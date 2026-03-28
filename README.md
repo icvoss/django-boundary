@@ -1,5 +1,11 @@
 # django-boundary
 
+[![CI](https://github.com/nigelcopley/icv-oss/actions/workflows/ci.yml/badge.svg)](https://github.com/nigelcopley/icv-oss/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/django-boundary.svg)](https://pypi.org/project/django-boundary/)
+[![Python versions](https://img.shields.io/pypi/pyversions/django-boundary.svg)](https://pypi.org/project/django-boundary/)
+[![Django versions](https://img.shields.io/pypi/djversions/django-boundary.svg)](https://pypi.org/project/django-boundary/)
+[![Licence: MIT](https://img.shields.io/badge/Licence-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 Scalable row-level multi-tenancy for Django with PostgreSQL Row Level Security.
 
 ---
@@ -621,7 +627,7 @@ Booking.unscoped.create(court=1, tenant=specific_tenant)
 ## Requirements
 
 - Python 3.10+
-- Django 4.2+ (LTS) or Django 5.x
+- Django 5.1+
 - PostgreSQL 14+ (for RLS; ORM layer works with any database)
 
 ---
