@@ -2,6 +2,36 @@
 
 All notable changes to django-boundary are documented here.
 
+## [0.2.0] - 2026-04-21
+
+### Added
+
+- **Configurable tenant FK field name** — `BOUNDARY_TENANT_FK_FIELD` setting
+  (default `"tenant"`) controls the FK field name on `TenantMixin`. Consumers
+  who want domain-native names like `merchant` can set this globally.
+- **`make_tenant_mixin(fk_field)` factory** — creates a custom `TenantMixin`
+  with any FK field name, wired up with `TenantManager`, `UnscopedManager`,
+  and auto-populate on `save()`. This is the public extension API for
+  consumers who need full control without reimplementing package internals.
+- **`is_tenant_model(model)`** — registry-backed check that recognises models
+  using `TenantMixin`, `make_tenant_mixin()`, or any class with
+  `_boundary_fk_field`. Replaces `issubclass(model, TenantMixin)` checks.
+- **`get_tenant_fk_field(model)`** — returns the FK field name for a
+  registered tenant-scoped model.
+
+### Changed
+
+- System check `boundary.E006` now uses `is_tenant_model()` instead of
+  `issubclass(model, TenantMixin)`, so custom tenant base classes created
+  via `make_tenant_mixin()` are verified by RLS checks.
+- `RegionalRouter` uses `is_tenant_model()` for routing decisions, supporting
+  custom FK field names.
+- `TenantManager` reads the FK field name from `model._boundary_fk_field`
+  rather than hardcoding `tenant`, so filtering, `bulk_create()`, and
+  `bulk_update()` all work with custom field names.
+- `CreateTenantPolicy` and `DropTenantPolicy` migration ops accept
+  `tenant_column=None` and derive the default from the model when possible.
+
 ## [0.1.0] - 2026-03-27
 
 Initial release — all four implementation phases.

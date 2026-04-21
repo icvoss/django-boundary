@@ -14,7 +14,7 @@ from contextvars import ContextVar
 
 from boundary.conf import boundary_settings
 from boundary.context import TenantContext
-from boundary.models import TenantMixin
+from boundary.models import is_tenant_model
 
 logger = logging.getLogger("boundary.routing")
 
@@ -58,7 +58,7 @@ class RegionalRouter:
             return "default"
 
         # Non-tenant models always go to default
-        if not (isinstance(model, type) and issubclass(model, TenantMixin)):
+        if not (isinstance(model, type) and is_tenant_model(model)):
             return "default"
 
         tenant = TenantContext.get()

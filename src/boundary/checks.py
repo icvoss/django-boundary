@@ -108,7 +108,11 @@ def _check_strict_mode():
 
 
 def _check_rls_enabled():
-    """E006: Verify RLS is enabled on all TenantModel tables (PostgreSQL only)."""
+    """E006: Verify RLS is enabled on all tenant-scoped tables (PostgreSQL only).
+
+    Recognises models using TenantMixin, make_tenant_mixin(), or any model
+    with a ``_boundary_fk_field`` attribute (custom tenant base classes).
+    """
     from django.apps import apps
     from django.conf import settings
     from django.db import connection
@@ -120,11 +124,11 @@ def _check_rls_enabled():
     if not model_string:
         return []  # E001 will catch this
 
-    from boundary.models import TenantMixin
+    from boundary.models import is_tenant_model
 
     errors = []
     for model in apps.get_models():
-        if not issubclass(model, TenantMixin):
+        if not is_tenant_model(model):
             continue
         if model._meta.abstract:
             continue

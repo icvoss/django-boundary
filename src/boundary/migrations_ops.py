@@ -60,9 +60,9 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
     reduces_to_sql = True
     reversible = True
 
-    def __init__(self, model_name: str, tenant_column: str = "tenant_id"):
+    def __init__(self, model_name: str, tenant_column: str | None = None):
         self.model_name = model_name
-        self.tenant_column = tenant_column
+        self.tenant_column = tenant_column or "tenant_id"
 
     def state_forwards(self, app_label, state):
         pass
@@ -149,9 +149,9 @@ class DropTenantPolicy(migrations.operations.base.Operation):
     reduces_to_sql = True
     reversible = True
 
-    def __init__(self, model_name: str, tenant_column: str = "tenant_id"):
+    def __init__(self, model_name: str, tenant_column: str | None = None):
         self.model_name = model_name
-        self.tenant_column = tenant_column
+        self.tenant_column = tenant_column or "tenant_id"
 
     def state_forwards(self, app_label, state):
         pass

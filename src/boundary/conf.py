@@ -89,6 +89,10 @@ class _Settings:
         return _setting("BOUNDARY_REGION_FIELD", "region")
 
     @property
+    def TENANT_FK_FIELD(self):  # noqa: N802
+        return _setting("BOUNDARY_TENANT_FK_FIELD", "tenant")
+
+    @property
     def POST_PROVISION_HOOK(self):  # noqa: N802
         return _setting("BOUNDARY_POST_PROVISION_HOOK")
 
