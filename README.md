@@ -343,6 +343,57 @@ class Booking(TenantModel):
 - `bulk_create()` — auto-populates tenant on objects where `tenant_id` is None
 - `bulk_update()` — validates all objects belong to the active tenant
 
+### Custom FK Field Names — `make_tenant_mixin()`
+
+If your domain uses a different name for the tenant relationship (e.g.
+`merchant`, `organisation`, `workspace`), use the factory instead of
+`TenantMixin`:
+
+```python
+from boundary.models import make_tenant_mixin
+
+MerchantMixin = make_tenant_mixin("merchant")
+
+class Product(MerchantMixin):
+    sku = models.CharField(max_length=50)
+
+# Product.merchant is the FK — auto-filtering, auto-populate, bulk ops all work
+# Product.objects.all()  — filters by active tenant via the "merchant" field
+# product.merchant       — returns the tenant instance
+```
+
+The factory accepts the same FK options as Django's `ForeignKey`:
+
+```python
+make_tenant_mixin(
+    "merchant",
+    on_delete=models.PROTECT,       # default: CASCADE
+    related_name="products",        # default: "%(app_label)s_%(class)s_set"
+    db_index=True,                  # default: True
+    null=False,                     # default: False
+)
+```
+
+Alternatively, set `BOUNDARY_TENANT_FK_FIELD` in your settings to change
+the default field name globally. `TenantMixin` itself always uses `"tenant"`,
+but the factory reads the setting when no explicit `fk_field` is passed.
+
+### Model Introspection
+
+```python
+from boundary.models import is_tenant_model, get_tenant_fk_field
+
+is_tenant_model(Product)       # True
+get_tenant_fk_field(Product)   # "merchant"
+
+is_tenant_model(Booking)       # True
+get_tenant_fk_field(Booking)   # "tenant"
+```
+
+System checks, regional routing, and RLS verification all use
+`is_tenant_model()` internally, so custom FK models are automatically
+recognised.
+
 ---
 
 ## Context
@@ -546,6 +597,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `BOUNDARY_TENANT_MODEL` | **Required** | Dotted path to tenant model, e.g. `"tenants.Organisation"` |
+| `BOUNDARY_TENANT_FK_FIELD` | `"tenant"` | Default FK field name used by `make_tenant_mixin()` when no explicit name is passed |
 | `BOUNDARY_STRICT_MODE` | `True` | Raise `TenantNotSetError` on unscoped queries |
 | `BOUNDARY_REQUIRED` | `True` | Return 404 if no resolver matches |
 | `BOUNDARY_RESOLVERS` | `["...SubdomainResolver"]` | Ordered resolver class paths |
@@ -572,7 +624,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E003` | Error | Resolver class cannot be imported |
 | `boundary.E004` | Error | TenantMiddleware not in MIDDLEWARE |
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
-| `boundary.E006` | Error | TenantModel table missing RLS (queries pg_class at startup) |
+| `boundary.E006` | Error | Tenant-scoped table missing RLS — recognises TenantMixin and make_tenant_mixin models |
 | `boundary.W001` | Warning | STRICT_MODE is False |
 
 ---
