@@ -184,9 +184,7 @@ def make_tenant_mixin(
 
         def save(self, **kwargs):
             """Auto-populate tenant from context if not set (BR-ORM-004/005/006)."""
-            if getattr(self, fk_id_field) is None and not getattr(
-                self, "_boundary_skip_auto_populate", False
-            ):
+            if getattr(self, fk_id_field) is None and not getattr(self, "_boundary_skip_auto_populate", False):
                 setattr(self, fk_field, TenantContext.require())
             super().save(**kwargs)
 
