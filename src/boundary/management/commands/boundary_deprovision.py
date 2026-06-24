@@ -102,9 +102,7 @@ class Command(BaseCommand):
                 if not is_tenant_model(model) or model._meta.abstract:
                     continue
                 fk_field = get_tenant_fk_field(model) or "tenant"
-                qs = model.unscoped.filter(**{fk_field: tenant}).iterator(
-                    chunk_size=batch_size
-                )
+                qs = model.unscoped.filter(**{fk_field: tenant}).iterator(chunk_size=batch_size)
                 for obj in qs:
                     row = {
                         "_model": f"{model._meta.app_label}.{model.__name__}",
