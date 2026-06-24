@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils.module_loading import import_string
 
 from boundary.conf import boundary_settings, get_tenant_model
-from boundary.models import TenantMixin
+from boundary.models import get_tenant_fk_field, is_tenant_model
 
 
 class Command(BaseCommand):
@@ -60,7 +60,8 @@ class Command(BaseCommand):
 
         # Delete (use unscoped to bypass TenantManager)
         for model, _ in affected:
-            model.unscoped.filter(tenant=tenant).delete()
+            fk_field = get_tenant_fk_field(model) or "tenant"
+            model.unscoped.filter(**{fk_field: tenant}).delete()
         tenant.delete()
         self.stdout.write(f"Tenant {tenant.pk} deleted.")
 
@@ -80,10 +81,11 @@ class Command(BaseCommand):
         """Return list of (model_class, row_count) for tenant-scoped models."""
         result = []
         for model in apps.get_models():
-            if not issubclass(model, TenantMixin) or model._meta.abstract:
+            if not is_tenant_model(model) or model._meta.abstract:
                 continue
+            fk_field = get_tenant_fk_field(model) or "tenant"
             # Use unscoped to bypass TenantManager strict mode
-            count = model.unscoped.filter(tenant=tenant).count()
+            count = model.unscoped.filter(**{fk_field: tenant}).count()
             if count > 0:
                 result.append((model, count))
         return result
@@ -97,9 +99,12 @@ class Command(BaseCommand):
         """Stream tenant data to NDJSON file."""
         with open(path, "w") as f:
             for model in apps.get_models():
-                if not issubclass(model, TenantMixin) or model._meta.abstract:
+                if not is_tenant_model(model) or model._meta.abstract:
                     continue
-                qs = model.unscoped.filter(tenant=tenant).iterator(chunk_size=batch_size)
+                fk_field = get_tenant_fk_field(model) or "tenant"
+                qs = model.unscoped.filter(**{fk_field: tenant}).iterator(
+                    chunk_size=batch_size
+                )
                 for obj in qs:
                     row = {
                         "_model": f"{model._meta.app_label}.{model.__name__}",

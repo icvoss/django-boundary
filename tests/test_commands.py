@@ -132,6 +132,46 @@ class TestBoundaryDeprovision:
         with pytest.raises(CommandError, match="not found"):
             call_command("boundary_deprovision", tenant="nonexistent", yes=True)
 
+    def test_discovers_custom_fk_model_rows(self, tenant_a, capsys):
+        """Regression: models built via make_tenant_mixin (custom FK name) must
+        be discovered (counted), not silently skipped. Exercises
+        _collect_affected via the dry-run report."""
+        from boundary_testapp.models import Product
+
+        with set_tenant(tenant_a):
+            Product.objects.create(sku="A1")
+            Product.objects.create(sku="A2")
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, dry_run=True)
+        output = capsys.readouterr().out
+        assert "Product: 2 rows" in output
+
+    def test_exports_custom_fk_model_rows(self, tenant_a):
+        """Regression: custom-FK (make_tenant_mixin) rows must be included in
+        the NDJSON export before deletion."""
+        from boundary_testapp.models import Product
+
+        with set_tenant(tenant_a):
+            Product.objects.create(sku="A1")
+            Product.objects.create(sku="A2")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False) as f:
+            export_path = f.name
+
+        try:
+            call_command(
+                "boundary_deprovision",
+                tenant=tenant_a.slug,
+                export=export_path,
+                yes=True,
+            )
+            with open(export_path) as f:
+                rows = [json.loads(line) for line in f]
+            product_rows = [r for r in rows if r["_model"] == "boundary_testapp.Product"]
+            assert len(product_rows) == 2
+        finally:
+            os.unlink(export_path)
+
 
 @pytest.mark.django_db
 class TestBoundaryRun:
