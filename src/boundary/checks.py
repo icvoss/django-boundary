@@ -124,13 +124,18 @@ def _check_rls_enabled():
     if not model_string:
         return []  # E001 will catch this
 
-    from boundary.models import is_tenant_model
+    from boundary.models import has_tenant_column, is_tenant_model
 
     errors = []
     for model in apps.get_models():
         if not is_tenant_model(model):
             continue
         if model._meta.abstract:
+            continue
+        # Path-scoped models have no local tenant column to put an RLS policy
+        # on. They inherit isolation from the parent on their path, which
+        # carries the policy. Skip them here.
+        if not has_tenant_column(model):
             continue
 
         table = model._meta.db_table

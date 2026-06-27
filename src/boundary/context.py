@@ -5,6 +5,8 @@ It propagates correctly across sync views, async views, middleware,
 Celery tasks, and management commands.
 """
 
+import functools
+import inspect
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -130,3 +132,58 @@ class TenantContext:
         from boundary.resolvers import _cache_invalidate
 
         _cache_invalidate(tenant)
+
+
+def tenant_scoped(tenant_arg: str | None = None):
+    """Run a function inside ``TenantContext.using(<the tenant argument>)``.
+
+    The blessed idiom for service functions and Celery tasks that receive a
+    tenant explicitly and need it active in context (so manager auto-filtering
+    works) without hand-rolling ``with TenantContext.using(...)`` or, worse, a
+    bespoke manager.
+
+    The tenant is resolved from a named or positional argument of the wrapped
+    function and the whole call runs inside that scope.
+
+    Usage::
+
+        from boundary.context import tenant_scoped
+
+        @tenant_scoped("merchant")
+        def run_audit(merchant, since):
+            AccountAudit.objects.filter(created__gte=since)  # auto-scoped
+
+        @shared_task
+        @tenant_scoped("merchant")
+        def rebuild_index(merchant):
+            ...
+
+    The resolved argument is passed straight to ``TenantContext.using``, so it
+    must be a tenant **instance** (the same thing you would pass to
+    ``using()``), not a bare pk. If a task only receives an id, resolve it to
+    an instance before the call (or in a thin wrapper) rather than decorating
+    with the id argument.
+
+    Args:
+        tenant_arg: Name of the argument holding the tenant. Defaults to
+            ``BOUNDARY_TENANT_FK_FIELD`` (e.g. ``"merchant"`` or ``"tenant"``),
+            resolved at call time.
+    """
+
+    def decorator(func):
+        sig = inspect.signature(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            arg_name = tenant_arg or boundary_settings.TENANT_FK_FIELD
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if arg_name not in bound.arguments:
+                raise TypeError(f"tenant_scoped: {func.__qualname__} has no argument {arg_name!r} to scope by.")
+            tenant = bound.arguments[arg_name]
+            with TenantContext.using(tenant):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator

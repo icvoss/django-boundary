@@ -36,15 +36,52 @@ def is_tenant_model(model: type) -> bool:
     """
     if model in _tenant_model_registry:
         return True
+    if getattr(model, "boundary_tenant_path", None):
+        return True
     return getattr(model, "_boundary_fk_field", None) is not None
 
 
 def get_tenant_fk_field(model: type) -> str | None:
-    """Return the tenant FK field name for a tenant-scoped model, or None."""
+    """Return the *local tenant FK column* name for a model, or None.
+
+    This is the writable column used by auto-populate paths. Path-scoped
+    models (those declaring ``boundary_tenant_path``) have no local column,
+    so this returns None for them — use :func:`get_tenant_lookup` to get the
+    ORM lookup used for filtering instead.
+    """
+    if getattr(model, "boundary_tenant_path", None):
+        return None
     fk = getattr(model, "_boundary_fk_field", None)
     if fk is not None:
         return fk
     return None
+
+
+def get_tenant_lookup(model: type) -> str | None:
+    """Return the ORM lookup used to filter *model* by the active tenant.
+
+    Direct-FK models return their FK field name (e.g. ``"merchant"``).
+    Path-scoped models return their declared ``boundary_tenant_path``
+    (e.g. ``"destination__merchant"``, possibly multi-hop). Returns None
+    if the model is not tenant-scoped.
+    """
+    path = getattr(model, "boundary_tenant_path", None)
+    if path:
+        return path
+    fk = getattr(model, "_boundary_fk_field", None)
+    return fk
+
+
+def has_tenant_column(model: type) -> bool:
+    """Return True if *model* owns a writable local tenant FK column.
+
+    False for path-scoped models, which reach the tenant through a relation
+    and therefore have no column to auto-populate or stamp. The write paths
+    (save, bulk_create, bulk_update, get_or_create injection) gate on this.
+    """
+    if getattr(model, "boundary_tenant_path", None):
+        return False
+    return getattr(model, "_boundary_fk_field", None) is not None
 
 
 # ── QuerySet ──────────────────────────────────────────────────
@@ -73,8 +110,8 @@ class TenantManager(models.Manager):
         qs = TenantQuerySet(self.model, using=self._db)
 
         if tenant is not None:
-            fk_field = getattr(self.model, "_boundary_fk_field", "tenant")
-            return qs.filter(**{fk_field: tenant})
+            lookup = get_tenant_lookup(self.model) or "tenant"
+            return qs.filter(**{lookup: tenant})
 
         if boundary_settings.STRICT_MODE:
             strict_mode_violation.send(sender=self.model, model=self.model, queryset=qs)
@@ -88,7 +125,14 @@ class TenantManager(models.Manager):
         return qs
 
     def bulk_create(self, objs, **kwargs):
-        """Auto-populate tenant on objects where the FK is None (BR-ORM-007)."""
+        """Auto-populate tenant on objects where the FK is None (BR-ORM-007).
+
+        Path-scoped models have no local tenant column to populate, so the
+        populate step is skipped for them and they fall straight through to
+        Django's bulk_create.
+        """
+        if not has_tenant_column(self.model):
+            return super().bulk_create(objs, **kwargs)
         tenant = TenantContext.require()
         fk_field = getattr(self.model, "_boundary_fk_field", "tenant")
         fk_id_field = f"{fk_field}_id"
@@ -98,7 +142,13 @@ class TenantManager(models.Manager):
         return super().bulk_create(objs, **kwargs)
 
     def bulk_update(self, objs, fields, **kwargs):
-        """Validate all objects belong to the active tenant (BR-ORM-011)."""
+        """Validate all objects belong to the active tenant (BR-ORM-011).
+
+        Path-scoped models have no local tenant column to compare, so the
+        cross-tenant validation is skipped for them.
+        """
+        if not has_tenant_column(self.model):
+            return super().bulk_update(objs, fields, **kwargs)
         tenant = TenantContext.require()
         fk_field = getattr(self.model, "_boundary_fk_field", "tenant")
         fk_id_field = f"{fk_field}_id"
@@ -111,6 +161,44 @@ class TenantManager(models.Manager):
                     f"{label} {tenant.pk}. Cross-{label} bulk_update is not allowed."
                 )
         return super().bulk_update(objs, fields, **kwargs)
+
+    def get_or_create(self, defaults=None, **kwargs):
+        """Scope the lookup and stamp the tenant on create (BR-ORM-009).
+
+        Injects the active tenant into both the lookup half (so the get
+        cannot match another tenant's row) and ``defaults`` (so the create
+        stamps the FK), unless the caller supplied it explicitly. No-op for
+        path-scoped models, which rely on the auto-filtered queryset.
+        """
+        self._inject_tenant_kwargs(kwargs, defaults)
+        return super().get_or_create(defaults=defaults, **kwargs)
+
+    def update_or_create(self, defaults=None, create_defaults=None, **kwargs):
+        """Scope the lookup and stamp the tenant on create (BR-ORM-009).
+
+        Like :meth:`get_or_create`, but also covers ``create_defaults``
+        (Django 5.0+). No-op for path-scoped models.
+        """
+        self._inject_tenant_kwargs(kwargs, defaults, create_defaults)
+        return super().update_or_create(defaults=defaults, create_defaults=create_defaults, **kwargs)
+
+    def _inject_tenant_kwargs(self, lookup, *defaults_dicts):
+        """Inject the active tenant into lookup + defaults for direct-FK models.
+
+        Never overwrites a value the caller supplied (by either the FK field
+        name or its ``_id`` form). Path-scoped models are left untouched —
+        they have no column to write and rely on ``get_queryset`` filtering.
+        """
+        if not has_tenant_column(self.model):
+            return
+        fk_field = getattr(self.model, "_boundary_fk_field", "tenant")
+        fk_id_field = f"{fk_field}_id"
+        tenant = TenantContext.require()
+        if fk_field not in lookup and fk_id_field not in lookup:
+            lookup[fk_field] = tenant
+        for d in defaults_dicts:
+            if d is not None and fk_field not in d and fk_id_field not in d:
+                d[fk_field] = tenant
 
 
 class UnscopedManager(models.Manager):
@@ -185,8 +273,16 @@ def make_tenant_mixin(
             abstract = True
 
         def save(self, **kwargs):
-            """Auto-populate tenant from context if not set (BR-ORM-004/005/006)."""
-            if getattr(self, fk_id_field) is None and not getattr(self, "_boundary_skip_auto_populate", False):
+            """Auto-populate tenant from context if not set (BR-ORM-004/005/006).
+
+            Skipped for path-scoped subclasses (boundary_tenant_path), which
+            have no local FK column to populate.
+            """
+            if (
+                has_tenant_column(type(self))
+                and getattr(self, fk_id_field) is None
+                and not getattr(self, "_boundary_skip_auto_populate", False)
+            ):
                 setattr(self, fk_field, TenantContext.require())
             super().save(**kwargs)
 
@@ -209,6 +305,63 @@ def make_tenant_mixin(
     _TenantMixin.__qualname__ = f"TenantMixin[{fk_field}]"
 
     return _TenantMixin
+
+
+def make_tenant_path_mixin(tenant_path: str):
+    """Create a TenantMixin for models scoped *through a relation*.
+
+    Use this when a model is tenant-scoped indirectly — it reaches the tenant
+    via a foreign key chain rather than owning a tenant FK column itself. The
+    manager auto-filters on the given lookup path, and all column-writing
+    paths (save, bulk_create, bulk_update, get_or_create injection) are
+    correctly skipped because there is no local column to populate.
+
+    Unlike :func:`make_tenant_mixin`, this adds **no ForeignKey** — the model
+    is expected to already have the relation the path traverses.
+
+    Returns an abstract model class that provides:
+    - ``objects = TenantManager()`` auto-filtering on ``tenant_path``
+    - ``unscoped = UnscopedManager()`` (bypass)
+    - No tenant column and no save() auto-populate
+
+    Usage::
+
+        from boundary.models import make_tenant_path_mixin
+
+        ExportScopedMixin = make_tenant_path_mixin("destination__merchant")
+
+        class ExportLog(ExportScopedMixin):
+            destination = models.ForeignKey(Destination, on_delete=models.CASCADE)
+            # ExportLog.objects auto-filters on destination__merchant
+
+    Multi-hop paths work the same way::
+
+        make_tenant_path_mixin("export_log__destination__merchant")
+
+    Note: path-scoped models cannot carry a PostgreSQL RLS policy on a local
+    column (they have none). They inherit isolation from the parent on the
+    path, which carries the policy, and are skipped by boundary's RLS system
+    check and provisioning. Application-layer auto-filtering still applies.
+
+    Args:
+        tenant_path: ORM lookup path to the tenant, e.g.
+            ``"destination__merchant"`` (single or multi-hop).
+    """
+
+    class _TenantPathMixin(models.Model):
+        boundary_tenant_path = tenant_path
+
+        objects = TenantManager()
+        unscoped = UnscopedManager()
+
+        class Meta:
+            abstract = True
+
+    _tenant_model_registry.add(_TenantPathMixin)
+    _TenantPathMixin.__name__ = f"TenantPathMixin[{tenant_path}]"
+    _TenantPathMixin.__qualname__ = f"TenantPathMixin[{tenant_path}]"
+
+    return _TenantPathMixin
 
 
 # ── Built-in Mixins ──────────────────────────────────────────
@@ -245,8 +398,16 @@ class TenantMixin(models.Model):
             _tenant_model_registry.add(cls)
 
     def save(self, **kwargs):
-        """Auto-populate tenant from context if not set (BR-ORM-004/005/006)."""
-        if self.tenant_id is None and not getattr(self, "_boundary_skip_auto_populate", False):
+        """Auto-populate tenant from context if not set (BR-ORM-004/005/006).
+
+        Skipped for path-scoped subclasses (boundary_tenant_path), which have
+        no local FK column to populate.
+        """
+        if (
+            has_tenant_column(type(self))
+            and self.tenant_id is None
+            and not getattr(self, "_boundary_skip_auto_populate", False)
+        ):
             self.tenant = TenantContext.require()
         super().save(**kwargs)
 

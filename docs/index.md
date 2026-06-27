@@ -12,6 +12,8 @@ the [settings reference](reference/settings.md).
 | --- | --- |
 | Build a multi-tenant app from scratch | [Build your first multi-tenant app](tutorial/first-multi-tenant-app.md) |
 | Define the tenant model itself | [Set up a tenant model](how-to/set-up-a-tenant-model.md) |
+| Scope a model that reaches the tenant through a relation | [Scope a model through a relation](how-to/scope-models-through-a-relation.md) |
+| Scope a service or task that already holds the tenant | [Scope a function that holds the tenant](how-to/scope-a-function-that-holds-the-tenant.md) |
 | Add boundary to an app that already has data | [Add boundary to an existing app](how-to/add-boundary-to-an-existing-app.md) |
 | Decide how requests map to tenants | [Choose and order resolvers](how-to/choose-and-order-resolvers.md) |
 | Rename "tenant" to merchant, organisation, club | [Customise the terminology](how-to/customise-terminology.md) |

@@ -3,7 +3,7 @@
 import pytest
 from django.db import connection
 
-from boundary.context import TenantContext
+from boundary.context import TenantContext, tenant_scoped
 from boundary.exceptions import TenantNotSetError
 
 
@@ -131,3 +131,74 @@ class TestTenantContextAtomicRollback:
 
         # ContextVar should be restored to original
         assert TenantContext.get() == original
+
+
+@pytest.mark.django_db
+class TestTenantScopedDecorator:
+    """tenant_scoped runs the function inside TenantContext.using()."""
+
+    def test_named_arg(self, tenant_a):
+        @tenant_scoped("club")
+        def inner(club):
+            return TenantContext.get()
+
+        assert inner(club=tenant_a) == tenant_a
+        assert TenantContext.get() is None  # restored after
+
+    def test_positional_arg(self, tenant_a):
+        @tenant_scoped("club")
+        def inner(club):
+            return TenantContext.get()
+
+        assert inner(tenant_a) == tenant_a
+
+    def test_default_arg_name_from_setting(self, tenant_a, settings):
+        settings.BOUNDARY_TENANT_FK_FIELD = "merchant"
+
+        @tenant_scoped()
+        def inner(merchant):
+            return TenantContext.get()
+
+        assert inner(merchant=tenant_a) == tenant_a
+
+    def test_missing_arg_raises_typeerror(self, tenant_a):
+        @tenant_scoped("merchant")
+        def inner(something_else):
+            return TenantContext.get()
+
+        with pytest.raises(TypeError, match="no argument 'merchant'"):
+            inner(something_else=tenant_a)
+
+    def test_nested_scope_restores_previous(self, tenant_a, tenant_b):
+        @tenant_scoped("club")
+        def inner(club):
+            return TenantContext.get()
+
+        with TenantContext.using(tenant_a):
+            assert inner(tenant_b) == tenant_b
+            # previous scope restored
+            assert TenantContext.get() == tenant_a
+
+    def test_exception_in_body_restores_context(self, tenant_a):
+        @tenant_scoped("club")
+        def inner(club):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            inner(tenant_a)
+        assert TenantContext.get() is None
+
+    def test_scope_makes_manager_filter(self, tenant_a, tenant_b):
+        from boundary_testapp.models import Booking
+
+        with TenantContext.using(tenant_a):
+            Booking.objects.create(court=1)
+        with TenantContext.using(tenant_b):
+            Booking.objects.create(court=2)
+
+        @tenant_scoped("club")
+        def count_for(club):
+            return Booking.objects.count()
+
+        assert count_for(tenant_a) == 1
+        assert count_for(tenant_b) == 1

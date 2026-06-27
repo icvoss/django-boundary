@@ -201,6 +201,47 @@ Use the pytest `settings` fixture (or Django's `override_settings`) so the chang
 is scoped to the single test. With `TestCase`, use `@override_settings` on the
 method or class.
 
+### 7. Call a class-based view directly with `call_view`
+
+`RequestFactory` bypasses middleware, so a CBV called directly in a test has no
+active tenant and any scoped query inside it raises `TenantNotSetError`. Use
+`call_view` from `boundary.testing` to build the request and activate a tenant in
+one line.
+
+```python
+from boundary.testing import call_view
+
+
+@pytest.mark.django_db
+def test_list_view_is_scoped(tenant_a, tenant_b):
+    with set_tenant(tenant_a):
+        Booking.objects.create(court=1)
+    with set_tenant(tenant_b):
+        Booking.objects.create(court=2)
+
+    response = call_view(BookingListView, tenant=tenant_a)
+    assert response.status_code == 200
+    # the view only saw tenant_a's row
+```
+
+Pass URL kwargs via `view_kwargs`, choose the HTTP method with `method`, and
+forward anything else (request body, headers) as keyword arguments:
+
+```python
+response = call_view(
+    BookingCreateView,
+    tenant=tenant_a,
+    method="post",
+    data={"court": 1},
+)
+detail = call_view(
+    BookingDetailView, tenant=tenant_a, view_kwargs={"pk": booking.pk}
+)
+```
+
+Prefer `call_view` over the Django test client when you want to exercise the view
+class directly without routing through URLconf and middleware.
+
 ## Verify it worked
 
 Run the suite and confirm both the isolation and strict-mode tests pass:
@@ -232,6 +273,15 @@ raises `TenantNotSetError` when no tenant is active.
   restore the previous context in their `finally`/`tearDown`.
 - **Forgetting `db` access.** Mark pytest tests with `@pytest.mark.django_db` (or
   request the `db`/`tenant_factory` fixtures), otherwise tenant creation fails.
+- **Mocking a manager method.** boundary has no `for_tenant`/`for_merchant`
+  method to mock — filtering lives entirely in the default manager's
+  `get_queryset`. Do not patch a manager method with a `side_effect`; assert on
+  the querysets the real (auto-filtered) manager returns, or use `set_tenant` /
+  `call_view` to establish context. A mock pinned to a method that does not
+  exist gives a false sense of coverage and breaks silently.
+- **Calling a CBV without context.** A view called via a bare `RequestFactory`
+  raises `TenantNotSetError` under strict mode. Use `call_view` (above), which
+  wraps the call in an active tenant context.
 
 ## Related
 

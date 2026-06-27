@@ -4,7 +4,8 @@ import pytest
 from django.test import TestCase
 
 from boundary.context import TenantContext
-from boundary.testing import TenantTestMixin, set_tenant, tenant_factory
+from boundary.exceptions import TenantNotSetError
+from boundary.testing import TenantTestMixin, call_view, set_tenant, tenant_factory
 
 
 @pytest.mark.django_db
@@ -56,3 +57,51 @@ class TestTenantTestMixin(TenantTestMixin, TestCase):
 
         booking = Booking.objects.create(court=1)
         assert booking.tenant == self.tenant
+
+
+@pytest.mark.django_db
+class TestCallView:
+    """call_view runs a CBV under an active tenant context."""
+
+    def _view_cls(self):
+        from boundary_testapp.models import Booking
+        from django.http import JsonResponse
+        from django.views import View
+
+        class BookingCountView(View):
+            def get(self, request, *args, **kwargs):
+                return JsonResponse({"count": Booking.objects.count()})
+
+        return BookingCountView
+
+    def test_view_sees_active_tenant_rows(self, tenant_a, tenant_b):
+        import json
+
+        from boundary_testapp.models import Booking
+
+        with set_tenant(tenant_a):
+            Booking.objects.create(court=1)
+            Booking.objects.create(court=2)
+        with set_tenant(tenant_b):
+            Booking.objects.create(court=3)
+
+        response = call_view(self._view_cls(), tenant=tenant_a)
+        assert json.loads(response.content)["count"] == 2
+
+        response = call_view(self._view_cls(), tenant=tenant_b)
+        assert json.loads(response.content)["count"] == 1
+
+    def test_without_helper_raises_strict(self, tenant_a, settings):
+        """Proves the helper is what fixes the missing-context problem: the
+        same view called via a bare RequestFactory raises under strict mode."""
+        from django.test import RequestFactory
+
+        settings.BOUNDARY_STRICT_MODE = True
+        with set_tenant(tenant_a):
+            from boundary_testapp.models import Booking
+
+            Booking.objects.create(court=1)
+
+        request = RequestFactory().get("/")
+        with pytest.raises(TenantNotSetError):
+            self._view_cls().as_view()(request)

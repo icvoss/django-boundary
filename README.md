@@ -707,8 +707,8 @@ Booking.unscoped.create(court=1, tenant=specific_tenant)
 
 ## Requirements
 
-- Python 3.10+
-- Django 5.1+
+- Python 3.12+
+- Django 5.2+ (5.2 LTS and 6.0 supported)
 - PostgreSQL 14+ (for RLS; ORM layer works with any database)
 
 ---

@@ -45,6 +45,24 @@ with TenantContext.using(tenant):
 
 Inside a normal request this is handled for you by `TenantMiddleware`. The error usually appears in management commands, shells, Celery tasks, or background threads where no middleware ran. See [Common gotchas](#common-gotchas) below.
 
+For a service function or task that already receives the tenant as an argument, the `@tenant_scoped` decorator is tidier than a manual `with` block:
+
+```python
+from boundary.context import tenant_scoped
+
+@tenant_scoped("merchant")
+def run_audit(merchant, since):
+    return AccountAudit.objects.filter(created__gte=since)  # auto-scoped
+```
+
+In a test that calls a class-based view directly (where `RequestFactory` bypasses `TenantMiddleware`), use `call_view` from `boundary.testing`, which activates the tenant for you:
+
+```python
+from boundary.testing import call_view
+
+response = call_view(BookingListView, tenant=tenant_a)
+```
+
 > Note: a `strict_mode_violation` signal fires just before this exception is raised, so you can hook logging or metrics onto it.
 
 ### `TenantResolutionError`

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-boundary"
-version = "0.3.1"
+version = "0.4.0"
 description = "Scalable row-level multi-tenancy for Django with PostgreSQL RLS"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,8 +13,6 @@ authors = [{name = "ICV", email = "dev@icv.dev"}]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Django",
-    "Framework :: Django :: 5.0",
-    "Framework :: Django :: 5.1",
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Intended Audience :: Developers",
@@ -25,7 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-    "Django>=5.0",
+    "Django>=5.2",
 ]
 
 [project.optional-dependencies]

@@ -30,8 +30,14 @@ class TestTenantLabel:
             TenantContext.require()
 
 
+@pytest.mark.django_db
 class TestRequestAttr:
-    """BOUNDARY_REQUEST_ATTR controls the alias on request."""
+    """BOUNDARY_REQUEST_ATTR controls the alias on request.
+
+    Marked django_db because the middleware sets the tenant context, which
+    writes the PostgreSQL session variable via a DB cursor. Without the mark
+    these pass only when a prior test happens to leave a connection open.
+    """
 
     def _make_middleware(self, tenant):
         mw = TenantMiddleware(get_response=lambda r: SimpleNamespace())

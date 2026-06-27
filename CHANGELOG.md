@@ -2,6 +2,47 @@
 
 All notable changes to django-boundary are documented here.
 
+## [0.4.0] — 2026-06-27
+
+### Added
+
+- **Indirect / traversal tenancy via `make_tenant_path_mixin(path)`.** Models
+  that reach the tenant through a relation (e.g. `destination__merchant`,
+  including multi-hop paths) can now be first-class tenant-scoped models instead
+  of needing a bespoke manager. The manager auto-filters on the lookup path, and
+  all column-writing paths (`save`, `bulk_create`, `bulk_update`,
+  `get_or_create`/`update_or_create` injection) are correctly skipped because
+  the model has no local tenant column. Such models carry no RLS policy on their
+  own table (there is no column to scope) and are excluded from the RLS system
+  check and provisioning; isolation comes from the parent on the path plus
+  application-layer auto-filtering. New helpers `get_tenant_lookup(model)` and
+  `has_tenant_column(model)` expose the distinction.
+- **`@tenant_scoped(tenant_arg=...)` decorator** (`boundary.context`). Runs a
+  service function or task inside `TenantContext.using(<the tenant argument>)`,
+  resolving the tenant from a named or positional argument. The blessed idiom
+  for "I hold the tenant explicitly" code, replacing hand-rolled managers that
+  re-implemented context filtering. Defaults the argument name to
+  `BOUNDARY_TENANT_FK_FIELD`.
+- **`boundary.testing.call_view(view_cls, *, tenant, ...)`** — calls a
+  class-based view directly under an active tenant context. `RequestFactory`
+  bypasses middleware, so direct CBV tests otherwise raise `TenantNotSetError`;
+  this builds the request and activates the tenant in one line.
+
+### Changed
+
+- **`get_or_create` / `update_or_create` are now tenant-scoped on direct-FK
+  models.** The active tenant is injected into both the lookup half (so a `get`
+  cannot match another tenant's row) and `defaults` / `create_defaults` (so the
+  create stamps the FK), unless the caller supplied it explicitly. This removes
+  the need for defensive `merchant=merchant` kwargs and makes the create path
+  provably scoped. Behaviour is unchanged when the caller passes the FK; a
+  caller that previously relied on an *unscoped* `get_or_create` matching across
+  tenants will now be scoped (the safer behaviour). No-op for path-scoped
+  models.
+- **Minimum Django is now 5.2 LTS** (was 5.0). Django 5.0 and 5.1 are
+  end-of-life; supported versions are 5.2 LTS and 6.0. Minimum Python remains
+  3.12.
+
 ## [0.3.1] — 2026-06-24
 
 ### Fixed
