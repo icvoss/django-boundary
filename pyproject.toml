@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "django-boundary"
 version = "0.4.0"
 description = "Scalable row-level multi-tenancy for Django with PostgreSQL RLS"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.12"
 authors = [{name = "ICV", email = "dev@icv.dev"}]
 classifiers = [
@@ -16,7 +16,6 @@ classifiers = [
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",

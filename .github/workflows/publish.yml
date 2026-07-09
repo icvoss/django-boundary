@@ -5,7 +5,7 @@ name: Publish django-boundary to PyPI
 # OIDC trusted publishing — no API token is required in repository secrets.
 # Configure trusted publishing in your PyPI project settings:
 #   Publisher: GitHub Actions
-#   Owner: nigelcopley
+#   Owner: icvoss
 #   Repository: django-boundary
 #   Workflow: publish.yml
 #   Environment: pypi
