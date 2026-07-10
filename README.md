@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/logo.svg" alt="" width="88">
+</p>
+
 # django-boundary
 
 [![CI](https://github.com/icvoss/django-boundary/actions/workflows/ci.yml/badge.svg)](https://github.com/icvoss/django-boundary/actions/workflows/ci.yml)
