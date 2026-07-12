@@ -16,6 +16,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_middleware())
     errors.extend(_check_strict_mode())
     errors.extend(_check_rls_enabled())
+    errors.extend(_check_identity_double_resolve())
 
     return errors
 
@@ -105,6 +106,45 @@ def _check_strict_mode():
             )
         ]
     return []
+
+
+def _check_identity_double_resolve():
+    """W002: warn when boundary and icv-identity both resolve the tenant.
+
+    Per ADR-025 T1, when icv-identity is installed it owns request-to-tenant
+    resolution: its TenantContextMiddleware resolves the tenant, sets
+    request.tenant, and bridges into boundary's TenantContext. Boundary's own
+    TenantMiddleware and resolver chain are for boundary-only deployments (no
+    identity). Running both middlewares double-resolves the tenant per
+    request. Detected by string suffix match on MIDDLEWARE entries; boundary
+    must never import icv_identity (ADR-002, ADR-025 T1).
+    """
+    from django.conf import settings
+
+    middleware = getattr(settings, "MIDDLEWARE", [])
+
+    has_boundary_middleware = any(entry.endswith("boundary.middleware.TenantMiddleware") for entry in middleware)
+    has_identity_middleware = any(
+        entry.endswith("icv_identity.tenants.middleware.TenantContextMiddleware") for entry in middleware
+    )
+
+    if not (has_boundary_middleware and has_identity_middleware):
+        return []
+
+    return [
+        Warning(
+            "Both boundary.middleware.TenantMiddleware and icv-identity's "
+            "TenantContextMiddleware are in MIDDLEWARE. This double-resolves the "
+            "tenant on every request.",
+            hint=(
+                "Per ADR-025 T1, when icv-identity is present it owns tenant "
+                "resolution and bridges into boundary. Remove "
+                "boundary.middleware.TenantMiddleware and let icv-identity resolve "
+                "and bridge, or run boundary-only without icv-identity's middleware."
+            ),
+            id="boundary.W002",
+        )
+    ]
 
 
 def _check_rls_enabled():

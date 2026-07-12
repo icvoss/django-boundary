@@ -2,6 +2,22 @@
 
 All notable changes to django-boundary are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **New system check `boundary.W002`** warns when both
+  `boundary.middleware.TenantMiddleware` and icv-identity's
+  `TenantContextMiddleware` are present in `MIDDLEWARE`, since icv-identity owns
+  tenant resolution and bridges into boundary when it is installed, and running
+  both double-resolves the tenant per request (ADR-025 T1).
+
+### Changed
+
+- **`BOUNDARY_TENANT_MODEL` now falls back to `ICV_TENANT_MODEL`** when unset,
+  matching how icv-identity and icv-payments already resolve the tenant model.
+  `ICV_TENANT_MODEL` is the single ecosystem-wide tenant-model knob (ADR-025 T2).
+
 ## [0.4.0] - 2026-06-27
 
 ### Added

@@ -627,7 +627,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `BOUNDARY_TENANT_MODEL` | **Required** | Dotted path to tenant model, e.g. `"tenants.Organisation"` |
+| `BOUNDARY_TENANT_MODEL` | **Required**, falls back to `ICV_TENANT_MODEL` | Dotted path to tenant model, e.g. `"tenants.Organisation"`. `ICV_TENANT_MODEL` is the single ecosystem-wide tenant-model knob (ADR-025 T2); set it once if other packages (e.g. icv-identity) already read it |
 | `BOUNDARY_TENANT_FK_FIELD` | `"tenant"` | Default FK field name used by `make_tenant_mixin()` when no explicit name is passed |
 | `BOUNDARY_TENANT_LABEL` | `BOUNDARY_TENANT_FK_FIELD` | Human-readable term used in error messages, FK `verbose_name`, and middleware HTTP response bodies |
 | `BOUNDARY_REQUEST_ATTR` | `BOUNDARY_TENANT_FK_FIELD` | Extra attribute set on the request object alongside `request.tenant` (e.g. `request.merchant`). When equal to `"tenant"`, no second attribute is added |
@@ -659,6 +659,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
 | `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models |
 | `boundary.W001` | Warning | STRICT_MODE is False |
+| `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 
 ---
 

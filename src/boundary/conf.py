@@ -14,14 +14,17 @@ def _setting(name, default=None):
 def get_tenant_model():
     """Return the concrete tenant model class.
 
-    Lazily resolves BOUNDARY_TENANT_MODEL via django.apps.apps.get_model().
-    Equivalent to django.contrib.auth.get_user_model().
+    Lazily resolves BOUNDARY_TENANT_MODEL via django.apps.apps.get_model(),
+    falling back to ICV_TENANT_MODEL when unset. ICV_TENANT_MODEL is the
+    single ecosystem-wide tenant-model knob (ADR-025 T2); other packages
+    (icv-identity, icv-payments) already resolve their tenant model the
+    same way. Equivalent to django.contrib.auth.get_user_model().
     """
     from django.apps import apps
 
-    model_string = _setting("BOUNDARY_TENANT_MODEL")
+    model_string = _setting("BOUNDARY_TENANT_MODEL") or _setting("ICV_TENANT_MODEL")
     if not model_string:
-        raise LookupError("BOUNDARY_TENANT_MODEL is not set. Add it to your Django settings.")
+        raise LookupError("Neither BOUNDARY_TENANT_MODEL nor ICV_TENANT_MODEL is set. Add one to your Django settings.")
     return apps.get_model(model_string)
 
 
@@ -30,7 +33,9 @@ class _Settings:
 
     @property
     def TENANT_MODEL(self):  # noqa: N802
-        return _setting("BOUNDARY_TENANT_MODEL")
+        # ADR-025 T2: BOUNDARY_TENANT_MODEL falls back to ICV_TENANT_MODEL,
+        # the single ecosystem-wide tenant-model knob.
+        return _setting("BOUNDARY_TENANT_MODEL") or _setting("ICV_TENANT_MODEL")
 
     @property
     def STRICT_MODE(self):  # noqa: N802
