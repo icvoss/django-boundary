@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-boundary"
-version = "0.4.0"
+version = "0.4.1"
 description = "Scalable row-level multi-tenancy for Django with PostgreSQL RLS"
 readme = "README.md"
 license = "MIT"
@@ -33,8 +33,7 @@ dev = [
     "factory-boy>=3.3",
     "psycopg[binary]>=3.1",
     "ruff>=0.5.0",
-    "mypy>=1.10",
-    "django-stubs>=5.0",
+    "django-stubs[compatible-mypy]>=5.1,<6",
 ]
 
 [project.urls]
@@ -46,6 +45,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+boundary = ["py.typed"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "settings"

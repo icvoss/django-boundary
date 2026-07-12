@@ -382,6 +382,47 @@ Alternatively, set `BOUNDARY_TENANT_FK_FIELD` in your settings to change
 the default field name globally. `TenantMixin` itself always uses `"tenant"`,
 but the factory reads the setting when no explicit `fk_field` is passed.
 
+#### Static typing and `make_tenant_mixin()` / `make_tenant_path_mixin()`
+
+`TenantModel` / `TenantMixin` are ordinary module-level classes: `mypy` with
+the `django-stubs` plugin resolves `objects`, `unscoped`, and the `tenant` FK
+on any model built from them with no extra configuration.
+
+`make_tenant_mixin()` and `make_tenant_path_mixin()` build and return a class
+from *inside a function call*. This is a hard `mypy` limitation, not a gap in
+boundary's types: `mypy` rejects any base class that is a function call (or a
+variable holding one) at the semantic-analysis stage, before plugins run
+(`Unsupported dynamic base class` / `Invalid base class`), and there is no
+annotation or stub shape that changes this. A model built from the factory
+will type-check as follows:
+
+```python
+from boundary.models import make_tenant_mixin
+
+MerchantMixin = make_tenant_mixin("merchant")
+
+
+class Product(MerchantMixin):  # type: ignore[valid-type,misc]
+    sku = models.CharField(max_length=50)
+```
+
+`Product.objects` / `Product.unscoped` then type as `Any` rather than
+`TenantManager[Product]` / `UnscopedManager[Product]` — no false positives,
+but no manager-level type safety either. Separately, the tenant model on the
+other end of the relationship needs its own narrow suppression for the
+reverse accessor `django-stubs` cannot synthesise for a runtime-attached FK:
+
+```python
+class Merchant(models.Model):  # type: ignore[django-manager-missing]
+    name = models.CharField(max_length=200)
+```
+
+If a model's FK field name can be `"tenant"`, prefer `TenantModel` /
+`TenantMixin` over the factory: it is fully type-checked with none of the
+above. Reserve `make_tenant_mixin()` for genuinely custom FK names, and
+`make_tenant_path_mixin()` for path-scoped models, accepting the two
+suppressions above under `django-stubs`.
+
 ### Custom Terminology
 
 Boundary error messages, `verbose_name` on FK fields, and middleware HTTP

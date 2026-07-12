@@ -6,6 +6,7 @@ multi-tenancy with configurable FK field names.
 """
 
 import logging
+from typing import ClassVar
 
 from django.conf import settings
 from django.db import models
@@ -386,8 +387,8 @@ class TenantMixin(models.Model):
         verbose_name=_("tenant"),
     )
 
-    objects = TenantManager()
-    unscoped = UnscopedManager()
+    objects: ClassVar[TenantManager] = TenantManager()
+    unscoped: ClassVar[UnscopedManager] = UnscopedManager()
 
     class Meta:
         abstract = True

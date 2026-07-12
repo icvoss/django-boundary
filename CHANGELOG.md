@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-12
+
 ### Added
 
 - **New system check `boundary.W002`** warns when both
@@ -11,12 +13,43 @@ All notable changes to django-boundary are documented here.
   `TenantContextMiddleware` are present in `MIDDLEWARE`, since icv-identity owns
   tenant resolution and bridges into boundary when it is installed, and running
   both double-resolves the tenant per request (ADR-025 T1).
+- **`src/boundary/py.typed`** marker, so consumers running `mypy` with the
+  `django-stubs` plugin get boundary's own types instead of falling back to
+  untyped `Any`. Shipped only once `TenantMixin` / `TenantModel` were confirmed
+  to resolve cleanly (see Fixed, below); a `py.typed` package with unresolved
+  managers is strictly worse for downstream consumers than an untyped one.
 
 ### Changed
 
 - **`BOUNDARY_TENANT_MODEL` now falls back to `ICV_TENANT_MODEL`** when unset,
   matching how icv-identity and icv-payments already resolve the tenant model.
   `ICV_TENANT_MODEL` is the single ecosystem-wide tenant-model knob (ADR-025 T2).
+- **Dev extra now pins `django-stubs[compatible-mypy]>=5.1,<6`** instead of the
+  previous unbounded `mypy>=1.10` + `django-stubs>=5.0`. The unbounded mypy pin
+  resolved mypy 2.2.0, which crashes `NewSemanalDjangoPlugin` construction (no
+  django-stubs release supports mypy 2.x); `compatible-mypy` keeps the two
+  versions from drifting apart. The bare `mypy` line is dropped: the extra
+  supplies a compatible mypy on its own.
+
+### Fixed
+
+- **`TenantMixin.objects` / `TenantMixin.unscoped` now carry explicit
+  `ClassVar` annotations**, so `mypy` with the `django-stubs` plugin resolves
+  `TenantManager[Model]` / `UnscopedManager[Model]` (rather than falling back
+  to `Any`) on any model built from `TenantModel` or `TenantMixin`, with no
+  configuration on the consumer's side. Verified against a sample model under
+  `mypy` + `django-stubs`: reported by a downstream consumer (agentpm).
+- **Documented, with a proven workaround, that `make_tenant_mixin()` and
+  `make_tenant_path_mixin()` cannot be resolved as base classes by `mypy`.**
+  This is a hard `mypy` limitation (`Unsupported dynamic base class` /
+  `Invalid base class`, raised by `mypy`'s own semantic analyser before any
+  plugin runs) for any base class built from a function call, not a gap in
+  boundary's types; no annotation or stub shape changes it. The factory
+  functions are unchanged at runtime. See the README's "Static typing and
+  `make_tenant_mixin()` / `make_tenant_path_mixin()`" section for the two
+  narrow `type: ignore` suppressions consumers need on the factory-built model
+  and on its tenant model's reverse accessor, and for when to prefer the
+  statically-resolvable `TenantMixin` / `TenantModel` instead.
 
 ## [0.4.0] - 2026-06-27
 
