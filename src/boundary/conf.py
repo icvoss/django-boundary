@@ -86,6 +86,21 @@ class _Settings:
         return _setting("BOUNDARY_ADMIN_FLAG_VAR", "app.boundary_admin")
 
     @property
+    def FUNCTION_LEAKPROOF(self):  # noqa: N802
+        """Whether to declare ``boundary_current_tenant_id()`` LEAKPROOF.
+
+        Defaults to ``False`` because PostgreSQL only lets a superuser create
+        or replace a LEAKPROOF function, and managed Postgres providers
+        (DigitalOcean, RDS, Cloud SQL, Azure, Heroku, Supabase) grant no
+        superuser role. Leaving it off keeps the RLS migrations runnable on
+        managed hosting; isolation is enforced identically either way, since
+        LEAKPROOF is only a planner optimisation (BR-RLS-009 is a SHOULD).
+        Set ``BOUNDARY_FUNCTION_LEAKPROOF = True`` on a self-managed cluster
+        where the migrating role is a superuser to regain the optimisation.
+        """
+        return _setting("BOUNDARY_FUNCTION_LEAKPROOF", False)
+
+    @property
     def REGIONS(self):  # noqa: N802
         return _setting("BOUNDARY_REGIONS")
 

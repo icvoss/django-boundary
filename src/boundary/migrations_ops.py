@@ -66,7 +66,9 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
     """Create tenant isolation and admin bypass RLS policies.
 
     Must be applied after EnableRLS. Creates the boundary_current_tenant_id()
-    LEAKPROOF helper function if it does not already exist.
+    helper function if it does not already exist. The function is declared
+    LEAKPROOF only when BOUNDARY_FUNCTION_LEAKPROOF is set (default off), since
+    LEAKPROOF requires a superuser and managed Postgres grants none.
 
     Reversible: drops both policies.
     """
@@ -85,7 +87,7 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
         model = to_state.apps.get_model(app_label, self.model_name)
         table = model._meta.db_table
 
-        # Detect tenant column's database type for the LEAKPROOF function
+        # Detect tenant column's database type for the helper function
         pg_type = self._detect_tenant_column_type(model)
 
         # Honour the configurable session-variable names so the database
@@ -95,8 +97,16 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
         session_var = _sql_string_literal(boundary_settings.DB_SESSION_VAR)
         admin_flag = _sql_string_literal(boundary_settings.ADMIN_FLAG_VAR)
 
-        # Create the LEAKPROOF helper function (idempotent via CREATE OR REPLACE)
-        # Uses the detected column type so it works with both UUID and integer PKs.
+        # LEAKPROOF is a planner optimisation, not an isolation requirement, and
+        # only a superuser may declare it. Managed Postgres (DigitalOcean, RDS,
+        # Cloud SQL, Azure, Heroku, Supabase) grants no superuser role, so the
+        # migration would abort with "only superuser can define a leakproof
+        # function". Default off; opt in via BOUNDARY_FUNCTION_LEAKPROOF on a
+        # self-managed cluster where the migrating role is a superuser.
+        leakproof = " LEAKPROOF" if boundary_settings.FUNCTION_LEAKPROOF else ""
+
+        # Create the helper function (idempotent via CREATE OR REPLACE). Uses the
+        # detected column type so it works with both UUID and integer PKs.
         schema_editor.execute(f"""
             CREATE OR REPLACE FUNCTION boundary_current_tenant_id()
             RETURNS {pg_type} AS $$
@@ -107,7 +117,7 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
             EXCEPTION WHEN OTHERS THEN
                 RETURN NULL;
             END;
-            $$ LANGUAGE plpgsql STABLE LEAKPROOF
+            $$ LANGUAGE plpgsql STABLE{leakproof}
         """)
 
         # Isolation policy with WITH CHECK for INSERT enforcement (BR-RLS-008)

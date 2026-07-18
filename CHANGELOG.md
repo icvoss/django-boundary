@@ -4,6 +4,28 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-18
+
+### Added
+
+- **New setting `BOUNDARY_FUNCTION_LEAKPROOF`** (default `False`) controls
+  whether `CreateTenantPolicy` declares the `boundary_current_tenant_id()`
+  helper function `LEAKPROOF`.
+
+### Fixed
+
+- **`CreateTenantPolicy` no longer aborts on managed PostgreSQL.** The helper
+  function was declared `LEAKPROOF` unconditionally, but PostgreSQL only lets a
+  superuser create a `LEAKPROOF` function, and managed providers (DigitalOcean,
+  AWS RDS, GCP Cloud SQL, Azure, Heroku, Supabase) grant no superuser role. The
+  migration failed with `only superuser can define a leakproof function`,
+  making RLS unusable on the most common Django production hosting. `LEAKPROOF`
+  is now off by default and opt-in via `BOUNDARY_FUNCTION_LEAKPROOF`. It is a
+  query-planner optimisation only: tenant isolation is enforced identically with
+  or without it (the policy predicate is unchanged), so the default costs no
+  security. Superuser deployments on a self-managed cluster set
+  `BOUNDARY_FUNCTION_LEAKPROOF = True` to regain the optimisation.
+
 ## [0.4.1] - 2026-07-12
 
 ### Added

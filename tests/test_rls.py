@@ -141,14 +141,31 @@ class TestRLSOperations:
         enabled, forced = _has_rls("boundary_testapp_booking")
         assert enabled is False
 
-    def test_creates_leakproof_function(self):
+    def test_creates_helper_function_not_leakproof_by_default(self):
+        # LEAKPROOF requires a superuser (unavailable on managed Postgres), so
+        # the helper is created without it unless BOUNDARY_FUNCTION_LEAKPROOF is
+        # set. See conf.FUNCTION_LEAKPROOF and BR-RLS-009.
         _apply_rls()
         try:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT proleakproof FROM pg_proc WHERE proname = 'boundary_current_tenant_id'")
                 row = cursor.fetchone()
                 assert row is not None, "Function not created"
-                assert row[0] is True, "Function not LEAKPROOF"
+                assert row[0] is False, "Function should not be LEAKPROOF by default"
+        finally:
+            _remove_rls()
+
+    def test_creates_leakproof_function_when_opted_in(self, settings):
+        # Opt in via BOUNDARY_FUNCTION_LEAKPROOF. The test database role is a
+        # superuser, so the LEAKPROOF declaration is permitted here.
+        settings.BOUNDARY_FUNCTION_LEAKPROOF = True
+        _apply_rls()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT proleakproof FROM pg_proc WHERE proname = 'boundary_current_tenant_id'")
+                row = cursor.fetchone()
+                assert row is not None, "Function not created"
+                assert row[0] is True, "Function not LEAKPROOF when opted in"
         finally:
             _remove_rls()
 

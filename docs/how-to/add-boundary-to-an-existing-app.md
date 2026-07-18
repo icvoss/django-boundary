@@ -291,7 +291,7 @@ Apply it:
 python manage.py migrate
 ```
 
-`CreateTenantPolicy` creates a `LEAKPROOF` helper function that casts the PostgreSQL session variable to the right type (it detects UUID vs integer primary keys), an isolation policy with `USING` and `WITH CHECK`, and an admin bypass policy for management commands. Both operations are reversible via `migrate --reverse`.
+`CreateTenantPolicy` creates a helper function that casts the PostgreSQL session variable to the right type (it detects UUID vs integer primary keys), an isolation policy with `USING` and `WITH CHECK`, and an admin bypass policy for management commands. The helper is declared `LEAKPROOF` only when `BOUNDARY_FUNCTION_LEAKPROOF` is set (default off, because `LEAKPROOF` needs a superuser that managed Postgres does not grant). Both operations are reversible via `migrate --reverse`.
 
 The session variable is set by `TenantContext` (which the middleware drives) within a transaction. By default `BOUNDARY_WRAP_ATOMIC = True` wraps each request in `transaction.atomic()` so the session variable takes effect. Keep that on, or enable `ATOMIC_REQUESTS` on the database, otherwise the per-transaction session variable has no scope to apply to.
 

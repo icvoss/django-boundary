@@ -62,7 +62,7 @@ exposure during development.
 - **Management commands**: provision, deprovision (with NDJSON export), scoped run, run-all with parallelism
 - **Test utilities**: `set_tenant()`, `TenantTestMixin`, `tenant_factory()`
 - **System checks**: validates configuration at startup
-- **LEAKPROOF RLS functions**: prevents query planner information leakage
+- **Optional LEAKPROOF RLS functions**: opt-in planner optimisation (off by default so RLS migrations run on managed Postgres)
 - **Zero assumptions**: no opinion on auth, URL structure, or domain model
 
 ---
@@ -555,8 +555,11 @@ class Migration(migrations.Migration):
 ```
 
 `CreateTenantPolicy` generates:
-- A `LEAKPROOF` helper function (`boundary_current_tenant_id()`) that safely
-  casts the session variable to the correct type
+- A helper function (`boundary_current_tenant_id()`) that safely casts the
+  session variable to the correct type. Declared `LEAKPROOF` only when
+  `BOUNDARY_FUNCTION_LEAKPROOF` is set (default off, because `LEAKPROOF` needs a
+  superuser that managed Postgres does not grant); it is a planner optimisation,
+  not an isolation requirement
 - An isolation policy with `USING` + `WITH CHECK` (enforces on SELECT, INSERT,
   UPDATE, DELETE)
 - An admin bypass policy for management commands
