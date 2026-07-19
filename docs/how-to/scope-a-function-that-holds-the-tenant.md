@@ -75,6 +75,15 @@ assert TenantContext.get() is None
 
 ## Common pitfalls
 
+- **Works correctly outside a request, including in autocommit.** Management
+  commands, Celery tasks, and scripts run in autocommit by default, where
+  PostgreSQL's `SET LOCAL` (what `TenantContext` uses under the hood) has no
+  effect without a surrounding transaction. `@tenant_scoped` (via
+  `TenantContext.using()`) opens one automatically for its own body when none
+  is already active, so tenant-scoped queries and writes inside the decorated
+  function are correctly isolated even when called from a bare management
+  command or task. Controlled by `BOUNDARY_WRAP_ATOMIC` (default `True`). See
+  [issue #6](https://github.com/icvoss/django-boundary/issues/6).
 - **Pass a tenant instance, not a pk.** The argument is handed straight to
   `TenantContext.using()`, which expects the tenant object. If your task only
   receives an id, load the instance first (in a thin wrapper or the body) rather

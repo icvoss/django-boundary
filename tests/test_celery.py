@@ -85,3 +85,37 @@ class TestTenantTaskBase:
     def test_non_retriable_config(self):
         """BR-CEL-003: TenantTask excludes TenantNotFoundError from retry."""
         assert TenantTask.reject_on_worker_lost is False
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTenantTaskAutocommit:
+    """Regression for #6: worker-side restoration must survive autocommit.
+
+    Celery workers run in autocommit by default (BR-CEL-002/BR-CTX-003).
+    ``@pytest.mark.django_db(transaction=True)`` reproduces that: the test
+    itself runs with no ambient transaction, so without the atomic wrap the
+    session variable set by ``_restore_tenant_context`` would vanish before
+    the task body's own query ran.
+    """
+
+    def test_call_holds_db_session_var_for_task_body(self, tenant_a):
+        from django.db import connection
+
+        assert connection.in_atomic_block is False
+
+        seen = {}
+
+        class FakeRequest:
+            headers = {HEADER_TENANT_ID: str(tenant_a.pk)}
+
+        class ProbeTask(TenantTask):
+            request = FakeRequest()
+
+            def run(self):
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT current_setting('app.current_tenant_id', true)")
+                    seen["tenant_var"] = cursor.fetchone()[0]
+
+        ProbeTask()()
+
+        assert seen["tenant_var"] == str(tenant_a.pk)

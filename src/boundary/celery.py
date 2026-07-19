@@ -8,7 +8,7 @@ import logging
 from functools import wraps
 
 from boundary.conf import boundary_settings, get_tenant_model
-from boundary.context import TenantContext
+from boundary.context import TenantContext, _ensure_atomic
 from boundary.exceptions import TenantNotFoundError
 
 logger = logging.getLogger("boundary.celery")
@@ -34,6 +34,11 @@ def _restore_tenant_context(headers):
 
     Returns (tenant, token) or (None, None) if no tenant header present.
     Raises TenantNotFoundError if the referenced tenant no longer exists.
+
+    Does not open a transaction itself: Celery workers run in autocommit by
+    default, so callers (``tenant_task``, ``TenantTask.__call__``) MUST hold
+    the task body inside ``_ensure_atomic()`` for ``TenantContext.set()`` to
+    have any effect on the DB session variable (#6).
     """
     tenant_id = headers.get(HEADER_TENANT_ID) if headers else None
     if not tenant_id:
@@ -80,12 +85,16 @@ def tenant_task(func):
         except ImportError:
             headers = {}
 
-        tenant, token = _restore_tenant_context(headers)
-        try:
-            return func(*args, **kwargs)
-        finally:
-            if token is not None:
-                TenantContext.clear(token)
+        # Celery workers run in autocommit by default, so the DB session
+        # variable set() establishes needs an explicit transaction to survive
+        # past the first statement (#6). No-op if one is already active.
+        with _ensure_atomic():
+            tenant, token = _restore_tenant_context(headers)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                if token is not None:
+                    TenantContext.clear(token)
 
     return wrapper
 
@@ -113,11 +122,17 @@ class TenantTask:
         return super().apply_async(args=args, kwargs=kwargs, **options)
 
     def __call__(self, *args, **kwargs):
-        """Restore tenant context before task execution."""
+        """Restore tenant context before task execution.
+
+        Wraps the run in ``_ensure_atomic()`` so the DB session variable
+        survives for the whole task body under Celery's default autocommit
+        (#6); a no-op if a transaction is already active.
+        """
         headers = getattr(self.request, "headers", None) or {}
-        tenant, token = _restore_tenant_context(headers)
-        try:
-            return self.run(*args, **kwargs)
-        finally:
-            if token is not None:
-                TenantContext.clear(token)
+        with _ensure_atomic():
+            tenant, token = _restore_tenant_context(headers)
+            try:
+                return self.run(*args, **kwargs)
+            finally:
+                if token is not None:
+                    TenantContext.clear(token)

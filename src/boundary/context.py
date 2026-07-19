@@ -8,7 +8,7 @@ Celery tasks, and management commands.
 import functools
 import inspect
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any
 
@@ -20,6 +20,43 @@ from boundary.exceptions import TenantNotSetError
 logger = logging.getLogger("boundary.context")
 
 _current_tenant: ContextVar[Any | None] = ContextVar("boundary_current_tenant", default=None)
+
+
+def _ensure_atomic(using: str = "default"):
+    """Return a context manager that guarantees an active transaction.
+
+    ``set_config(..., true)`` is transaction-local (BR-CTX-002): it has no
+    effect once the surrounding transaction commits, and none at all if there
+    is no surrounding transaction. Inside a request, ``TenantMiddleware``
+    already wraps the call in ``transaction.atomic()``. Outside a request
+    (management commands, Celery tasks, ad hoc scripts) Django's default
+    ``AUTOCOMMIT = True`` means every statement is its own implicit
+    transaction, so the session variable set by ``TenantContext`` is gone
+    before the next query runs and RLS silently sees no tenant (#6).
+
+    This opens ``transaction.atomic(using=using)`` only when there is no
+    ambient transaction already, so nested use inside a request or an
+    existing ``atomic()`` block is a no-op (avoids an unnecessary savepoint).
+    Gated by ``BOUNDARY_WRAP_ATOMIC`` (default ``True``) so integrators who
+    manage transactions explicitly can opt out, matching the setting
+    ``TenantMiddleware`` already honours.
+    """
+    connection = connections[using]
+    if not boundary_settings.WRAP_ATOMIC:
+        if not connection.in_atomic_block:
+            logger.warning(
+                "TenantContext.using() entered outside an active transaction with "
+                "BOUNDARY_WRAP_ATOMIC=False. The tenant session variable will not "
+                "survive past the next statement and RLS will see no tenant. Wrap "
+                "this call in transaction.atomic(using=%r) explicitly.",
+                using,
+            )
+        return nullcontext()
+    if connection.in_atomic_block:
+        return nullcontext()
+    from django.db import transaction
+
+    return transaction.atomic(using=using)
 
 
 class TenantContext:
@@ -80,25 +117,37 @@ class TenantContext:
         On exit, explicitly restores both the ContextVar AND the DB session
         variable. Does NOT rely on savepoint rollback (BR-CTX-007).
 
+        Guarantees the DB session variable actually takes effect even when
+        called outside an ambient transaction (management commands, Celery
+        tasks, ad hoc scripts running under Django's default autocommit).
+        Without an active transaction, ``set_config(..., true)`` (BR-CTX-002)
+        is scoped to a one-statement implicit transaction and vanishes before
+        the next query runs, so tenant-scoped writes hit RLS with an empty
+        tenant var. ``using()`` opens ``transaction.atomic()`` for its own
+        body in that case (see ``_ensure_atomic``, gated by
+        ``BOUNDARY_WRAP_ATOMIC``), so the body always runs under the tenant
+        it just set (#6).
+
         Usage::
 
             with TenantContext.using(club):
                 Booking.objects.all()  # filtered to club
         """
         previous = cls.get()
-        token = cls.set(tenant, using=using)
-        try:
-            yield tenant
-        finally:
-            _current_tenant.reset(token)
-            # Explicitly restore DB session variable (BR-CTX-007)
+        with _ensure_atomic(using):
+            token = cls.set(tenant, using=using)
             try:
-                if previous is not None:
-                    cls._set_db_session(str(previous.pk), using=using)
-                else:
-                    cls._clear_db_session(using=using)
-            except Exception:
-                logger.warning("Failed to restore DB session variable", exc_info=True)
+                yield tenant
+            finally:
+                _current_tenant.reset(token)
+                # Explicitly restore DB session variable (BR-CTX-007)
+                try:
+                    if previous is not None:
+                        cls._set_db_session(str(previous.pk), using=using)
+                    else:
+                        cls._clear_db_session(using=using)
+                except Exception:
+                    logger.warning("Failed to restore DB session variable", exc_info=True)
 
     @staticmethod
     def _set_db_session(tenant_id: str, using: str = "default") -> None:

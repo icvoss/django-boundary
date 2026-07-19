@@ -4,6 +4,27 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TenantContext.using()` no longer silently no-ops outside a transaction.**
+  `set_config(..., true)` is transaction-local; outside a request (management
+  commands, Celery tasks, ad hoc scripts, all of which run in autocommit by
+  default), the session variable it set was gone before the next statement
+  ran, and a tenant-scoped write then failed deep in the database with an
+  opaque RLS error rather than at the `using()` call site. `using()` now opens
+  `transaction.atomic()` for its own body whenever one is not already active,
+  controlled by `BOUNDARY_WRAP_ATOMIC` (default `True`, matching the setting
+  `TenantMiddleware` already honours); it is a no-op when a transaction is
+  already active, so nesting inside a request or another `using()` block does
+  not open a redundant transaction. The Celery worker-side restoration
+  (`TenantTask.__call__`, `@tenant_task`) gets the same guarantee, since
+  Celery workers also run in autocommit by default. This fixes `using()`
+  itself and every API built on it: `tenant_scoped`, `boundary_run`,
+  `boundary_run_all`, and `boundary.testing`'s `set_tenant` / `call_view` /
+  `TenantTestMixin`. If `BOUNDARY_WRAP_ATOMIC` is deliberately set to `False`,
+  `using()` now logs a warning when entered outside a transaction rather than
+  failing silently. (#6)
+
 ## [0.5.0] - 2026-07-18
 
 ### Added

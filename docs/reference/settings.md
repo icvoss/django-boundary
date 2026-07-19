@@ -282,11 +282,13 @@ Whether `CreateTenantPolicy` declares the `boundary_current_tenant_id()` helper 
 | **Type** | `bool` |
 | **Default** | `True` |
 
-When `True`, `TenantMiddleware` wraps each request in `transaction.atomic()`. This ensures that `SET LOCAL` session variables (which are transaction-scoped in PostgreSQL) remain active for the full request duration and are automatically cleared on transaction close.
+When `True`, `TenantMiddleware` wraps each request in `transaction.atomic()`, and `TenantContext.using()` (plus the Celery worker-side restoration in `TenantTask`/`tenant_task`) does the same for its own body whenever it is entered outside an ambient transaction. This ensures that `SET LOCAL` session variables (which are transaction-scoped in PostgreSQL) remain active for as long as the tenant is meant to be active, and are automatically cleared on transaction close. It is a no-op wherever a transaction is already active (inside a request, inside another `using()` block), so it never opens a redundant nested transaction.
 
-**When to change it:** Set to `False` only if you manage transactions explicitly at the view level and have confirmed that your RLS session variables are still correctly scoped. This is an advanced configuration; the default is safe for virtually all cases.
+This matters well beyond requests: management commands (`boundary_run`, `boundary_run_all`), Celery tasks, and ad hoc scripts all run in autocommit by default. Without this behaviour, `TenantContext.using()` outside a transaction silently sets a session variable that is gone before the next statement runs, and the tenant-scoped write fails deep in the database with an opaque RLS error rather than at the call site. See [issue #6](https://github.com/icvoss/django-boundary/issues/6).
 
-**Trade-off:** Disabling this means `SET LOCAL` variables may not persist as expected if a transaction boundary is crossed mid-request, potentially causing RLS policy violations or `TenantNotSetError` in subsequent queries within the same request.
+**When to change it:** Set to `False` only if you manage transactions explicitly everywhere `TenantContext` is used (view level, management commands, Celery tasks) and have confirmed that your RLS session variables are still correctly scoped. This is an advanced configuration; the default is safe for virtually all cases. With it `False`, `TenantContext.using()` logs a warning if entered outside an active transaction, since the session variable will not take effect.
+
+**Trade-off:** Disabling this means `SET LOCAL` variables may not persist as expected if a transaction boundary is crossed mid-request (or a management command/Celery task never opens one), potentially causing RLS policy violations or `TenantNotSetError` in subsequent queries.
 
 ---
 

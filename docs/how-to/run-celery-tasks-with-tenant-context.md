@@ -136,6 +136,15 @@ assert headers[HEADER_TENANT_ID] == str(tenant_a.pk)
 
 ## Common pitfalls
 
+- **Celery workers run in autocommit; boundary handles this for you.** Both
+  `TenantTask.__call__` and `@tenant_task` wrap the restored tenant context in
+  a transaction for the duration of the task body when one is not already
+  active, so the DB session variable `set_config()` establishes survives for
+  the whole task rather than vanishing after the first statement. This is
+  controlled by `BOUNDARY_WRAP_ATOMIC` (default `True`); you do not need to
+  wrap your task body in `transaction.atomic()` yourself. See
+  [issue #6](https://github.com/icvoss/django-boundary/issues/6).
+
 - **`TenantNotFoundError` is not retriable.** If the tenant referenced by the
   header no longer exists when the worker restores context, boundary raises
   `boundary.exceptions.TenantNotFoundError`. This is deliberate: retrying will

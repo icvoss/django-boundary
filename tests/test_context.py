@@ -115,6 +115,72 @@ class TestTenantContextSavepointBehaviour:
                 TenantContext.clear(token)
 
 
+@pytest.mark.django_db(transaction=True)
+class TestTenantContextAutocommit:
+    """Regression for #6: using() must not silently no-op in autocommit.
+
+    ``@pytest.mark.django_db(transaction=True)`` runs the test itself without
+    an ambient transaction (real autocommit), the same condition management
+    commands and Celery workers run under in production. Without the fix,
+    ``set_config(..., true)`` set inside ``using()`` vanishes before the
+    assertion's own SELECT, because each is its own implicit transaction.
+    """
+
+    def _get_session_var(self):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('app.current_tenant_id', true)")
+            return cursor.fetchone()[0]
+
+    def test_using_sets_db_session_var_outside_any_transaction(self, tenant_a):
+        """BR-CTX-003: using() must open its own transaction when none is active."""
+        from django.db import connection
+
+        assert connection.in_atomic_block is False  # sanity: genuinely autocommit
+
+        with TenantContext.using(tenant_a):
+            assert self._get_session_var() == str(tenant_a.pk)
+
+    def test_using_write_survives_rls_outside_any_transaction(self, tenant_a):
+        """A tenant-scoped write inside using() must not hit an empty RLS var
+        when called with no surrounding transaction.atomic() (the exact
+        failure mode reported in #6: an opaque RLS violation from a
+        management command or Celery task)."""
+        from boundary_testapp.models import Booking
+        from django.db import connection
+
+        assert connection.in_atomic_block is False
+
+        with TenantContext.using(tenant_a):
+            booking = Booking.objects.create(court=1)
+
+        assert booking.tenant_id == tenant_a.pk
+
+    def test_using_is_noop_wrap_when_already_atomic(self, tenant_a):
+        """using() must not open a redundant nested transaction when one is
+        already active (e.g. called from inside TenantMiddleware's atomic
+        block, or nested using() calls)."""
+        from django.db import transaction
+
+        with transaction.atomic(), TenantContext.using(tenant_a):
+            assert self._get_session_var() == str(tenant_a.pk)
+            # Still the *same* outer transaction, not a new one.
+            assert transaction.get_connection().in_atomic_block is True
+
+    def test_wrap_atomic_false_leaves_var_unset_and_warns(self, tenant_a, settings, caplog):
+        """With BOUNDARY_WRAP_ATOMIC=False, using() must not silently pretend
+        to work: the session variable has no effect (documented trade-off),
+        and a warning is logged identifying the call as ineffective."""
+        settings.BOUNDARY_WRAP_ATOMIC = False
+
+        with caplog.at_level("WARNING", logger="boundary.context"), TenantContext.using(tenant_a):
+            val = self._get_session_var()
+
+        assert val == ""
+        assert any("outside an active transaction" in record.message for record in caplog.records)
+
+
 class TestTenantContextAtomicRollback:
     """BR-CTX-008: ContextVar rolled back if _set_db_session fails."""
 
