@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-22
+
 ### Fixed
 
 - **`TenantContext.using()` no longer silently no-ops outside a transaction.**
