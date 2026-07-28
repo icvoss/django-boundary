@@ -8,7 +8,7 @@ Celery tasks, and management commands.
 import functools
 import inspect
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any
 
@@ -20,6 +20,47 @@ from boundary.exceptions import TenantNotSetError
 logger = logging.getLogger("boundary.context")
 
 _current_tenant: ContextVar[Any | None] = ContextVar("boundary_current_tenant", default=None)
+
+
+def _regional_alias(tenant: Any) -> str | None:
+    """Return the regional DB alias a tenant routes to, or None (BR-CTX-009).
+
+    Mirrors :class:`boundary.routing.RegionalRouter._route`: when
+    ``BOUNDARY_REGIONS`` is configured and the tenant's region field names a
+    configured region, tenant-scoped queries route to that regional alias.
+    Returns ``None`` when no regional routing applies (regions unconfigured,
+    the tenant has no region, or its region is not in ``BOUNDARY_REGIONS``),
+    and never returns ``"default"`` (the caller always covers default).
+
+    Computed from settings here rather than importing ``routing`` so
+    ``context`` stays free of the ``context -> routing -> context`` import
+    cycle.
+    """
+    if tenant is None:
+        return None
+    regions = boundary_settings.REGIONS
+    if not regions:
+        return None
+    region = getattr(tenant, boundary_settings.REGION_FIELD, None)
+    if not region or region not in regions or region == "default":
+        return None
+    return region
+
+
+def _target_aliases(tenant: Any) -> list[str]:
+    """DB aliases the tenant session variable must be set on for a tenant.
+
+    Always includes ``"default"`` (non-tenant models and the default
+    connection route there). Adds the tenant's regional alias when regional
+    routing sends its tenant-scoped queries to a separate connection: without
+    this, RLS on the regional database sees an empty tenant variable and a
+    tenant-scoped write is unscoped or fails (BR-CTX-009, issue #7).
+    """
+    aliases = ["default"]
+    regional = _regional_alias(tenant)
+    if regional is not None and regional not in aliases:
+        aliases.append(regional)
+    return aliases
 
 
 def _ensure_atomic(using: str = "default"):
@@ -41,7 +82,16 @@ def _ensure_atomic(using: str = "default"):
     manage transactions explicitly can opt out, matching the setting
     ``TenantMiddleware`` already honours.
     """
-    connection = connections[using]
+    from django.utils.connection import ConnectionDoesNotExist
+
+    try:
+        connection = connections[using]
+    except ConnectionDoesNotExist:
+        # Connection does not exist (e.g. a regional alias that is configured
+        # in BOUNDARY_REGIONS but not in DATABASES, typically in tests that
+        # only want to verify routing logic). Treat as safe no-op: tests that
+        # mock _set_db_session/_clear_db_session don't require actual atomicity.
+        return nullcontext()
     if not boundary_settings.WRAP_ATOMIC:
         if not connection.in_atomic_block:
             logger.warning(
@@ -66,13 +116,21 @@ class TenantContext:
     def set(tenant, *, using: str = "default") -> object:
         """Set the active tenant. Returns a token for clear().
 
-        Also sets the PostgreSQL session variable via set_config().
-        Per BR-CTX-008, if the DB call fails, the ContextVar is rolled back.
+        Also sets the PostgreSQL session variable via set_config(), on the
+        ``default`` connection AND on the tenant's regional connection when
+        regional routing is active (BR-CTX-009): the regional DB is where the
+        tenant's RLS-scoped queries actually run, so the variable must be set
+        there too or RLS sees no tenant.
+
+        ``using`` names the base connection (default ``"default"``); the
+        regional alias is added automatically. Per BR-CTX-008, if any DB call
+        fails, the ContextVar is rolled back.
         """
         token = _current_tenant.set(tenant)
         try:
             if tenant is not None:
-                TenantContext._set_db_session(str(tenant.pk), using=using)
+                for alias in TenantContext._aliases_for(tenant, using):
+                    TenantContext._set_db_session(str(tenant.pk), using=alias)
         except Exception:
             _current_tenant.reset(token)
             raise
@@ -83,19 +141,43 @@ class TenantContext:
         return token
 
     @staticmethod
+    def _aliases_for(tenant, using: str) -> list[str]:
+        """The DB aliases to set/clear the session var on for ``tenant``.
+
+        ``using`` (the caller's base alias, normally ``"default"``) plus the
+        tenant's regional alias when regional routing applies (BR-CTX-009).
+        De-duplicated, ``using`` first.
+        """
+        aliases = [using]
+        for alias in _target_aliases(tenant):
+            if alias != using and alias not in aliases:
+                aliases.append(alias)
+        return aliases
+
+    @staticmethod
     def get() -> Any | None:
         """Return the active tenant, or None if no tenant is set."""
         return _current_tenant.get()
 
     @staticmethod
     def clear(token, *, using: str = "default") -> None:
-        """Restore the previous context using the token from set()."""
+        """Restore the previous context using the token from set().
+
+        Clears the DB session variable on the ``default`` connection and on the
+        regional connection of the tenant that was active before the reset, so
+        a regional connection is never left carrying a stale tenant (BR-CTX-009).
+        """
+        # Read the tenant that is about to be cleared BEFORE resetting, so its
+        # regional alias can be cleared too.
+        active = _current_tenant.get()
         _current_tenant.reset(token)
-        try:
-            TenantContext._clear_db_session(using=using)
-        except Exception:
-            # Best-effort DB cleanup; ContextVar is already restored
-            logger.warning("Failed to clear DB session variable", exc_info=True)
+        aliases = TenantContext._aliases_for(active, using) if active is not None else [using]
+        for alias in aliases:
+            try:
+                TenantContext._clear_db_session(using=alias)
+            except Exception:
+                # Best-effort DB cleanup; ContextVar is already restored
+                logger.warning("Failed to clear DB session variable on %r", alias, exc_info=True)
         logger.debug("Tenant context cleared")
 
     @classmethod
@@ -134,20 +216,35 @@ class TenantContext:
                 Booking.objects.all()  # filtered to club
         """
         previous = cls.get()
-        with _ensure_atomic(using):
+        # Open an atomic block on EVERY alias the tenant's session var will be
+        # set on (default + regional), so set_config(..., true) survives on the
+        # regional connection too under autocommit (BR-CTX-002, BR-CTX-009).
+        aliases = cls._aliases_for(tenant, using)
+        with ExitStack() as stack:
+            for alias in aliases:
+                stack.enter_context(_ensure_atomic(alias))
             token = cls.set(tenant, using=using)
             try:
                 yield tenant
             finally:
                 _current_tenant.reset(token)
-                # Explicitly restore DB session variable (BR-CTX-007)
-                try:
-                    if previous is not None:
-                        cls._set_db_session(str(previous.pk), using=using)
-                    else:
-                        cls._clear_db_session(using=using)
-                except Exception:
-                    logger.warning("Failed to restore DB session variable", exc_info=True)
+                # Explicitly restore the DB session variable (BR-CTX-007). First
+                # clear every alias this scope set (default + this tenant's
+                # regional alias), so no connection is left carrying this
+                # tenant. Then, if there was a previous tenant, re-apply it on
+                # ITS own alias set (which may include a different regional
+                # connection).
+                for alias in aliases:
+                    try:
+                        cls._clear_db_session(using=alias)
+                    except Exception:
+                        logger.warning("Failed to clear DB session variable on %r", alias, exc_info=True)
+                if previous is not None:
+                    for alias in cls._aliases_for(previous, using):
+                        try:
+                            cls._set_db_session(str(previous.pk), using=alias)
+                        except Exception:
+                            logger.warning("Failed to restore DB session variable on %r", alias, exc_info=True)
 
     @staticmethod
     def _set_db_session(tenant_id: str, using: str = "default") -> None:

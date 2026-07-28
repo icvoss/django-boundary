@@ -268,3 +268,117 @@ class TestTenantScopedDecorator:
 
         assert count_for(tenant_a) == 1
         assert count_for(tenant_b) == 1
+
+
+class TestRegionalSessionVarUnit:
+    """Issue #7 / BR-CTX-009: alias resolution for the regional session var.
+
+    Pure-unit tests of the alias helpers (no DB): a tenant whose region is a
+    configured region routes its tenant-scoped queries to that regional
+    connection, so the session var must be set there too, not only on default.
+    """
+
+    def test_target_aliases_default_only_without_regions(self, settings):
+        from boundary.context import _target_aliases
+
+        settings.BOUNDARY_REGIONS = None
+
+        class T:
+            pk = 1
+            region = "eu-west"
+
+        assert _target_aliases(T()) == ["default"]
+
+    def test_target_aliases_includes_regional_alias(self, settings):
+        from boundary.context import _target_aliases
+
+        settings.BOUNDARY_REGIONS = {"eu-west": {}, "us": {}}
+
+        class T:
+            pk = 1
+            region = "eu-west"
+
+        assert _target_aliases(T()) == ["default", "eu-west"]
+
+    def test_target_aliases_unknown_region_is_default_only(self, settings):
+        from boundary.context import _target_aliases
+
+        settings.BOUNDARY_REGIONS = {"eu-west": {}}
+
+        class T:
+            pk = 1
+            region = "ap-southeast"  # not configured
+
+        assert _target_aliases(T()) == ["default"]
+
+    def test_target_aliases_none_tenant(self):
+        from boundary.context import _target_aliases
+
+        assert _target_aliases(None) == ["default"]
+
+
+class TestRegionalSessionVarIsSet:
+    """Issue #7 / BR-CTX-009: the session var is set ON the regional connection.
+
+    The test settings define only a ``default`` database, so these spy on
+    ``_set_db_session`` / ``_clear_db_session`` to assert the fix sets and
+    clears the variable on the tenant's regional alias, which pre-fix never
+    happened (RLS on the regional DB saw an empty tenant, silent mis-scoping).
+    """
+
+    def _regional_tenant(self):
+        from boundary_testapp.models import Tenant
+
+        t = Tenant(name="EU Club", slug="eu-club")
+        t.region = "eu-west"
+        return t
+
+    def test_set_writes_session_var_on_regional_alias(self, settings, monkeypatch):
+        settings.BOUNDARY_REGIONS = {"eu-west": {}, "us": {}}
+        calls = []
+        monkeypatch.setattr(
+            TenantContext,
+            "_set_db_session",
+            staticmethod(lambda tenant_id, using="default": calls.append((tenant_id, using))),
+        )
+
+        tenant = self._regional_tenant()
+        tenant.pk = 42
+        TenantContext.set(tenant)
+
+        aliases = [using for _tid, using in calls]
+        assert "default" in aliases
+        assert "eu-west" in aliases, "session var must be set on the tenant's regional connection (BR-CTX-009)"
+
+    def test_no_regional_write_when_regions_unconfigured(self, settings, monkeypatch):
+        settings.BOUNDARY_REGIONS = None
+        calls = []
+        monkeypatch.setattr(
+            TenantContext,
+            "_set_db_session",
+            staticmethod(lambda tenant_id, using="default": calls.append((tenant_id, using))),
+        )
+
+        tenant = self._regional_tenant()
+        tenant.pk = 42
+        TenantContext.set(tenant)
+
+        assert [using for _tid, using in calls] == ["default"]
+
+    def test_clear_clears_regional_alias(self, settings, monkeypatch):
+        settings.BOUNDARY_REGIONS = {"eu-west": {}}
+        monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
+        cleared = []
+        monkeypatch.setattr(
+            TenantContext,
+            "_clear_db_session",
+            staticmethod(lambda using="default": cleared.append(using)),
+        )
+
+        tenant = self._regional_tenant()
+        tenant.pk = 42
+        token = TenantContext.set(tenant)
+        TenantContext.clear(token)
+
+        assert "default" in cleared
+        assert "eu-west" in cleared, "regional connection must be cleared too, not left carrying a stale tenant"

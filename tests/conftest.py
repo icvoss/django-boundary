@@ -54,3 +54,19 @@ def inactive_tenant(db):
     from boundary_testapp.models import Tenant
 
     return Tenant.objects.create(name="Closed Club", slug="closed", is_active=False)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_tenant_context():
+    """Clear any lingering tenant context after each test.
+
+    Ensures test isolation: a monkeypatch in one test or a failed context
+    manager exit doesn't leave a stale tenant in _current_tenant for the next
+    test to see.
+    """
+    yield
+    from boundary.context import TenantContext, _current_tenant
+
+    # Only clear if something is set; this is best-effort cleanup.
+    if TenantContext.get() is not None:
+        _current_tenant.set(None)
