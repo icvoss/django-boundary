@@ -24,11 +24,19 @@ class TestRegionalRouterWithConfig:
     """AC-REG-001/002: Routes by tenant region; non-tenant models use default."""
 
     @pytest.fixture(autouse=True)
-    def _setup_regions(self, settings):
+    def _setup_regions(self, settings, monkeypatch):
+        from boundary.context import TenantContext
+
         settings.BOUNDARY_REGIONS = {
             "eu-west": {"ENGINE": "django.db.backends.postgresql"},
             "us": {"ENGINE": "django.db.backends.postgresql"},
         }
+        # Mock _set_db_session and _clear_db_session to avoid requiring
+        # regional DB connections during routing tests (BR-CTX-009 will
+        # attempt to set session var on the regional connection, but these
+        # tests only need to verify routing logic).
+        monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(TenantContext, "_clear_db_session", staticmethod(lambda *a, **k: None))
 
     def test_routes_to_tenant_region(self, tenant_a):
         from boundary_testapp.models import Booking
@@ -99,6 +107,13 @@ class TestAllRegions:
 class TestSpecificRegion:
     """AC-REG-005: specific_region pinning."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_db_session(self, monkeypatch):
+        """Mock _set_db_session to avoid requiring regional DB connections."""
+        from boundary.context import TenantContext
+
+        monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
+
     def test_overrides_tenant_region(self, tenant_a, settings):
         from boundary_testapp.models import Booking
 
@@ -129,6 +144,13 @@ class TestSpecificRegion:
 @pytest.mark.django_db
 class TestRequireRegion:
     """Issue #6: require_region() raises instead of silently using default."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_db_session(self, monkeypatch):
+        """Mock _set_db_session to avoid requiring regional DB connections."""
+        from boundary.context import TenantContext
+
+        monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
 
     def test_returns_region_for_routable_tenant(self, tenant_a, settings):
         settings.BOUNDARY_REGIONS = {"eu-west": {}, "us": {}}

@@ -4,7 +4,26 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
-## [0.5.1] - 2026-07-22
+## [0.5.2] - 2026-07-28
+
+### Fixed
+
+- **Regional RLS: the tenant session variable is now set on the regional
+  connection, not only `default`** (issue #7, BR-CTX-009). With
+  `BOUNDARY_REGIONS` configured, `RegionalRouter` sends a tenant's
+  tenant-scoped queries to its regional database alias, but `TenantContext`
+  only ever ran `set_config()` on `default`. Row-level security on the
+  regional database therefore saw an empty tenant variable, so a
+  tenant-scoped write was silently mis-scoped or failed with no indication at
+  the call site, the same silent-data-loss class as the autocommit gap fixed
+  in 0.5.1. `TenantContext.set()`, `using()`, and `clear()` now resolve the
+  tenant's regional alias (via the new internal `_regional_alias()` /
+  `_aliases_for()` helpers, computed from settings to avoid a
+  `context -> routing` import cycle) and set, restore, and clear the session
+  variable on `default` AND that regional connection. `using()` opens the
+  autocommit-guard transaction on every target alias so the transaction-local
+  `set_config(..., true)` survives on the regional connection too. No effect
+  when regions are unconfigured (the single-region path is unchanged).
 
 ### Fixed
 
