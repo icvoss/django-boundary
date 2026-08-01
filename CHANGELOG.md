@@ -49,8 +49,13 @@ All notable changes to django-boundary are documented here.
   first, then `ICV_TENANT_MODEL`, raising `ImproperlyConfigured` naming both
   settings if neither is set) now backs both FK declarations and both
   checks, so a project configured with only `ICV_TENANT_MODEL` starts
-  cleanly. Whichever setting resolves remains structural: it is baked into
-  the FK (and your migrations) at import time, exactly as before. (#15)
+  cleanly. One deliberate exception-type change rides along:
+  `get_tenant_model()` now raises `ImproperlyConfigured` for the
+  missing-setting case (previously `LookupError`), the Django idiom for a
+  configuration error; the `LookupError` raised when the dotted path does
+  not name an installed model is unchanged. Whichever setting resolves
+  remains structural: it is baked into the FK (and your migrations) at
+  import time, exactly as before. (#15)
 
 ### Changed
 
