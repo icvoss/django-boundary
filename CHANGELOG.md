@@ -36,6 +36,22 @@ All notable changes to django-boundary are documented here.
   tenant is now active, re-sets the variable to that tenant's pk on its own
   alias set. (#13)
 
+- **`ICV_TENANT_MODEL` alone is now enough to start a project.**
+  `boundary.conf.get_tenant_model()` and `boundary_settings.TENANT_MODEL`
+  already fell back from `BOUNDARY_TENANT_MODEL` to `ICV_TENANT_MODEL`
+  (ADR-025 T2), but `boundary.models` read `settings.BOUNDARY_TENANT_MODEL`
+  directly at import time in both `TenantMixin`'s and `make_tenant_mixin()`'s
+  foreign key declarations, raising a bare `AttributeError` before either
+  setting's fallback ever got a chance to run. `boundary.checks` had the
+  same gap: `_check_tenant_model()` (`boundary.E001`) and
+  `_check_rls_enabled()` read only `BOUNDARY_TENANT_MODEL`. A new
+  `boundary.conf.resolve_tenant_model_setting()` helper (`BOUNDARY_TENANT_MODEL`
+  first, then `ICV_TENANT_MODEL`, raising `ImproperlyConfigured` naming both
+  settings if neither is set) now backs both FK declarations and both
+  checks, so a project configured with only `ICV_TENANT_MODEL` starts
+  cleanly. Whichever setting resolves remains structural: it is baked into
+  the FK (and your migrations) at import time, exactly as before. (#15)
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed

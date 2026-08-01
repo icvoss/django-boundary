@@ -22,26 +22,35 @@ def check_boundary_configuration(app_configs, **kwargs):
 
 
 def _check_tenant_model():
-    """E001: BOUNDARY_TENANT_MODEL must be set and refer to an installed model."""
+    """E001: a tenant model must be set (BOUNDARY_TENANT_MODEL or its
+    ICV_TENANT_MODEL fallback, ADR-025 T2) and refer to an installed model.
+    """
     from django.apps import apps
     from django.conf import settings
 
-    model_string = getattr(settings, "BOUNDARY_TENANT_MODEL", None)
+    boundary_setting = getattr(settings, "BOUNDARY_TENANT_MODEL", None)
+    icv_setting = getattr(settings, "ICV_TENANT_MODEL", None)
+    model_string = boundary_setting or icv_setting
     if not model_string:
         return [
             Error(
-                "BOUNDARY_TENANT_MODEL is not set.",
-                hint="Add BOUNDARY_TENANT_MODEL = 'app_label.ModelName' to settings.",
+                "Neither BOUNDARY_TENANT_MODEL nor ICV_TENANT_MODEL is set.",
+                hint=(
+                    "Add BOUNDARY_TENANT_MODEL = 'app_label.ModelName' to settings, or "
+                    "ICV_TENANT_MODEL = 'app_label.ModelName' if another ecosystem package "
+                    "(e.g. icv-identity) already sets it (ADR-025 T2)."
+                ),
                 id="boundary.E001",
             )
         ]
 
+    source_setting = "BOUNDARY_TENANT_MODEL" if boundary_setting else "ICV_TENANT_MODEL"
     try:
         apps.get_model(model_string)
     except LookupError:
         return [
             Error(
-                f"BOUNDARY_TENANT_MODEL = '{model_string}' does not refer to an installed model.",
+                f"{source_setting} = '{model_string}' does not refer to an installed model.",
                 hint="Check the app_label.ModelName format and ensure the app is in INSTALLED_APPS.",
                 id="boundary.E001",
             )
@@ -160,7 +169,10 @@ def _check_rls_enabled():
     if connection.vendor != "postgresql":
         return []
 
-    model_string = getattr(settings, "BOUNDARY_TENANT_MODEL", None)
+    # Resolved the same way as boundary.conf.get_tenant_model(): either
+    # setting is enough to gate on, and if neither is set E001 already
+    # reports it, so this check has nothing useful to add.
+    model_string = getattr(settings, "BOUNDARY_TENANT_MODEL", None) or getattr(settings, "ICV_TENANT_MODEL", None)
     if not model_string:
         return []  # E001 will catch this
 

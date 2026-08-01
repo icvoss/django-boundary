@@ -671,7 +671,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `BOUNDARY_TENANT_MODEL` | **Required**, falls back to `ICV_TENANT_MODEL` | Dotted path to tenant model, e.g. `"tenants.Organisation"`. `ICV_TENANT_MODEL` is the single ecosystem-wide tenant-model knob (ADR-025 T2); set it once if other packages (e.g. icv-identity) already read it |
+| `BOUNDARY_TENANT_MODEL` | **Required**, falls back to `ICV_TENANT_MODEL` | Dotted path to tenant model, e.g. `"tenants.Organisation"`. `ICV_TENANT_MODEL` is the single ecosystem-wide tenant-model knob (ADR-025 T2); set it once if other packages (e.g. icv-identity) already read it. `BOUNDARY_TENANT_MODEL` always wins if both are set. Whichever setting resolves is structural: it is baked into `TenantMixin`'s and `make_tenant_mixin()`'s foreign key (and therefore into your migrations) at import time, so changing either setting afterwards needs a new migration, the same as changing any other FK target. A project with neither setting configured fails fast at startup with `ImproperlyConfigured` naming both settings |
 | `BOUNDARY_TENANT_FK_FIELD` | `"tenant"` | Default FK field name used by `make_tenant_mixin()` when no explicit name is passed |
 | `BOUNDARY_TENANT_LABEL` | `BOUNDARY_TENANT_FK_FIELD` | Human-readable term used in error messages, FK `verbose_name`, and middleware HTTP response bodies |
 | `BOUNDARY_REQUEST_ATTR` | `BOUNDARY_TENANT_FK_FIELD` | Extra attribute set on the request object alongside `request.tenant` (e.g. `request.merchant`). When equal to `"tenant"`, no second attribute is added |
@@ -697,7 +697,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 
 | ID | Severity | Condition |
 |----|----------|-----------|
-| `boundary.E001` | Error | `BOUNDARY_TENANT_MODEL` missing or invalid |
+| `boundary.E001` | Error | Neither `BOUNDARY_TENANT_MODEL` nor its `ICV_TENANT_MODEL` fallback is set, or whichever one is set is invalid |
 | `boundary.E003` | Error | Resolver class cannot be imported |
 | `boundary.E004` | Error | TenantMiddleware not in MIDDLEWARE |
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
