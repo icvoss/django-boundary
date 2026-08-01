@@ -346,10 +346,18 @@ def make_tenant_path_mixin(tenant_path: str):
 
         make_tenant_path_mixin("export_log__destination__merchant")
 
-    Note: path-scoped models cannot carry a PostgreSQL RLS policy on a local
-    column (they have none). They inherit isolation from the parent on the
-    path, which carries the policy, and are skipped by boundary's RLS system
-    check and provisioning. Application-layer auto-filtering still applies.
+    Note (issue #14): relation-scoped isolation is an APPLICATION-LAYER
+    feature only, by intentional contract. The child table carries NO RLS
+    policy, and none is created for it (this model is skipped by boundary's
+    RLS system check and provisioning). PostgreSQL RLS is table-specific: the
+    parent's policy (e.g. ``Destination``'s policy on its ``merchant_id``)
+    constrains scans of the PARENT table, so an ORM query that joins through
+    the path is constrained too, but it does NOT constrain direct SQL,
+    unscoped managers, or third-party database access run directly against
+    THIS table. Rows that need database-level isolation must own a tenant FK
+    of their own and use :class:`TenantMixin` or :func:`make_tenant_mixin`
+    instead. See docs/how-to/scope-models-through-a-relation.md for the full
+    contract.
 
     Args:
         tenant_path: ORM lookup path to the tenant, e.g.

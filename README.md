@@ -308,7 +308,12 @@ Two independent layers enforce tenant isolation:
 2. **PostgreSQL RLS**: Row Level Security policies enforce isolation at the
    database level, catching raw SQL, third-party packages, and ORM bugs.
 
-A bug in one layer is caught by the other.
+A bug in one layer is caught by the other. This RLS layer only exists for
+models with their own tenant column (`TenantMixin` / `make_tenant_mixin`).
+Relation-scoped (path-scoped) models built with `make_tenant_path_mixin` are
+protected at the ORM layer only: see
+[Scope a model through a relation](docs/how-to/scope-models-through-a-relation.md)
+for the exact contract before relying on RLS to catch direct SQL against one.
 
 ---
 

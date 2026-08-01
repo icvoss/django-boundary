@@ -87,13 +87,20 @@ boundary handles all of this for you:
   validation that direct-FK models get is skipped.
 - **`get_or_create` / `update_or_create` inject nothing.** They rely on the
   auto-filtered queryset to scope the lookup.
-- **No RLS on this table.** A PostgreSQL Row Level Security policy needs a local
-  column. Path-scoped models are **excluded** from boundary's RLS system check
-  and provisioning. Database-level isolation must come from the parent on the
-  path (e.g. `Destination` carries the RLS policy on its `merchant_id`), with
-  application-layer auto-filtering protecting the path model itself. If you need
-  RLS directly on the row, give the model its own FK and use `TenantMixin`
-  instead.
+- **No RLS on this table. This is an application-layer-only feature by intentional
+  contract, not a gap to be filled later.** A PostgreSQL Row Level Security policy
+  needs a local column, and path-scoped models have none, so none is created:
+  they are **excluded** from boundary's RLS system check and provisioning.
+
+  > **Warning:** direct SQL against this table (raw queries, an unscoped
+  > report, a third-party tool connecting straight to Postgres) returns
+  > **every tenant's rows**, not just the active one's. PostgreSQL RLS is
+  > table-specific: the parent's policy (e.g. `Destination`'s policy on its
+  > `merchant_id`) constrains scans of the **parent** table, so an ORM query
+  > that joins through the path is constrained too, but it does **not**
+  > constrain anything that queries this child table directly. If a row
+  > needs database-level isolation, it must own a tenant FK of its own and
+  > use `TenantMixin` (or `make_tenant_mixin`) instead of this mixin.
 
 ## Introspection
 

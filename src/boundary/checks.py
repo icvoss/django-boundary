@@ -184,9 +184,13 @@ def _check_rls_enabled():
             continue
         if model._meta.abstract:
             continue
-        # Path-scoped models have no local tenant column to put an RLS policy
-        # on. They inherit isolation from the parent on their path, which
-        # carries the policy. Skip them here.
+        # Path-scoped models (make_tenant_path_mixin) have no local tenant
+        # column to put an RLS policy on, and this exemption is intentional,
+        # not a gap: relation-scoped isolation is an application-layer-only
+        # contract (issue #14). The parent's policy protects the parent
+        # table (and therefore ORM queries that join through the path), but
+        # never the child table itself, so there is deliberately nothing to
+        # check here. See docs/how-to/scope-models-through-a-relation.md.
         if not has_tenant_column(model):
             continue
 

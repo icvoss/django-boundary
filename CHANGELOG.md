@@ -52,6 +52,26 @@ All notable changes to django-boundary are documented here.
   cleanly. Whichever setting resolves remains structural: it is baked into
   the FK (and your migrations) at import time, exactly as before. (#15)
 
+### Changed
+
+- **The documented contract for relation-scoped (path-scoped) models is now
+  explicit: they are protected at the ORM layer only, never at the database
+  layer.** `make_tenant_path_mixin()` models have no local tenant column and
+  therefore no RLS policy, and `boundary.checks` intentionally exempts them
+  from `boundary.E006`. The previous docstring and README wording described
+  this as "inheriting isolation from the parent on the path", which reads as
+  database-level protection; it is not. PostgreSQL RLS is table-specific:
+  the parent's policy constrains scans of the *parent* table (so an ORM
+  query joining through the path is constrained too), but it does **not**
+  constrain direct SQL, unscoped managers, or third-party access run
+  straight against the child table. `make_tenant_path_mixin()`'s docstring,
+  the `boundary.E006` skip comment, the
+  `docs/how-to/scope-models-through-a-relation.md` how-to (now with an
+  explicit warning), and the README's defence-in-depth section are corrected
+  to state this plainly, and a new raw-SQL test in `tests/test_rls.py` pins
+  the contract: an unscoped query against a path-scoped child table returns
+  every tenant's rows even with RLS applied to its parent. (#14)
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed
