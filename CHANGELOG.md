@@ -4,6 +4,26 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TenantMiddleware` no longer breaks under ASGI.** It subclassed
+  `MiddlewareMixin`, which declares `async_capable = True`, while overriding
+  `__call__` with a purely synchronous body. Under ASGI, Django therefore
+  handed it an async `get_response` and treated the instance as a coroutine
+  function; the sync `__call__` called that async `get_response` without
+  awaiting it, so the `try`/`finally` cleared `TenantContext` (and exited the
+  `transaction.atomic()` wrap) before the returned coroutine was ever
+  awaited. Every async-served request ran its view with no tenant in context
+  and no RLS session variable. A second facet: on the no-tenant 404 and
+  inactive-tenant 403 paths, the coroutine-marked middleware returned a plain
+  `HttpResponse`, which Django then tried to await, raising `TypeError`.
+  `TenantMiddleware` now declares `sync_capable = True` and
+  `async_capable = False` explicitly, so Django's middleware machinery
+  adapts it under ASGI instead (wrapping it in `sync_to_async`, with
+  `async_to_sync` for anything downstream that is itself async), which keeps
+  the tenant context and the DB session variable active for the whole
+  request, including async views. (#16)
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed
