@@ -24,6 +24,18 @@ All notable changes to django-boundary are documented here.
   the tenant context and the DB session variable active for the whole
   request, including async views. (#16)
 
+- **`TenantContext.clear()` now restores the previous tenant's DB session
+  variable, not only the ContextVar.** After a nested `set(a)`, `set(b)`,
+  `clear(token_b)`, the ContextVar correctly reported tenant A again, but the
+  PostgreSQL session variable had only ever been reset to an empty string
+  for the removed tenant B: it was never re-applied for tenant A. RLS
+  therefore saw no active tenant even though application code believed one
+  was set. `clear()` now mirrors the restore already done in `using()`'s
+  `finally` block: it clears the session variable on the removed tenant's
+  aliases (default and its regional alias, BR-CTX-009), then, if a previous
+  tenant is now active, re-sets the variable to that tenant's pk on its own
+  alias set. (#13)
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed
