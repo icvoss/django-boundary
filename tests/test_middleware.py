@@ -276,10 +276,14 @@ class TestAsgiIntegration:
         settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
         settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
 
+        # AsyncClient builds an ASGI header scope from **extra, so the
+        # WSGI-style HTTP_X_TENANT_ID kwarg (correct for RequestFactory
+        # elsewhere in this file) would round-trip through ASGIRequest as
+        # HTTP_HTTP_X_TENANT_ID. Use the headers= kwarg instead.
         client = AsyncClient()
         response = async_to_sync(client.get)(
             "/tenant-across-await/",
-            HTTP_X_TENANT_ID=str(tenant_a.pk),
+            headers={"X-Tenant-Id": str(tenant_a.pk)},
         )
 
         assert response.status_code == 200
