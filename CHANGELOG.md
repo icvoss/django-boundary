@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-01
+
 ### Fixed
 
 - **`TenantMiddleware` no longer breaks under ASGI.** It subclassed
