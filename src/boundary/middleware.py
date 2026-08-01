@@ -1,6 +1,8 @@
 """Tenant middleware — resolves tenant from request and sets context.
 
-Uses Django's MiddlewareMixin for WSGI + ASGI compatibility.
+Sync-native middleware, served under ASGI via Django's built-in
+sync-middleware adaptation (see the async_capable/sync_capable comment
+on TenantMiddleware below).
 Wraps the request in transaction.atomic() so set_config() has effect.
 """
 
@@ -24,6 +26,36 @@ class TenantMiddleware(MiddlewareMixin):
     Overrides __call__ to wrap the full request in transaction.atomic()
     when BOUNDARY_WRAP_ATOMIC is True, ensuring set_config() has effect.
     """
+
+    # Declared sync-only, not async-native (issue #16). MiddlewareMixin
+    # declares async_capable = True, which under ASGI makes Django mark this
+    # middleware instance as a coroutine function and hand it an async
+    # get_response. But __call__ below is a plain sync function that wraps
+    # get_response(request) in transaction.atomic(): calling an async
+    # get_response from sync code returns an unawaited coroutine, so the
+    # try/finally clears TenantContext (and exits the atomic block) before
+    # the view ever runs, leaving every async-served request with no tenant
+    # in context and no RLS session variable. A second facet: on the
+    # no-tenant 404 and inactive-tenant 403 paths, the coroutine-marked
+    # middleware returns a plain HttpResponse, which Django then tries to
+    # await, raising TypeError.
+    #
+    # There is no async-native fix that preserves the atomic-transaction
+    # guarantee: Django has no async transactions, so an __acall__ could not
+    # hold transaction.atomic() open across an awaited get_response the way
+    # __call__ does. Declaring async_capable = False instead makes Django's
+    # middleware machinery adapt this middleware under ASGI (wrapping it in
+    # sync_to_async, and using async_to_sync inside for anything downstream
+    # that is itself async). That keeps TenantContext and the DB session
+    # variable active for the complete request, including async views:
+    # asgiref propagates contextvars across the sync/async boundary and
+    # routes thread-sensitive ORM work back to this middleware's thread,
+    # inside its atomic block. Flipping async_capable back to True
+    # re-introduces issue #16 (context cleared before the async downstream
+    # is ever awaited); do not do that without also rewriting __call__ to be
+    # genuinely async and dropping the atomic-transaction guarantee.
+    sync_capable = True
+    async_capable = False
 
     def __call__(self, request):
         # Resolve tenant from the configured resolver chain

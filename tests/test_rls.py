@@ -233,7 +233,12 @@ def app_conn():
         pytest.skip(f"icv_app role not available: {e}")
 
     # Grant table access to the non-superuser role (run as superuser via Django conn).
-    tables = ("boundary_testapp_booking", "boundary_testapp_tenant")
+    tables = (
+        "boundary_testapp_booking",
+        "boundary_testapp_tenant",
+        "boundary_testapp_brand",
+        "boundary_testapp_brandasset",
+    )
     with connection.cursor() as cur:
         for table in tables:
             cur.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{table}" TO icv_app')
@@ -389,3 +394,74 @@ class TestRLSEnforcement:
             assert orm_count == raw_count == 2
         finally:
             _remove_rls()
+
+
+def _apply_rls_to_brand():
+    """Apply RLS to Brand (the direct-FK parent BrandAsset paths through).
+
+    Brand's tenant column is merchant_id (make_tenant_mixin("merchant")), so
+    CreateTenantPolicy needs the non-default tenant_column kwarg.
+    """
+    state = _get_fake_state()
+    with connection.schema_editor() as editor:
+        EnableRLS("Brand").database_forwards("boundary_testapp", editor, state, state)
+        CreateTenantPolicy("Brand", tenant_column="merchant_id").database_forwards(
+            "boundary_testapp", editor, state, state
+        )
+
+
+def _remove_rls_from_brand():
+    state = _get_fake_state()
+    with connection.schema_editor() as editor:
+        EnableRLS("Brand").database_backwards("boundary_testapp", editor, state, state)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestPathScopedModelHasNoOwnRls:
+    """Issue #14: path-scoped (relation-scoped) models are ORM-layer-only.
+
+    This test PINS the documented contract: make_tenant_path_mixin() models
+    carry no RLS policy of their own, so the ORM manager (auto-filtering on
+    the declared path) constrains results while raw SQL against the child
+    table does not, even though its parent (Brand) has RLS applied. If a
+    future release adds a database-level policy for path-scoped models, this
+    test must be updated deliberately, not left to fail as a surprise.
+    """
+
+    def test_raw_sql_bypasses_isolation_but_orm_does_not(self, tenant_a, tenant_b, app_conn):
+        from boundary_testapp.models import Brand, BrandAsset
+
+        _apply_rls_to_brand()
+        try:
+            with set_tenant(tenant_a):
+                brand_a = Brand.objects.create(name="Brand A")
+                BrandAsset.objects.create(brand=brand_a, label="a1")
+                BrandAsset.objects.create(brand=brand_a, label="a2")
+            with set_tenant(tenant_b):
+                brand_b = Brand.objects.create(name="Brand B")
+                BrandAsset.objects.create(brand=brand_b, label="b1")
+
+            # ORM layer: auto-filtered on brand__merchant, sees only tenant A's rows.
+            with set_tenant(tenant_a):
+                orm_count = BrandAsset.objects.count()
+            assert orm_count == 2
+
+            # Raw SQL against the CHILD table directly: no RLS policy exists on
+            # boundary_testapp_brandasset, so setting the tenant session variable
+            # has no effect here and every tenant's rows come back.
+            with app_conn.cursor() as cur:
+                cur.execute("BEGIN")
+                cur.execute(
+                    "SELECT set_config('app.current_tenant_id', %s, true)",
+                    [str(tenant_a.pk)],
+                )
+                cur.execute("SELECT count(*) FROM boundary_testapp_brandasset")
+                raw_count = cur.fetchone()[0]
+                cur.execute("COMMIT")
+
+            assert raw_count == 3, (
+                "Direct SQL against a path-scoped child table must see ALL tenants' rows: "
+                "this pins the documented ORM-only contract for make_tenant_path_mixin (issue #14)"
+            )
+        finally:
+            _remove_rls_from_brand()

@@ -8,11 +8,10 @@ multi-tenancy with configurable FK field names.
 import logging
 from typing import ClassVar
 
-from django.conf import settings
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
-from boundary.conf import boundary_settings
+from boundary.conf import boundary_settings, resolve_tenant_model_setting
 from boundary.context import TenantContext
 from boundary.exceptions import TenantNotSetError
 from boundary.signals import strict_mode_violation
@@ -287,9 +286,17 @@ def make_tenant_mixin(
                 setattr(self, fk_field, TenantContext.require())
             super().save(**kwargs)
 
-    # Add the FK field dynamically
+    # Add the FK field dynamically. Resolved via resolve_tenant_model_setting()
+    # (BOUNDARY_TENANT_MODEL first, falling back to ICV_TENANT_MODEL per
+    # ADR-025 T2, issue #15) rather than settings.BOUNDARY_TENANT_MODEL
+    # directly, so a project configured with only ICV_TENANT_MODEL can
+    # import this module at all. Whichever setting supplies the value is
+    # structural: it is baked into this FK (and every consumer's migrations)
+    # at import time. An explicit BOUNDARY_TENANT_MODEL always takes
+    # precedence, and changing either setting afterwards requires new
+    # migrations, exactly as it always has for BOUNDARY_TENANT_MODEL users.
     fk = models.ForeignKey(
-        settings.BOUNDARY_TENANT_MODEL,
+        resolve_tenant_model_setting(),
         on_delete=on_delete,
         db_index=db_index,
         null=null,
@@ -339,10 +346,18 @@ def make_tenant_path_mixin(tenant_path: str):
 
         make_tenant_path_mixin("export_log__destination__merchant")
 
-    Note: path-scoped models cannot carry a PostgreSQL RLS policy on a local
-    column (they have none). They inherit isolation from the parent on the
-    path, which carries the policy, and are skipped by boundary's RLS system
-    check and provisioning. Application-layer auto-filtering still applies.
+    Note (issue #14): relation-scoped isolation is an APPLICATION-LAYER
+    feature only, by intentional contract. The child table carries NO RLS
+    policy, and none is created for it (this model is skipped by boundary's
+    RLS system check and provisioning). PostgreSQL RLS is table-specific: the
+    parent's policy (e.g. ``Destination``'s policy on its ``merchant_id``)
+    constrains scans of the PARENT table, so an ORM query that joins through
+    the path is constrained too, but it does NOT constrain direct SQL,
+    unscoped managers, or third-party database access run directly against
+    THIS table. Rows that need database-level isolation must own a tenant FK
+    of their own and use :class:`TenantMixin` or :func:`make_tenant_mixin`
+    instead. See docs/how-to/scope-models-through-a-relation.md for the full
+    contract.
 
     Args:
         tenant_path: ORM lookup path to the tenant, e.g.
@@ -378,8 +393,15 @@ class TenantMixin(models.Model):
 
     _boundary_fk_field = "tenant"
 
+    # Resolved via resolve_tenant_model_setting() rather than
+    # settings.BOUNDARY_TENANT_MODEL directly, so a project configured with
+    # only ICV_TENANT_MODEL (ADR-025 T2) can import this module (issue #15).
+    # The setting is structural: it is baked into this FK (and consumers'
+    # migrations) at import time. An explicit BOUNDARY_TENANT_MODEL always
+    # takes precedence, and changing either setting later requires new
+    # migrations, exactly as before.
     tenant = models.ForeignKey(
-        settings.BOUNDARY_TENANT_MODEL,
+        resolve_tenant_model_setting(),
         on_delete=models.CASCADE,
         db_index=True,
         null=False,

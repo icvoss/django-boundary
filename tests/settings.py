@@ -42,6 +42,14 @@ TIME_ZONE = "UTC"
 
 ALLOWED_HOSTS = ["*"]
 
+# Only the ASGI integration test in test_middleware.py needs a URLconf (it
+# drives an async view through django.test.AsyncClient). MIDDLEWARE is
+# deliberately not set here: several tests in test_checks.py assert on
+# boundary.E004/W002 by setting settings.MIDDLEWARE themselves per-test, and
+# a global default here would just be overridden by every one of them, so
+# the ASGI test sets MIDDLEWARE itself via the settings fixture instead.
+ROOT_URLCONF = "urls"
+
 # Boundary settings
 BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
 BOUNDARY_STRICT_MODE = True

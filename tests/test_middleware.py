@@ -236,6 +236,65 @@ class TestSignals:
             tenant_resolution_failed.disconnect(handler)
 
 
+class TestAsyncCapability:
+    """Regression for issue #16: TenantMiddleware must declare itself sync-only.
+
+    MiddlewareMixin declares async_capable = True by default. If
+    TenantMiddleware ever loses its own async_capable = False override
+    (accidentally or via a "helpful" cleanup), Django goes back to treating
+    it as async-native under ASGI: it hands the middleware an async
+    get_response, __call__'s sync body calls it without awaiting, and the
+    try/finally clears TenantContext (and exits the atomic block) before the
+    view ever runs. Every async-served request would then run with no
+    tenant in context and no RLS session variable, exactly the bug reported
+    in #16.
+    """
+
+    def test_declares_sync_only(self):
+        assert TenantMiddleware.sync_capable is True
+        assert TenantMiddleware.async_capable is False
+
+
+@pytest.mark.django_db
+class TestAsgiIntegration:
+    """AC for issue #16: an async view sees the tenant on both sides of an await.
+
+    Drives a real async view through django.test.AsyncClient under ASGI, the
+    exact path where the bug in #16 occurred: TenantMiddleware being
+    misidentified as async-native and clearing context before the coroutine
+    was awaited.
+    """
+
+    def test_tenant_present_before_and_after_await(self, tenant_a, settings):
+        import json
+
+        from asgiref.sync import async_to_sync
+        from django.test import AsyncClient
+
+        from boundary.context import TenantContext
+
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+
+        # AsyncClient builds an ASGI header scope from **extra, so the
+        # WSGI-style HTTP_X_TENANT_ID kwarg (correct for RequestFactory
+        # elsewhere in this file) would round-trip through ASGIRequest as
+        # HTTP_HTTP_X_TENANT_ID. Use the headers= kwarg instead.
+        client = AsyncClient()
+        response = async_to_sync(client.get)(
+            "/tenant-across-await/",
+            headers={"X-Tenant-Id": str(tenant_a.pk)},
+        )
+
+        assert response.status_code == 200
+        body = json.loads(response.content)
+        assert body["before"] == str(tenant_a.pk)
+        assert body["after"] == str(tenant_a.pk)
+        # Context is cleared once the (adapted, sync) middleware's atomic
+        # block exits after the request completes.
+        assert TenantContext.get() is None
+
+
 # Test helper: a resolver that always raises
 from boundary.resolvers import BaseResolver  # noqa: E402
 

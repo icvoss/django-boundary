@@ -11,20 +11,48 @@ def _setting(name, default=None):
     return getattr(settings, name, default)
 
 
+def resolve_tenant_model_setting() -> str:
+    """Return the configured tenant model dotted path, resolving the fallback.
+
+    BOUNDARY_TENANT_MODEL takes precedence; ICV_TENANT_MODEL (the single
+    ecosystem-wide tenant-model knob, ADR-025 T2) is used when it is unset.
+    ``_setting`` treats an explicit ``None`` the same as "not set" because
+    ``getattr`` returns the falsy ``None`` value, which is what lets a
+    project set ``BOUNDARY_TENANT_MODEL = None`` to defer to ICV_TENANT_MODEL.
+
+    Raises ImproperlyConfigured, naming both settings, when neither is set
+    (issue #15). This is a startup-time configuration error, not a "model
+    string points somewhere that doesn't exist" error: previously this case
+    raised a bare, cryptic AttributeError from settings.BOUNDARY_TENANT_MODEL
+    being read directly at import time in boundary.models, before any check
+    ran, so a project configured with only ICV_TENANT_MODEL could not start
+    at all.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+
+    model_string = _setting("BOUNDARY_TENANT_MODEL") or _setting("ICV_TENANT_MODEL")
+    if not model_string:
+        raise ImproperlyConfigured(
+            "Neither BOUNDARY_TENANT_MODEL nor ICV_TENANT_MODEL is set. Add one to your Django settings."
+        )
+    return model_string
+
+
 def get_tenant_model():
     """Return the concrete tenant model class.
 
     Lazily resolves BOUNDARY_TENANT_MODEL via django.apps.apps.get_model(),
-    falling back to ICV_TENANT_MODEL when unset. ICV_TENANT_MODEL is the
-    single ecosystem-wide tenant-model knob (ADR-025 T2); other packages
-    (icv-identity, icv-payments) already resolve their tenant model the
-    same way. Equivalent to django.contrib.auth.get_user_model().
+    falling back to ICV_TENANT_MODEL when unset (ADR-025 T2; other packages
+    such as icv-identity and icv-payments already resolve their tenant model
+    the same way). Equivalent to django.contrib.auth.get_user_model().
+
+    Raises ImproperlyConfigured if neither setting is set (see
+    resolve_tenant_model_setting()). Raises LookupError, unchanged, if the
+    configured dotted path does not refer to an installed model.
     """
     from django.apps import apps
 
-    model_string = _setting("BOUNDARY_TENANT_MODEL") or _setting("ICV_TENANT_MODEL")
-    if not model_string:
-        raise LookupError("Neither BOUNDARY_TENANT_MODEL nor ICV_TENANT_MODEL is set. Add one to your Django settings.")
+    model_string = resolve_tenant_model_setting()
     return apps.get_model(model_string)
 
 

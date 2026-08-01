@@ -163,14 +163,25 @@ class TenantContext:
     def clear(token, *, using: str = "default") -> None:
         """Restore the previous context using the token from set().
 
-        Clears the DB session variable on the ``default`` connection and on the
-        regional connection of the tenant that was active before the reset, so
-        a regional connection is never left carrying a stale tenant (BR-CTX-009).
+        Restores BOTH the ContextVar and the DB session variable (issue #13).
+        Resetting the token only rewinds the ContextVar to whichever tenant
+        was active before the corresponding set() call; without also
+        re-applying that tenant's pk to the session variable, a nested
+        set(a), set(b), clear(token_b) left the ContextVar correctly back on
+        tenant A while current_setting() still read the empty string cleared
+        for tenant B, so RLS saw no tenant even though TenantContext.get()
+        reported one. Mirrors the restore already done in using()'s finally
+        block: clear the DB session variable on the removed tenant's aliases
+        (default and its regional alias, BR-CTX-009), then, if a previous
+        tenant is now active, re-set the variable to that tenant's pk on ITS
+        own alias set, which may be a different regional connection.
         """
         # Read the tenant that is about to be cleared BEFORE resetting, so its
         # regional alias can be cleared too.
         active = _current_tenant.get()
         _current_tenant.reset(token)
+        previous = _current_tenant.get()
+
         aliases = TenantContext._aliases_for(active, using) if active is not None else [using]
         for alias in aliases:
             try:
@@ -178,6 +189,15 @@ class TenantContext:
             except Exception:
                 # Best-effort DB cleanup; ContextVar is already restored
                 logger.warning("Failed to clear DB session variable on %r", alias, exc_info=True)
+
+        if previous is not None:
+            for alias in TenantContext._aliases_for(previous, using):
+                try:
+                    TenantContext._set_db_session(str(previous.pk), using=alias)
+                except Exception:
+                    # Best-effort DB cleanup; ContextVar is already restored
+                    logger.warning("Failed to restore DB session variable on %r", alias, exc_info=True)
+
         logger.debug("Tenant context cleared")
 
     @classmethod

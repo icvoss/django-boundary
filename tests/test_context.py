@@ -35,6 +35,105 @@ class TestTenantContextClear:
             TenantContext.clear(token_a)
 
 
+@pytest.mark.django_db(transaction=True)
+class TestTenantContextClearRestoresDbSessionVar:
+    """Regression for issue #13: clear() must restore the previous tenant's
+    DB session variable, not just the ContextVar.
+
+    Before the fix, clear() reset the ContextVar to the previous tenant but
+    only ever cleared the session variable on the removed tenant's aliases:
+    it never re-applied the previous tenant's pk. After a nested
+    set(a), set(b), clear(token_b), TenantContext.get() correctly reported
+    tenant A while current_setting() still read the empty string, so RLS saw
+    no tenant even though application code believed one was active.
+    """
+
+    def _get_session_var(self):
+        from boundary.conf import boundary_settings
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT current_setting('{boundary_settings.DB_SESSION_VAR}', true)")
+            return cursor.fetchone()[0]
+
+    def test_clear_reapplies_previous_tenant_session_var(self, tenant_a, tenant_b):
+        from django.db import transaction
+
+        with transaction.atomic():
+            token_a = TenantContext.set(tenant_a)
+            token_b = TenantContext.set(tenant_b)
+
+            TenantContext.clear(token_b)
+            assert TenantContext.get() == tenant_a
+            assert self._get_session_var() == str(tenant_a.pk), (
+                "clear() must re-apply the previous tenant's pk to the session variable, not leave it empty"
+            )
+
+            TenantContext.clear(token_a)
+            assert TenantContext.get() is None
+            assert self._get_session_var() in ("", None)
+
+
+class TestTenantContextClearRestoresRegionalAlias:
+    """Regression for issue #13, regional variant (BR-CTX-009).
+
+    After nested set/set/clear where the removed tenant and the previous
+    tenant are in DIFFERENT regions, clear() must clear the removed tenant's
+    aliases (default + its region) and re-set the previous tenant's variable
+    on ITS OWN alias set (default + its own, different, region). Uses mocked
+    _set_db_session/_clear_db_session (as the existing regional tests in
+    this module do) since the test settings define only a default database.
+    """
+
+    def _regional_tenant(self, pk, region):
+        from boundary_testapp.models import Tenant
+
+        t = Tenant(name=f"Tenant {pk}", slug=f"tenant-{pk}")
+        t.region = region
+        t.pk = pk
+        return t
+
+    def test_clear_restores_previous_tenant_on_its_own_region(self, settings, monkeypatch):
+        settings.BOUNDARY_REGIONS = {"eu-west": {}, "us-east": {}}
+
+        set_calls = []
+        clear_calls = []
+        monkeypatch.setattr(
+            TenantContext,
+            "_set_db_session",
+            staticmethod(lambda tenant_id, using="default": set_calls.append((tenant_id, using))),
+        )
+        monkeypatch.setattr(
+            TenantContext,
+            "_clear_db_session",
+            staticmethod(lambda using="default": clear_calls.append(using)),
+        )
+
+        previous_tenant = self._regional_tenant(1, "us-east")
+        removed_tenant = self._regional_tenant(2, "eu-west")
+
+        token_previous = TenantContext.set(previous_tenant)
+        token_removed = TenantContext.set(removed_tenant)
+        set_calls.clear()
+        clear_calls.clear()
+
+        TenantContext.clear(token_removed)
+
+        assert TenantContext.get() == previous_tenant
+        # The removed tenant's aliases (default + eu-west) were cleared.
+        assert "default" in clear_calls
+        assert "eu-west" in clear_calls
+        # The previous tenant's variable was re-set on its OWN aliases
+        # (default + us-east), not on the removed tenant's region.
+        restored_aliases = [using for _tid, using in set_calls]
+        assert "default" in restored_aliases
+        assert "us-east" in restored_aliases
+        assert "eu-west" not in restored_aliases
+        restored_ids = {tid for tid, _using in set_calls}
+        assert restored_ids == {str(previous_tenant.pk)}
+
+        TenantContext.clear(token_previous)
+
+
 class TestTenantContextNesting:
     """AC-CTX-003: Context manager nesting."""
 

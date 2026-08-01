@@ -4,6 +4,79 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TenantMiddleware` no longer breaks under ASGI.** It subclassed
+  `MiddlewareMixin`, which declares `async_capable = True`, while overriding
+  `__call__` with a purely synchronous body. Under ASGI, Django therefore
+  handed it an async `get_response` and treated the instance as a coroutine
+  function; the sync `__call__` called that async `get_response` without
+  awaiting it, so the `try`/`finally` cleared `TenantContext` (and exited the
+  `transaction.atomic()` wrap) before the returned coroutine was ever
+  awaited. Every async-served request ran its view with no tenant in context
+  and no RLS session variable. A second facet: on the no-tenant 404 and
+  inactive-tenant 403 paths, the coroutine-marked middleware returned a plain
+  `HttpResponse`, which Django then tried to await, raising `TypeError`.
+  `TenantMiddleware` now declares `sync_capable = True` and
+  `async_capable = False` explicitly, so Django's middleware machinery
+  adapts it under ASGI instead (wrapping it in `sync_to_async`, with
+  `async_to_sync` for anything downstream that is itself async), which keeps
+  the tenant context and the DB session variable active for the whole
+  request, including async views. (#16)
+
+- **`TenantContext.clear()` now restores the previous tenant's DB session
+  variable, not only the ContextVar.** After a nested `set(a)`, `set(b)`,
+  `clear(token_b)`, the ContextVar correctly reported tenant A again, but the
+  PostgreSQL session variable had only ever been reset to an empty string
+  for the removed tenant B: it was never re-applied for tenant A. RLS
+  therefore saw no active tenant even though application code believed one
+  was set. `clear()` now mirrors the restore already done in `using()`'s
+  `finally` block: it clears the session variable on the removed tenant's
+  aliases (default and its regional alias, BR-CTX-009), then, if a previous
+  tenant is now active, re-sets the variable to that tenant's pk on its own
+  alias set. (#13)
+
+- **`ICV_TENANT_MODEL` alone is now enough to start a project.**
+  `boundary.conf.get_tenant_model()` and `boundary_settings.TENANT_MODEL`
+  already fell back from `BOUNDARY_TENANT_MODEL` to `ICV_TENANT_MODEL`
+  (ADR-025 T2), but `boundary.models` read `settings.BOUNDARY_TENANT_MODEL`
+  directly at import time in both `TenantMixin`'s and `make_tenant_mixin()`'s
+  foreign key declarations, raising a bare `AttributeError` before either
+  setting's fallback ever got a chance to run. `boundary.checks` had the
+  same gap: `_check_tenant_model()` (`boundary.E001`) and
+  `_check_rls_enabled()` read only `BOUNDARY_TENANT_MODEL`. A new
+  `boundary.conf.resolve_tenant_model_setting()` helper (`BOUNDARY_TENANT_MODEL`
+  first, then `ICV_TENANT_MODEL`, raising `ImproperlyConfigured` naming both
+  settings if neither is set) now backs both FK declarations and both
+  checks, so a project configured with only `ICV_TENANT_MODEL` starts
+  cleanly. One deliberate exception-type change rides along:
+  `get_tenant_model()` now raises `ImproperlyConfigured` for the
+  missing-setting case (previously `LookupError`), the Django idiom for a
+  configuration error; the `LookupError` raised when the dotted path does
+  not name an installed model is unchanged. Whichever setting resolves
+  remains structural: it is baked into the FK (and your migrations) at
+  import time, exactly as before. (#15)
+
+### Changed
+
+- **The documented contract for relation-scoped (path-scoped) models is now
+  explicit: they are protected at the ORM layer only, never at the database
+  layer.** `make_tenant_path_mixin()` models have no local tenant column and
+  therefore no RLS policy, and `boundary.checks` intentionally exempts them
+  from `boundary.E006`. The previous docstring and README wording described
+  this as "inheriting isolation from the parent on the path", which reads as
+  database-level protection; it is not. PostgreSQL RLS is table-specific:
+  the parent's policy constrains scans of the *parent* table (so an ORM
+  query joining through the path is constrained too), but it does **not**
+  constrain direct SQL, unscoped managers, or third-party access run
+  straight against the child table. `make_tenant_path_mixin()`'s docstring,
+  the `boundary.E006` skip comment, the
+  `docs/how-to/scope-models-through-a-relation.md` how-to (now with an
+  explicit warning), and the README's defence-in-depth section are corrected
+  to state this plainly, and a new raw-SQL test in `tests/test_rls.py` pins
+  the contract: an unscoped query against a path-scoped child table returns
+  every tenant's rows even with RLS applied to its parent. (#14)
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed
