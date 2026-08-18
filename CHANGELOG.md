@@ -4,6 +4,11 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Django 6.1 added to the CI test matrix** and declared via the
+  `Framework :: Django :: 6.1` classifier.
+
 ## [0.5.3] - 2026-08-01
 
 ### Fixed
