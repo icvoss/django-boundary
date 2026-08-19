@@ -21,3 +21,7 @@ venv/
 
 # Claude Code framework and worktrees
 .claude/
+
+# uv lockfile: boundary is a library, not an application. Pinning
+# transitive deps here would not bind consumers and only churns.
+uv.lock
