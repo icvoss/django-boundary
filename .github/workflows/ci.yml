@@ -71,6 +71,19 @@ jobs:
           pip install pytest pytest-django pytest-cov factory-boy psycopg[binary]
           pip install -e .
 
+      - name: Provision the non-superuser icv_app role for RLS enforcement tests
+        # Without this role, tests/test_rls.py's app_conn fixture and
+        # tests/test_checks.py's boundary.W003 "proven silent" test both
+        # skip rather than run, because the icv_test bootstrap role from
+        # the postgres:16 image is itself a BYPASSRLS superuser (this is
+        # precisely the trap issue #21 documents). Skipping is not
+        # equivalent to passing: run the role-dependent tests for real.
+        run: |
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "CREATE ROLE icv_app LOGIN PASSWORD 'icv_dev' NOSUPERUSER NOBYPASSRLS;"
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "GRANT CONNECT ON DATABASE boundary_test TO icv_app; GRANT USAGE ON SCHEMA public TO icv_app;"
+
       - name: Run tests
         run: pytest tests/ -v --tb=short --color=yes
         env:

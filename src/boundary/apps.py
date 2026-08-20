@@ -10,6 +10,15 @@ class BoundaryConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
 
     def ready(self):
+        # boundary.checks registers every boundary.* system check via the
+        # @register decorator at import time. Nothing else in the package
+        # imports that module, so without this import the whole check suite
+        # (E001, E003, E004, E005, E006, W001, W002, W003) never registers
+        # and `manage.py check`/`migrate`/runserver silently run none of
+        # them; they had only ever appeared to work because
+        # tests/test_checks.py imports the module directly.
+        import boundary.checks  # noqa: F401
+
         self._connect_cache_invalidation_signals()
 
     def _connect_cache_invalidation_signals(self):

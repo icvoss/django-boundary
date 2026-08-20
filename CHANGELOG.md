@@ -6,8 +6,38 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`boundary.W003`: warn when the database connection role bypasses Row
+  Level Security** (superuser or `BYPASSRLS`). PostgreSQL exempts such
+  roles from every RLS policy, including `FORCE ROW LEVEL SECURITY`
+  tables, so `boundary.E006` passing (RLS enabled and forced on the
+  tables) gives no guarantee that isolation actually applies to the
+  connection in use. The stock bootstrap role of nearly every Postgres
+  docker image is exactly this kind of role, so a consumer's RLS-policy
+  tests can pass on every developer machine while testing nothing. The
+  warning is deliberately not silenced under pytest/DEBUG: the failure
+  it exists to catch lives precisely in local and CI test runs on a
+  bypassing role. A deliberately chosen superuser connection (initial
+  provisioning, some managed deployments) is silenced by ID via
+  `SILENCED_SYSTEM_CHECKS`. Fixes #21.
 - **Django 6.1 added to the CI test matrix** and declared via the
   `Framework :: Django :: 6.1` classifier.
+
+### Fixed
+
+- **`boundary.checks` was never imported anywhere the package itself
+  runs, so every system check it defines (`E001`, `E003`, `E004`,
+  `E006`, `W001`, `W002`, and now `W003`) silently never registered on a
+  real `manage.py check`, `migrate`, or server startup.** They only
+  appeared to work because `tests/test_checks.py` imports the module
+  directly, so the test suite exercised the check functions while the
+  application never did. `BoundaryConfig.ready()` now imports
+  `boundary.checks`, which registers the whole suite via its `@register`
+  decorators the same way Django's own checks register.
+- **CI now provisions the non-superuser `icv_app` role** the RLS
+  enforcement tests and the `boundary.W003` "stays silent" test require,
+  so those tests run for real in CI instead of skipping (the `icv_test`
+  bootstrap role from the `postgres:16` service image is itself a
+  `BYPASSRLS` superuser).
 
 ## [0.5.3] - 2026-08-01
 
