@@ -17,6 +17,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_strict_mode())
     errors.extend(_check_rls_enabled())
     errors.extend(_check_identity_double_resolve())
+    errors.extend(_check_rls_bypassable())
 
     return errors
 
@@ -218,3 +219,60 @@ def _check_rls_enabled():
             pass  # DB not available at check time; skip
 
     return errors
+
+
+def _check_rls_bypassable():
+    """W003: warn when the connecting role bypasses RLS entirely.
+
+    PostgreSQL exempts superusers and BYPASSRLS roles from every policy,
+    including FORCE ROW LEVEL SECURITY tables (issue #21). E006 verifies
+    RLS is enabled and forced on the tables; it says nothing about whether
+    the connecting role can bypass what those tables declare. A dev/CI role
+    that is a BYPASSRLS superuser (the default bootstrap role for nearly
+    every postgres docker image) makes E006 pass and every RLS-policy test
+    pass vacuously: the policies are configured correctly and enforce
+    nothing for this connection.
+
+    Deliberately not skipped under pytest/DEBUG. The failure this check
+    exists to catch lives precisely in local/CI test runs on a bypassing
+    role; suppressing it there would rebuild the silent-default trap the
+    check exists to close. A consumer that has deliberately chosen a
+    superuser connection (initial provisioning, some managed deployments)
+    silences it by ID via SILENCED_SYSTEM_CHECKS, which is greppable and
+    reviewed, rather than the check falling silent by default.
+    """
+    from django.db import connection
+
+    if connection.vendor != "postgresql":
+        return []
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            row = cursor.fetchone()
+    except Exception:
+        return []  # DB not available at check time; skip
+
+    if row is None:
+        return []
+
+    rolsuper, rolbypassrls = row
+    if not (rolsuper or rolbypassrls):
+        return []
+
+    return [
+        Warning(
+            "The database connection role bypasses Row Level Security, so "
+            "RLS policies will not be enforced for this connection: "
+            "tenant-isolation tests will pass without testing anything. "
+            "Connect as a role without SUPERUSER or BYPASSRLS. If this "
+            "role is deliberate (initial provisioning, some managed "
+            "deployments), silence boundary.W003 in SILENCED_SYSTEM_CHECKS.",
+            hint=(
+                "PostgreSQL exempts superuser and BYPASSRLS roles from "
+                "every RLS policy, even FORCE ROW LEVEL SECURITY tables. "
+                "See docs/explanation/isolation-layers.md#important-limits-of-rls."
+            ),
+            id="boundary.W003",
+        )
+    ]

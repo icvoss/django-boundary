@@ -709,6 +709,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models |
 | `boundary.W001` | Warning | STRICT_MODE is False |
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
+| `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
 
 ---
 
