@@ -109,13 +109,13 @@ jobs:
 
       - name: Install the built wheel and test dependencies
         run: |
-          pip install dist/*.whl
+          # The package comes from the wheel; the `[dev]` extra resolves its
+          # own test dependencies (and the package's declared runtime deps),
+          # so `[dev]` stays the single source of truth and cannot rot the
+          # way a hand-listed set does. A hand-list predating an API layer is
+          # exactly how icv-identity's v0.6.0rc1 publish gate failed.
+          pip install "$(ls dist/*.whl)[dev]"
           pip install "Django~=5.2.0"
-          # Test dependencies only. The package itself comes from the wheel
-          # above, so this must never be `pip install -e .` or `.[dev]`:
-          # either puts the source tree back on sys.path and silently defeats
-          # the whole point of this job.
-          pip install pytest pytest-django pytest-cov factory-boy psycopg[binary]
 
       - name: Provision the non-superuser icv_app role for RLS enforcement tests
         # See ci.yml: the icv_test bootstrap role from the postgres:16
