@@ -4,6 +4,21 @@ Registered in AppConfig.ready() and run at startup and during test collection.
 """
 
 from django.core.checks import Error, Tags, Warning, register
+from django.db.utils import InterfaceError, OperationalError
+
+# Exceptions that mean "the database connection itself is unavailable",
+# distinct from a query against a reachable database failing for some
+# other reason (permissions, a malformed statement, a lock timeout).
+# OperationalError covers connection refused, auth failure at the socket,
+# and DNS/host resolution failures; InterfaceError covers a connection
+# that has already been closed. Both are raised by connection.cursor()
+# before any SQL runs, which is exactly the pre-migrate /
+# DB-not-provisioned-yet case this module has always meant to skip
+# silently. A DatabaseError subclass raised BY the query itself
+# (ProgrammingError for a permissions failure reading pg_class, DataError,
+# etc.) is a different fact: the database is there and something is
+# wrong, which boundary.W007 exists to surface rather than swallow.
+_CONNECTION_UNAVAILABLE_ERRORS = (OperationalError, InterfaceError)
 
 
 @register(Tags.models)
@@ -198,13 +213,28 @@ def _check_rls_enabled():
         table = model._meta.db_table
         try:
             with connection.cursor() as cursor:
+                # to_regclass() resolves *table* through the connection's own
+                # search_path, exactly as any ordinary query against the
+                # model's table would, and returns a single OID (or NULL if
+                # nothing resolves). WHERE relname = %s with no schema
+                # qualification instead returns one row per schema that
+                # happens to contain a same-named table (a partition
+                # archive, a staging schema, a multi-entry search_path), and
+                # fetchone() silently reads whichever row the planner's
+                # index scan produced first, which is not necessarily the
+                # table Django is actually configured against (issue #34).
                 cursor.execute(
-                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
                     [table],
                 )
                 row = cursor.fetchone()
                 if row is None:
-                    continue  # Table doesn't exist yet (pre-migration)
+                    # to_regclass() returns NULL for a name that resolves to
+                    # nothing on this search_path, which is the same
+                    # pre-migration state the old query's fetchone() == None
+                    # branch handled: the table doesn't exist yet, so there
+                    # is nothing to check.
+                    continue
                 rls_enabled, rls_forced = row
                 if not rls_enabled or not rls_forced:
                     errors.append(
@@ -215,8 +245,34 @@ def _check_rls_enabled():
                             id="boundary.E006",
                         )
                     )
-        except Exception:
-            pass  # DB not available at check time; skip
+        except _CONNECTION_UNAVAILABLE_ERRORS:
+            # The database itself is not reachable (connection refused,
+            # auth failure, closed connection): the legitimate skip this
+            # branch has always existed for, e.g. running `manage.py check`
+            # before the database is provisioned. Silence here is correct
+            # because there is nothing to report against.
+            continue
+        except Exception as exc:
+            # The connection IS there and the query failed for some other
+            # reason (a permissions error reading pg_class, a statement
+            # timeout, a lock). That is indistinguishable from "every table
+            # is correctly protected" if swallowed, which makes this check
+            # fail open exactly where it matters (issue #34). Report it
+            # instead of staying silent.
+            errors.append(
+                Warning(
+                    f"Could not determine Row Level Security state for table '{table}' (model {model.__name__}): {exc}",
+                    hint=(
+                        "The database connection is available but the query "
+                        "against pg_class failed, so boundary.E006 could not "
+                        "verify this table. Check the connecting role has "
+                        "SELECT on pg_class, and investigate the underlying "
+                        "error before treating the absence of boundary.E006 "
+                        "as a pass."
+                    ),
+                    id="boundary.W007",
+                )
+            )
 
     return errors
 
@@ -250,8 +306,29 @@ def _check_rls_bypassable():
         with connection.cursor() as cursor:
             cursor.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
             row = cursor.fetchone()
-    except Exception:
-        return []  # DB not available at check time; skip
+    except _CONNECTION_UNAVAILABLE_ERRORS:
+        # Genuinely unreachable connection: the same legitimate pre-migrate
+        # skip as _check_rls_enabled (issue #34).
+        return []
+    except Exception as exc:
+        # The connection is there and the query against pg_roles failed for
+        # some other reason. Silence here is the same fail-open trap E006
+        # had: report it as boundary.W007 instead of letting it read as
+        # "this role does not bypass RLS".
+        return [
+            Warning(
+                f"Could not determine whether the database connection role bypasses Row Level Security: {exc}",
+                hint=(
+                    "The database connection is available but the query "
+                    "against pg_roles failed, so boundary.W003 could not "
+                    "verify the connecting role. Check the connecting role "
+                    "has SELECT on pg_roles, and investigate the underlying "
+                    "error before treating the absence of boundary.W003 as "
+                    "a pass."
+                ),
+                id="boundary.W007",
+            )
+        ]
 
     if row is None:
         return []
