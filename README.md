@@ -497,6 +497,36 @@ with TenantContext.using(tenant):
 The context manager is savepoint-safe: it explicitly restores the DB session
 variable on exit rather than relying on PostgreSQL savepoint rollback.
 
+### Admin Bypass
+
+`admin_bypass()` is the only supported way to set the RLS admin bypass flag
+(`BOUNDARY_ADMIN_FLAG_VAR`, default `app.boundary_admin`). It hardcodes the
+transaction-local form of `set_config`, so the unsafe session-scoped form
+(which can outlive a transaction and leak across pooled or reused
+connections) is not reachable through this API:
+
+```python
+from boundary.context import admin_bypass
+
+with admin_bypass():
+    # Full read/write access across every tenant in this block, even with
+    # FORCE ROW LEVEL SECURITY on the table. Clears automatically on exit.
+    Booking.unscoped.filter(court=1).update(is_paid=True)
+```
+
+The flag grants both visibility AND write access: the `boundary_admin_bypass`
+policy has no `WITH CHECK`, so PostgreSQL uses its `USING` clause for write
+checks too, and permissive policies are OR'd, so this policy alone is
+sufficient regardless of `boundary_tenant_isolation`'s own `WITH CHECK`. Treat
+it as full cross-tenant access, not a read-only viewer.
+
+Fires `boundary.signals.admin_bypass_activated` on entry (flag variable name
+and DB alias) for audit trails. Nested calls on the same alias are
+idempotent; only the outermost call clears the flag on exit. See the
+docstring on `admin_bypass()` for the full contract, including the
+`BOUNDARY_WRAP_ATOMIC=False` case and multi-region use with `all_regions()`.
+See also [Cross-tenant admin operations](docs/how-to/cross-tenant-admin-operations.md#5-bypass-rls-for-trusted-maintenance-work).
+
 ---
 
 ## Resolvers
@@ -757,6 +787,7 @@ Booking.unscoped.create(court=1, tenant=specific_tenant)
 | `tenant_resolved` | `tenant, resolver, request` | After successful resolution |
 | `tenant_resolution_failed` | `request` | No resolver matched (REQUIRED=True) |
 | `strict_mode_violation` | `model, queryset` | Before TenantNotSetError is raised |
+| `admin_bypass_activated` | `flag_var, using` | On entry to `admin_bypass()` |
 
 ---
 

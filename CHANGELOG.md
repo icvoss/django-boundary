@@ -6,6 +6,25 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`admin_bypass()` context manager for the RLS admin bypass flag** (issue
+  #37). The flag (`BOUNDARY_ADMIN_FLAG_VAR`, default `app.boundary_admin`)
+  previously had no API: consumers were directed by the docs to call
+  `set_config` by hand, and correctness depended entirely on passing the
+  right third argument. `admin_bypass()` hardcodes the transaction-local
+  form, so the unsafe session-scoped form (which can persist across
+  `CONN_MAX_AGE` connection reuse or an external pooler handing the
+  connection to an unrelated request) is not reachable through this API.
+  It reuses the same transaction-guarantee machinery as
+  `TenantContext.using()`, verifies the flag actually took effect before
+  running the wrapped block, and clears it explicitly on exit. Fires the
+  new `admin_bypass_activated` signal on entry (flag variable name and DB
+  alias) so use of the escape hatch is auditable. Nested calls on the same
+  alias are idempotent; only the outermost call clears the flag.
+- **`boundary.exceptions.AdminBypassNotActiveError`**, raised by
+  `admin_bypass()` if a read-back after setting the flag does not confirm
+  it is active (most likely `BOUNDARY_WRAP_ATOMIC=False` with no ambient
+  transaction), rather than silently proceeding as though the bypass were
+  in effect.
 - **`boundary.W003`: warn when the database connection role bypasses Row
   Level Security** (superuser or `BYPASSRLS`). PostgreSQL exempts such
   roles from every RLS policy, including `FORCE ROW LEVEL SECURITY`
@@ -83,6 +102,16 @@ All notable changes to django-boundary are documented here.
   exception in the view still rolls back the whole request. If you run
   `ATOMIC_REQUESTS = True` and rely on RLS, upgrade: no configuration
   change is required. Fixes #40.
+- **`docs/explanation/isolation-layers.md` understated the RLS admin bypass
+  flag as visibility-only** ("sees every tenant's rows"). Verified against
+  the actual policy SQL as a non-superuser: `boundary_admin_bypass` has no
+  `WITH CHECK`, so PostgreSQL falls back to its `USING` clause for write
+  checks too, and permissive policies are combined with `OR`, so the flag
+  alone is sufficient to pass an `INSERT` or `UPDATE` for any tenant.
+  Corrected to state read AND write access, matching
+  `docs/how-to/cross-tenant-admin-operations.md`, which already had it
+  right. Both pages now also document the interaction with `CONN_MAX_AGE`
+  and connection pooling.
 - **`boundary.checks` was never imported anywhere the package itself
   runs, so every system check it defines (`E001`, `E003`, `E004`,
   `E006`, `W001`, `W002`, and now `W003`) silently never registered on a

@@ -63,7 +63,7 @@ def on_tenant_resolved(sender, tenant, resolver, request, **kwargs):
 tenant_resolved.connect(on_tenant_resolved)
 ```
 
-The three signals exported from `boundary.signals` are `tenant_resolved`, `tenant_resolution_failed`, and `strict_mode_violation`. They exist purely for observability, so you can attach metrics or logging without boundary depending on any metrics library.
+The signals exported from `boundary.signals` relevant to request resolution are `tenant_resolved`, `tenant_resolution_failed`, and `strict_mode_violation`. They exist purely for observability, so you can attach metrics or logging without boundary depending on any metrics library. (`boundary.signals` also exports `admin_bypass_activated`, fired on entry to `admin_bypass()`; see the [README signals reference](../../README.md#signals) for the full list.)
 
 The middleware then sets `request.tenant`. `request.tenant` is always set for backwards compatibility. If `BOUNDARY_REQUEST_ATTR` (which defaults to `BOUNDARY_TENANT_FK_FIELD`, in turn defaulting to `"tenant"`) differs from `"tenant"`, the same value is also assigned to that attribute, so a project using merchant terminology can read `request.merchant`.
 

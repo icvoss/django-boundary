@@ -15,11 +15,20 @@ from typing import Any
 from django.db import connections
 
 from boundary.conf import boundary_settings
-from boundary.exceptions import TenantNotSetError
+from boundary.exceptions import AdminBypassNotActiveError, TenantNotSetError
 
 logger = logging.getLogger("boundary.context")
 
 _current_tenant: ContextVar[Any | None] = ContextVar("boundary_current_tenant", default=None)
+
+# Tracks, per (contextvars-scoped) call stack, whether the current task already
+# holds an active admin_bypass() on a given alias. Read on entry to decide
+# whether a nested admin_bypass() call owns clearing the flag on exit, or is
+# merely re-affirming a bypass an outer call already owns (BR-CTX-010).
+# Defaults to None, not {}, because a ContextVar default is shared across
+# every context that never called .set(): a mutable default would let one
+# task's writes leak into another's read of the "unset" state.
+_admin_bypass_depth: ContextVar[dict[str, int] | None] = ContextVar("boundary_admin_bypass_depth", default=None)
 
 
 def _regional_alias(tenant: Any) -> str | None:
@@ -298,6 +307,156 @@ class TenantContext:
         from boundary.resolvers import _cache_invalidate
 
         _cache_invalidate(tenant)
+
+
+@contextmanager
+def admin_bypass(*, using: str = "default"):
+    """Activate the RLS admin bypass flag for the duration of the block (issue #37).
+
+    Sets the PostgreSQL session variable named by ``BOUNDARY_ADMIN_FLAG_VAR``
+    (default ``app.boundary_admin``) to ``'true'`` so that the
+    ``boundary_admin_bypass`` RLS policy (see ``boundary.migrations_ops``)
+    applies, then clears it explicitly on exit. This is the only supported way
+    to set the flag: it hardcodes the transaction-local form of ``set_config``
+    (the third argument is always ``true``, never reachable as ``false`` through
+    this API), because the session-scoped form is the failure mode issue #37
+    exists to remove. A connection that carries the flag session-scoped keeps
+    it across statements, across ``CONN_MAX_AGE`` reuse, and across a pooler's
+    connection handoff to a completely different request, unless something
+    explicitly clears it first. None of that is true of the transaction-local
+    form, which is inherently scoped to the current transaction and vanishes
+    on commit or rollback even if this context manager's own cleanup never ran.
+
+    **What the flag actually grants** (verified by direct probe against a
+    table carrying both boundary policies, connected as a non-superuser role):
+    with the flag set, ``boundary_admin_bypass`` is a second permissive USING
+    policy that is OR'd with ``boundary_tenant_isolation``, so SELECT/UPDATE/
+    DELETE visibility is not limited to the active tenant. Because
+    ``boundary_admin_bypass`` declares no WITH CHECK, PostgreSQL falls back to
+    its USING expression for the write check too (see PostgreSQL's CREATE
+    POLICY documentation), and that USING expression only tests the admin
+    flag. Multiple permissive policies are combined with OR, so a write only
+    has to satisfy ONE policy's check, and this one imposes no tenant
+    constraint at all. The practical result: an INSERT or UPDATE that
+    disagrees with the active (or absent) tenant context is accepted, not
+    just rows outside it made visible. Treat the flag as full read/write
+    access across every tenant, not a viewer of other tenants' rows.
+
+    **Transaction requirement (BR-CTX-002, BR-CTX-010).** Like
+    ``TenantContext.using()``, this reuses ``_ensure_atomic()`` so the
+    transaction-local setting has a transaction to be local to. With
+    ``BOUNDARY_WRAP_ATOMIC`` at its default (``True``), a transaction is
+    opened automatically when none is already active. With
+    ``BOUNDARY_WRAP_ATOMIC=False`` and no ambient transaction, ``set_config``
+    scopes to an implicit single-statement transaction and the flag is gone
+    before the next statement runs, so the bypass would silently never apply
+    to the caller's actual queries: a query for another tenant's rows would
+    return empty or raise ``TenantNotSetError`` with no indication why.
+    Rather than let that happen silently (the flag not applying is a
+    correctness bug, but degrading to "flag inert" cannot itself become the
+    session-scoped hazard, since the SQL issued here is unconditionally
+    transaction-local), this reads the flag back with ``current_setting()``
+    immediately after setting it and raises ``AdminBypassNotActiveError`` if
+    the read-back does not show ``'true'``. This catches every cause of the
+    flag not taking (missing transaction under ``WRAP_ATOMIC=False``, a
+    connection that failed to open) rather than special-casing one setting.
+
+    **Nesting.** Re-entering ``admin_bypass()`` on the same ``using`` alias
+    while one is already active is idempotent: the flag is already ``'true'``
+    and stays so. Only the outermost call on a given alias clears it on exit,
+    mirroring the depth-tracking a caller would otherwise have to hand-write;
+    an inner block exiting does not turn the bypass off under an outer block
+    still using it. Entering while a tenant is active in ``TenantContext`` is
+    supported and requires no special handling: the two session variables are
+    independent, and ``boundary_admin_bypass`` is simply OR'd with
+    ``boundary_tenant_isolation``, so both can be set at once without
+    conflict.
+
+    **Regional aliases.** Unlike ``TenantContext.set()``/``using()``, this
+    does NOT auto-derive a regional alias to also flip, because there is no
+    tenant instance here to derive a region from (``_regional_alias()``
+    reads a tenant's region field). ``using`` names exactly the one alias the
+    flag is set on. A multi-region maintenance operation combines this with
+    ``boundary.routing.all_regions()``/``specific_region()``, entering
+    ``admin_bypass(using=alias)`` once per alias, the same way ``unscoped``
+    already composes with region iteration in the cross-tenant-admin-
+    operations how-to.
+
+    Fires ``boundary.signals.admin_bypass_activated`` on entry, with the flag
+    variable name and the ``using`` alias, so use of this escape hatch is
+    observable without boundary depending on a metrics library (see also the
+    ``.unscoped`` observability gap noted in the how-to guide). No exit
+    signal is fired: activation is the auditable event (an escape hatch was
+    opened and by which alias); the block's own duration and the explicit
+    clear-on-exit already bound how long it was open, and a second signal
+    on every exit path (including exception unwinding) adds a signal a
+    consumer must also wire up correctly without adding new audit value over
+    knowing entry happened and reading the surrounding code/logs for how
+    long the block ran.
+
+    Usage::
+
+        from boundary.context import admin_bypass
+
+        with admin_bypass():
+            Booking.unscoped.filter(court=1).update(is_paid=True)
+
+    Args:
+        using: DB alias to set the flag on. Defaults to ``"default"``.
+    """
+    from boundary.signals import admin_bypass_activated
+
+    connection = connections[using]
+    depth_map = dict(_admin_bypass_depth.get() or {})
+    already_active = depth_map.get(using, 0) > 0
+    depth_map[using] = depth_map.get(using, 0) + 1
+    depth_token = _admin_bypass_depth.set(depth_map)
+
+    try:
+        with _ensure_atomic(using):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config(%s, 'true', true)",
+                    [boundary_settings.ADMIN_FLAG_VAR],
+                )
+                cursor.execute(
+                    "SELECT current_setting(%s, true)",
+                    [boundary_settings.ADMIN_FLAG_VAR],
+                )
+                active = cursor.fetchone()[0]
+            if active != "true":
+                raise AdminBypassNotActiveError(
+                    f"admin_bypass() set {boundary_settings.ADMIN_FLAG_VAR!r} on alias "
+                    f"{using!r} but the read-back did not confirm it is active. This "
+                    "usually means BOUNDARY_WRAP_ATOMIC=False and no transaction was "
+                    "already open, so the transaction-local setting had no scope to "
+                    "persist into. Wrap the call in transaction.atomic(using=...) "
+                    "explicitly, or leave BOUNDARY_WRAP_ATOMIC at its default."
+                )
+
+            admin_bypass_activated.send(
+                sender=None,
+                flag_var=boundary_settings.ADMIN_FLAG_VAR,
+                using=using,
+            )
+            logger.warning(
+                "RLS admin bypass activated",
+                extra={"flag_var": boundary_settings.ADMIN_FLAG_VAR, "using": using},
+            )
+            try:
+                yield
+            finally:
+                if not already_active:
+                    # Only the call that actually turned the flag on clears
+                    # it; an inner nested call leaves an outer call's bypass
+                    # active for the outer call to clear.
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT set_config(%s, '', true)",
+                            [boundary_settings.ADMIN_FLAG_VAR],
+                        )
+    finally:
+        _admin_bypass_depth.reset(depth_token)
 
 
 def tenant_scoped(tenant_arg: str | None = None):
