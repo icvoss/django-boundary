@@ -576,7 +576,7 @@ via `BOUNDARY_RESOLVERS`; first match wins.
 
 | Resolver | Source | Setting | Client-controlled? |
 |----------|--------|---------|---------------------|
-| `SubdomainResolver` | `club.example.com` -> slug lookup | `BOUNDARY_SUBDOMAIN_FIELD` | No (constrained by `ALLOWED_HOSTS`) |
+| `SubdomainResolver` | `club.example.com` -> slug lookup | `BOUNDARY_SUBDOMAIN_FIELD`, `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` | No (constrained by `ALLOWED_HOSTS`, and by `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` when set) |
 | `HeaderResolver` | `X-Tenant-ID` header (UUID first, slug fallback) | `BOUNDARY_HEADER_NAME` | **Yes** |
 | `JWTClaimResolver` | JWT payload claim (no signature validation) | `BOUNDARY_JWT_CLAIM` | **Yes** |
 | `SessionResolver` | Django session key | `BOUNDARY_SESSION_KEY` | No, provided the session key is only ever set server-side after its own check |
@@ -591,6 +591,14 @@ resolved tenant is the consumer's responsibility; see
 [Enforce membership after resolution](docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution).
 `boundary.W006` warns when a client-controlled resolver is configured
 alongside `django.contrib.auth`.
+
+**`ALLOWED_HOSTS` alone is not a domain boundary.** `SubdomainResolver`
+resolves the first label of any host with three or more labels, including a
+foreign, customer-owned domain that happens to pass `ALLOWED_HOSTS` and whose
+first label collides with a tenant slug. Set
+`BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` to constrain resolution to your own
+domain(s); see [Constrain SubdomainResolver to your own domain](docs/how-to/choose-and-order-resolvers.md#constrain-subdomainresolver-to-your-own-domain).
+`boundary.W008` warns when `SubdomainResolver` is configured without it.
 
 **Security note:** Resolver ordering determines precedence. Placing
 `HeaderResolver` first allows any HTTP client to set the tenant via header.
@@ -766,6 +774,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `BOUNDARY_REQUIRED` | `True` | Return 404 if no resolver matches |
 | `BOUNDARY_RESOLVERS` | `["...SubdomainResolver"]` | Ordered resolver class paths |
 | `BOUNDARY_SUBDOMAIN_FIELD` | `"slug"` | Tenant field for subdomain lookup |
+| `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` | `None` | Constrain `SubdomainResolver` to hosts exactly one label above this domain (or list of domains); closes cross-tenant serving from foreign hosts |
 | `BOUNDARY_HEADER_NAME` | `"X-Tenant-ID"` | HTTP header for HeaderResolver |
 | `BOUNDARY_JWT_CLAIM` | `"tenant_id"` | JWT payload claim |
 | `BOUNDARY_SESSION_KEY` | `"boundary_tenant_id"` | Session key for SessionResolver |
@@ -794,6 +803,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
 | `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
 | `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |
+| `boundary.W008` | Warning | `SubdomainResolver` (or a subclass) is in `BOUNDARY_RESOLVERS` without `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` set: it resolves the first label of any three-plus-label host, including a foreign host outside the deployment's own domain (issue #22) |
 
 ---
 
