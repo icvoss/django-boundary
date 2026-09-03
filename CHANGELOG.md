@@ -59,6 +59,30 @@ All notable changes to django-boundary are documented here.
   isn't actually queried. A new `test_cache_invalidated_on_delete` adds
   the coverage that was previously entirely missing for the `post_delete`
   side of the same signal wiring. Fixes #35.
+- **`TenantMiddleware` silently disabled the RLS defence-in-depth layer for
+  every request when `ATOMIC_REQUESTS = True` was set on the default
+  database.** The middleware skipped its own transaction wrap whenever
+  `ATOMIC_REQUESTS` was already on, assuming Django's own transaction would
+  already be open when it called `TenantContext.set()`. It was not: Django's
+  `ATOMIC_REQUESTS` wraps the view, not the middleware chain, so at the point
+  the middleware set the PostgreSQL session variable no transaction had
+  opened yet, and the transaction-local `set_config(..., true)` call was
+  discarded before the view's transaction began. Application-level tenant
+  scoping (`TenantContext.get()`, the tenant-aware manager) was unaffected
+  and continued to report the correct tenant, but the RLS policies reading
+  `current_setting('app.current_tenant_id', true)` saw an empty session
+  variable throughout the request. Under `FORCE ROW LEVEL SECURITY` this
+  fails closed (no rows returned) rather than leaking data, but it meant RLS
+  provided no protection at all on any consumer running
+  `ATOMIC_REQUESTS = True`. `TenantMiddleware` now always wraps the request
+  in its own transaction (via `context._ensure_atomic()`, honouring
+  `BOUNDARY_WRAP_ATOMIC = False` for consumers who manage transactions
+  themselves), so the session variable is reliably in scope regardless of
+  the `ATOMIC_REQUESTS` setting; when `ATOMIC_REQUESTS` is also on, the
+  view's transaction now nests as a savepoint inside boundary's, and an
+  exception in the view still rolls back the whole request. If you run
+  `ATOMIC_REQUESTS = True` and rely on RLS, upgrade: no configuration
+  change is required. Fixes #40.
 - **`boundary.checks` was never imported anywhere the package itself
   runs, so every system check it defines (`E001`, `E003`, `E004`,
   `E006`, `W001`, `W002`, and now `W003`) silently never registered on a

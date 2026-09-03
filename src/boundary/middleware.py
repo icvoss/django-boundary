@@ -13,7 +13,7 @@ from django.utils.deprecation import MiddlewareMixin
 from django.utils.module_loading import import_string
 
 from boundary.conf import boundary_settings
-from boundary.context import TenantContext
+from boundary.context import TenantContext, _ensure_atomic
 from boundary.exceptions import TenantInactiveError, TenantResolutionError
 from boundary.signals import tenant_resolution_failed, tenant_resolved
 
@@ -98,23 +98,40 @@ class TenantMiddleware(MiddlewareMixin):
             },
         )
 
-        # Set context and wrap in transaction if configured
+        # Set context and wrap in a transaction so set_config() has effect
+        # (BR-CTX-002, issue #40). ATOMIC_REQUESTS was previously treated as
+        # a reason to skip this middleware's own atomic() wrap, on the
+        # assumption that Django's ATOMIC_REQUESTS transaction would already
+        # cover TenantContext.set(). That assumption is false: Django's
+        # ATOMIC_REQUESTS wraps the VIEW (BaseHandler.make_view_atomic), not
+        # the middleware chain, so no transaction is open yet at this point
+        # in __call__. set_config(..., true) is transaction-local, so the
+        # session variable set here was silently discarded before the view's
+        # transaction ever opened, leaving RLS with an empty tenant variable
+        # while TenantContext.get() still reported the tenant correctly
+        # (fail-closed under FORCE ROW LEVEL SECURITY: no rows, not a leak,
+        # but the RLS layer was effectively disabled for every request).
+        #
+        # _ensure_atomic() (context.py) is the single source of truth for
+        # "is a transaction already open right now": it checks
+        # connection.in_atomic_block, which correctly reads False here
+        # regardless of ATOMIC_REQUESTS, because the view has not started.
+        # Opening our own atomic() here means the view's later
+        # ATOMIC_REQUESTS wrap nests as a savepoint under it rather than
+        # being a separate top-level transaction; Django's atomic() nesting
+        # already handles that, and the "view's work commits or rolls back
+        # as a unit" contract is preserved because an unhandled exception in
+        # the view still unwinds through both the savepoint and this outer
+        # transaction. BOUNDARY_WRAP_ATOMIC=False is honoured by
+        # _ensure_atomic() itself (warn-and-no-op, matching the
+        # already-documented behaviour TenantContext.using() relies on),
+        # so this call needs no separate gate.
         request.tenant = tenant
         request_attr = boundary_settings.REQUEST_ATTR
         if request_attr and request_attr != "tenant":
             setattr(request, request_attr, tenant)
 
-        if boundary_settings.WRAP_ATOMIC and not self._is_atomic_requests():
-            from django.db import transaction
-
-            with transaction.atomic():
-                token = TenantContext.set(tenant)
-                request._boundary_token = token
-                try:
-                    response = self.get_response(request)
-                finally:
-                    TenantContext.clear(token)
-        else:
+        with _ensure_atomic():
             token = TenantContext.set(tenant)
             request._boundary_token = token
             try:
@@ -167,10 +184,3 @@ class TenantMiddleware(MiddlewareMixin):
         a failing resolver to abort resolution rather than be skipped.
         """
         return None
-
-    @staticmethod
-    def _is_atomic_requests():
-        """Check if ATOMIC_REQUESTS is already enabled on the default DB."""
-        from django.db import connections
-
-        return connections["default"].settings_dict.get("ATOMIC_REQUESTS", False)
