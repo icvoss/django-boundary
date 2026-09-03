@@ -4,6 +4,26 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TenantManager.from_queryset(CustomQuerySet)` now works** (issue #29).
+  `get_queryset()` previously constructed a hardcoded `TenantQuerySet`
+  instead of honouring `self._queryset_class`, so a manager built with
+  `TenantManager.from_queryset(CustomQuerySet)` generated methods that
+  called `get_queryset()` and then the custom method on the result, and
+  since the returned object was never a `CustomQuerySet`, every generated
+  method raised `AttributeError` at runtime. `from_queryset()` appeared to
+  succeed and mypy was satisfied, so the break was only visible when the
+  method was actually called. If you worked around this by hand-copying
+  boundary's tenant filter, strict-mode branch, `strict_mode_violation`
+  signal, and `TenantNotSetError` message into your own
+  `get_queryset()` override, that override can now be deleted:
+  `TenantManager.from_queryset(YourQuerySet)` does the same job and stays
+  in sync with boundary's own filtering logic. Behaviour for anyone not
+  using `from_queryset()` is unchanged: a plain `TenantManager` still
+  returns a `TenantQuerySet` instance (now set explicitly via
+  `_queryset_class` rather than relying on it being hardcoded).
+
 ## [0.6.0] - 2026-09-03
 
 ### Added

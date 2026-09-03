@@ -112,6 +112,26 @@ If you set `BOUNDARY_TENANT_FK_FIELD = "merchant"` in step 2, `make_tenant_mixin
 
 The mixin also wires up the managers and auto-populate behaviour: `Booking.objects` is a `TenantManager` (auto-filtering), `Booking.unscoped` is an `UnscopedManager` (returns all rows regardless of context), and `save()`/`bulk_create()` auto-populate the FK from the active tenant when it is not set.
 
+If your model needs its own queryset methods (`.active()`, `.paid()`, and so on), subclass `TenantQuerySet` and build the manager with `TenantManager.from_queryset()` instead of overriding `get_queryset()` by hand:
+
+```python
+from boundary.models import TenantManager, TenantQuerySet
+
+
+class BookingQuerySet(TenantQuerySet):
+    def paid(self):
+        return self.filter(is_paid=True)
+
+
+class Booking(NullableTenantMixin):
+    court = models.IntegerField()
+    is_paid = models.BooleanField(default=False)
+
+    objects = TenantManager.from_queryset(BookingQuerySet)()
+```
+
+`Booking.objects.paid()` still auto-filters by the active tenant, still enforces strict mode, and still auto-populates on `bulk_create()`, because the generated manager subclasses `TenantManager`. Overriding `get_queryset()` yourself to get a custom queryset is never necessary and duplicates boundary's filtering and strict-mode logic in your own code.
+
 Generate the schema migration:
 
 ```bash

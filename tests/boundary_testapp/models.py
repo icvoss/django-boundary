@@ -5,7 +5,9 @@ from django.db import models
 
 from boundary.models import (
     AbstractTenant,
+    TenantManager,
     TenantModel,
+    TenantQuerySet,
     make_tenant_mixin,
     make_tenant_path_mixin,
 )
@@ -23,6 +25,32 @@ class Booking(TenantModel):
 
     court = models.IntegerField()
     is_paid = models.BooleanField(default=False)
+
+    class Meta:
+        app_label = "boundary_testapp"
+
+
+class PaidCourtQuerySet(TenantQuerySet):
+    """Distinctive custom queryset method for the from_queryset() coverage
+    (issue #29): TenantManager.get_queryset() must return an instance of
+    the queryset class TenantManager.from_queryset() was built from, not
+    a hardcoded TenantQuerySet, or a generated manager method calling this
+    method on the get_queryset() result raises AttributeError.
+    """
+
+    def paid(self):
+        return self.filter(is_paid=True)
+
+
+class BookingWithCustomQuerySet(TenantModel):
+    """Tenant-scoped model whose manager is built via
+    TenantManager.from_queryset(PaidCourtQuerySet), covering issue #29.
+    """
+
+    court = models.IntegerField()
+    is_paid = models.BooleanField(default=False)
+
+    objects = TenantManager.from_queryset(PaidCourtQuerySet)()
 
     class Meta:
         app_label = "boundary_testapp"
