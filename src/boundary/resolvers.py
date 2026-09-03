@@ -114,16 +114,27 @@ class SubdomainResolver(BaseResolver):
         # further parsing.
         host = host.rstrip(".").lower()
 
+        # BR-RES-011: an empty label is never a valid DNS label (RFC 1035
+        # requires 1 to 63 octets), so a host containing one is malformed and
+        # carries no tenant identity. Rejecting here, before the cache read
+        # and the database query, covers both the leading-dot case
+        # (".example.com" splits to ["", "example", "com"], passing the
+        # len(parts) < 3 guard and using "" as the slug) and the interior case
+        # ("shop..example.com", which on the unguarded path would otherwise
+        # resolve the tenant slugged "shop" from a malformed host).
+        labels = host.split(".")
+        if not all(labels):
+            return None
+
         parent_domains = boundary_settings.SUBDOMAIN_PARENT_DOMAIN
         if parent_domains is not None:
             slug = _slug_for_configured_parent(host, parent_domains)
             if slug is None:
                 return None
         else:
-            parts = host.split(".")
-            if len(parts) < 3:
+            if len(labels) < 3:
                 return None
-            slug = parts[0]
+            slug = labels[0]
 
         logger.debug(
             "SubdomainResolver attempt",

@@ -162,6 +162,69 @@ class TestSubdomainResolverParentDomain:
 
 
 @pytest.mark.django_db
+class TestSubdomainResolverEmptyLabel:
+    """Issue #46: a host containing an empty label carries no tenant identity
+    and must be rejected before the cache read and the database query.
+
+    An empty label is never a valid DNS label (RFC 1035 requires 1 to 63
+    octets), so a host containing one is malformed. Two distinct failures are
+    covered here, both pre-existing:
+
+    - A leading dot (`.example.com`) splits to `['', 'example', 'com']`, which
+      passes the `len(parts) < 3` guard, so the EMPTY STRING is used as the
+      tenant slug and reaches `TenantModel.objects.get(slug="")`.
+    - An interior empty label (`shop..example.com`) on the unguarded path
+      takes `shop` as the slug and resolves a real tenant from a malformed
+      host.
+
+    Every assertion here is on the QUERY COUNT, not the return value. `None`
+    is already the return value today for both hosts on the guarded path and
+    for the leading-dot host on the unguarded one, so a test asserting only
+    the result passes before the fix and proves nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        [".example.com", "shop..example.com", "a..b.example.com", "..com"],
+    )
+    def test_empty_label_host_never_queries_the_database(self, rf, tenant_a, host, django_assert_num_queries):
+        """Unguarded path: no parent domain configured."""
+        request = rf.get("/", HTTP_HOST=host)
+        resolver = SubdomainResolver()
+        with django_assert_num_queries(0):
+            assert resolver.resolve(request) is None
+
+    @pytest.mark.parametrize(
+        "host",
+        [".example.com", "shop..example.com", "a..b.example.com", "..com"],
+    )
+    def test_empty_label_host_never_queries_under_configured_parent(
+        self, rf, tenant_a, settings, host, django_assert_num_queries
+    ):
+        """Guarded path: BOUNDARY_SUBDOMAIN_PARENT_DOMAIN set. The label-count
+        comparison already rejects the interior-empty-label hosts here, but
+        incidentally rather than by rule, and it does NOT reject the
+        leading-dot host: `.example.com` against parent `example.com`
+        satisfies both the label count and the tail comparison, and yields
+        `''`."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST=host)
+        resolver = SubdomainResolver()
+        with django_assert_num_queries(0):
+            assert resolver.resolve(request) is None
+
+    def test_positive_control_a_valid_host_does_query(self, rf, tenant_a, django_assert_num_queries):
+        """The query-count assertions above are only evidence if a query is
+        observable at all through this instrument. A well-formed host with a
+        cold cache must show exactly one query, or the zero-query assertions
+        would pass for a host that could never have queried anyway."""
+        request = rf.get("/", HTTP_HOST="club-a.example.com")
+        resolver = SubdomainResolver()
+        with django_assert_num_queries(1):
+            assert resolver.resolve(request) == tenant_a
+
+
+@pytest.mark.django_db
 class TestHeaderResolver:
     """AC-RES-002/014: Header resolution (UUID first, slug fallback)."""
 
