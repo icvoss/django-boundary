@@ -221,11 +221,23 @@ class TenantManager(models.Manager):
 
     The FK field name is read from the model's ``_boundary_fk_field``
     attribute (set by TenantMixin or make_tenant_mixin).
+
+    Set explicitly rather than relying on Django's own default (plain
+    ``QuerySet``), because ``get_queryset()`` below is overridden and must
+    construct via ``self._queryset_class`` to honour
+    ``TenantManager.from_queryset(CustomQuerySet)`` (issue #29). Without
+    this, a manager built with ``from_queryset()`` would generate methods
+    that call ``self.get_queryset()`` then the custom method on the
+    result, and since the overridden ``get_queryset()`` ignored
+    ``_queryset_class``, the custom method would not be on the returned
+    object and the generated method would raise ``AttributeError``.
     """
+
+    _queryset_class = TenantQuerySet
 
     def get_queryset(self):
         tenant = TenantContext.get()
-        qs = TenantQuerySet(self.model, using=self._db)
+        qs = self._queryset_class(self.model, using=self._db)
 
         if tenant is not None:
             lookup = get_tenant_lookup(self.model) or "tenant"

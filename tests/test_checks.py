@@ -667,7 +667,7 @@ class TestE006FiresOnMissingRls:
 
         errors = _check_rls_enabled()
         e006 = [e for e in errors if e.id == "boundary.E006"]
-        assert any("boundary_testapp_booking" in e.msg and "Booking" in e.msg for e in e006), (
+        assert any("Table 'boundary_testapp_booking'" in e.msg and "model Booking)" in e.msg for e in e006), (
             f"expected boundary.E006 to report the unprotected Booking table; got {[e.msg for e in e006]}"
         )
 
@@ -693,7 +693,7 @@ class TestE006FiresOnMissingRls:
             )
 
             errors = _check_rls_enabled()
-            e006 = [e for e in errors if e.id == "boundary.E006" and "boundary_testapp_booking" in e.msg]
+            e006 = [e for e in errors if e.id == "boundary.E006" and "Table 'boundary_testapp_booking'" in e.msg]
             assert not e006, f"expected boundary.E006 to stay silent for a protected table; got {[e.msg for e in e006]}"
         finally:
             _remove_rls_from_booking()
@@ -877,7 +877,7 @@ class TestE006QualifiesTableLookupByOid:
                 )
 
             errors = _check_rls_enabled()
-            e006 = [e for e in errors if e.id == "boundary.E006" and table in e.msg]
+            e006 = [e for e in errors if e.id == "boundary.E006" and f"Table '{table}'" in e.msg]
             assert not e006, (
                 f"expected the OID-qualified lookup to resolve the real, "
                 f"RLS-protected tenantschema.{table} via search_path, not "
