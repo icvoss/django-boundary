@@ -528,8 +528,11 @@ class TestAdminBypassFlagLifecycle:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT current_setting('myapp.is_admin', true)")
                 assert cursor.fetchone()[0] == "true"
-            # The default variable name must NOT have been touched.
-            assert _get_admin_flag() == ""
+            # The default variable name must NOT have been touched: it was
+            # never set on this connection at all, so current_setting(...,
+            # true) returns SQL NULL (Python None), not the empty string a
+            # set-then-cleared variable would read back as.
+            assert _get_admin_flag() is None
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT current_setting('myapp.is_admin', true)")
@@ -556,7 +559,10 @@ class TestAdminBypassTransactionLocal:
             assert _get_admin_flag() == "true"
             with app_conn.cursor() as cur:
                 cur.execute("SELECT current_setting('app.boundary_admin', true)")
-                assert cur.fetchone()[0] == "", "flag must not leak onto an unrelated connection"
+                # app_conn has never set this variable at all, so an
+                # untouched GUC reads back as SQL NULL (Python None), not
+                # the empty string a set-then-cleared variable would show.
+                assert cur.fetchone()[0] is None, "flag must not leak onto an unrelated connection"
 
 
 @pytest.mark.django_db(transaction=True)
