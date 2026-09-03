@@ -51,6 +51,29 @@ All notable changes to django-boundary are documented here.
 
 ### Fixed
 
+- **`SubdomainResolver` no longer queries the database for a host with an
+  empty label** (issue #46). A host with a leading dot (`.example.com`) split
+  to `["", "example", "com"]`, which passed the three-label guard, so the
+  empty string was used as the tenant slug and reached
+  `TenantModel.objects.get(slug="")` on every such request. A host with an
+  interior empty label (`shop..example.com`) was worse on the unguarded path:
+  it took `shop` as the slug and resolved whichever tenant carried that slug
+  from a malformed host. `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` did not close
+  either case: `.example.com` satisfies both the label-count and tail
+  comparison against parent `example.com` and still yields `""`.
+
+  An empty label is never a valid DNS label (RFC 1035 requires 1 to 63
+  octets), so such a host is now rejected before the cache read and the
+  database lookup, on both the guarded and unguarded paths. In practice the
+  empty-slug lookup raised `DoesNotExist` and was caught, so **no wrong
+  tenant was served** for the leading-dot case and nothing changes in what
+  your application returns for it; what changes is that the pointless query
+  per request is gone, and a tenant row that did carry an empty slug is no
+  longer resolvable by any leading-dot host. The interior-empty-label case
+  is a genuine behaviour change on the unguarded path: `shop..example.com`
+  previously resolved the tenant slugged `shop` and now resolves nothing. No
+  well-formed host changes behaviour.
+
 - **`TenantManager.from_queryset(CustomQuerySet)` now works** (issue #29).
   `get_queryset()` previously constructed a hardcoded `TenantQuerySet`
   instead of honouring `self._queryset_class`, so a manager built with
