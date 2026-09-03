@@ -84,6 +84,104 @@ class TestSystemChecks:
 
 
 @pytest.mark.django_db
+class TestW006ClientControlledResolverWithoutMembershipCheck:
+    """Issue #38: a client-controlled resolver (HeaderResolver,
+    JWTClaimResolver) combined with django.contrib.auth is the
+    configuration where the missing membership check actually bites: the
+    app has authenticated users, and tenant selection is nonetheless taken
+    from client-supplied input."""
+
+    def test_fires_for_header_resolver_with_auth(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_fires_for_jwt_claim_resolver_with_auth(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.JWTClaimResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_fires_for_a_subclass_of_a_client_controlled_resolver(self, settings):
+        """A consumer subclass inherits the same client-controlled trust
+        boundary; matched by issubclass, not dotted-path suffix, so this
+        must fire even though the path differs from the built-in."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary_testapp.resolvers.CustomHeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_subdomain_resolver_with_auth(self, settings):
+        """Positive control: SubdomainResolver derives the tenant from the
+        Host header, which ALLOWED_HOSTS constrains, not from a value the
+        client freely chooses. Proves the check discriminates by resolver
+        class rather than firing unconditionally whenever auth is
+        installed."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_header_resolver_without_auth(self, settings):
+        """Positive control: without django.contrib.auth installed there
+        are no authenticated users to mis-scope, so the same
+        client-controlled resolver must not fire. Proves the check
+        discriminates by INSTALLED_APPS rather than firing on the resolver
+        alone."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        settings.INSTALLED_APPS = [app for app in settings.INSTALLED_APPS if app != "django.contrib.auth"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_unimportable_resolver_path(self, settings):
+        """A broken path is boundary.E003's concern; W006 has nothing to
+        add and must not raise trying to import it."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["nonexistent.Resolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+        assert any(e.id == "boundary.E003" for e in errors)
+
+    def test_message_names_the_resolver_and_the_hint_points_at_the_pattern(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        w006 = next(e for e in errors if e.id == "boundary.W006")
+        assert "boundary.resolvers.HeaderResolver" in w006.msg
+        assert "SILENCED_SYSTEM_CHECKS" in w006.hint
+        assert "membership" in w006.hint
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        """Issue #31: the whole check module once failed to register at
+        all. Proves W006 actually fires through Django's real check
+        registry (as manage.py check / AppConfig.ready() invoke it), not
+        only when check_boundary_configuration() is called directly."""
+        from django.core.checks.registry import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = registry.run_checks()
+        assert any(e.id == "boundary.W006" for e in errors)
+
+
+@pytest.mark.django_db
 class TestE001IcvTenantModelFallback:
     """Issue #15: _check_tenant_model() must accept ICV_TENANT_MODEL too
     (ADR-025 T2), not only BOUNDARY_TENANT_MODEL."""
@@ -107,6 +205,154 @@ class TestE001IcvTenantModelFallback:
         settings.ICV_TENANT_MODEL = "nonexistent.Model"
         errors = check_boundary_configuration(None)
         assert any(e.id == "boundary.E001" for e in errors)
+
+
+@pytest.mark.django_db
+class TestE005RegionalRouterConfigured:
+    """Issue #36: BOUNDARY_REGIONS documented a system check, boundary.E005,
+    that did not exist anywhere in the package; the README row and the
+    apps.py ready() comment both claimed it. BR-REG-002 requires
+    RegionalRouter be added to DATABASE_ROUTERS explicitly, never
+    automatically, so this configuration is visible and auditable; E005 is
+    what catches the case where an integrator sets BOUNDARY_REGIONS and
+    forgets that step, which otherwise fails silently: RegionalRouter._route()
+    returns "default" for every query the moment BOUNDARY_REGIONS is truthy,
+    with no error and no warning."""
+
+    def test_fires_when_regions_set_and_router_absent(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_router_present(self, settings):
+        """Positive control: the documented configuration from
+        deploy-multi-region.md must not fire."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = ["boundary.routing.RegionalRouter"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_regions_unset(self, settings):
+        """Positive control: without BOUNDARY_REGIONS there is nothing to
+        enforce, regardless of DATABASE_ROUTERS."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = None
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_regions_is_empty_dict(self, settings):
+        """Positive control: RegionalRouter._route() treats an empty
+        BOUNDARY_REGIONS the same as unset (`if not regions: return
+        "default"`), so this check must match that, not fire on the
+        presence of the setting alone."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_a_subclass_of_regional_router(self, settings):
+        """Matched by issubclass, not dotted-path suffix: a consumer
+        subclass that composes RegionalRouter with other routing concerns
+        still performs the same routing decision and must not fire."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = ["boundary_testapp.routing.CustomRegionalRouter"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_a_router_instance(self, settings):
+        """Django's own DATABASE_ROUTERS accepts a constructed router
+        instance, not only a dotted string; this check must not crash on
+        one and must recognise a RegionalRouter instance as satisfying the
+        requirement."""
+        from boundary.routing import RegionalRouter
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [RegionalRouter()]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_an_unrelated_router_instance(self, settings):
+        """An instance of some other router class must not accidentally
+        satisfy the check."""
+
+        class UnrelatedRouter:
+            def db_for_read(self, model, **hints):
+                return None
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [UnrelatedRouter()]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E005" for e in errors)
+
+    def test_does_not_raise_for_a_router_path_alongside_regional_router(self, settings):
+        """A broken DATABASE_ROUTERS path is not this check's concern, and
+        in practice Django itself refuses an unimportable entry the moment
+        DATABASE_ROUTERS is touched (django.db.utils.ConnectionRouter.routers
+        calls import_string() eagerly, so an unimportable path raises
+        ModuleNotFoundError before this check ever runs, not something this
+        check could catch or needs to). What this check must not do is trip
+        over an *importable* but unrelated entry sitting alongside a valid
+        RegionalRouter path."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [
+            "boundary_testapp.routing.CustomRegionalRouter",
+            "django.db.utils.ConnectionRouter",
+        ]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_message_and_hint(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        e005 = next(e for e in errors if e.id == "boundary.E005")
+        assert "BOUNDARY_REGIONS" in e005.msg
+        assert "DATABASE_ROUTERS" in e005.msg
+        assert "boundary.routing.RegionalRouter" in e005.hint
+        assert "DATABASE_ROUTERS" in e005.hint
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        """Issue #31: the whole check module once failed to register at
+        all. Proves E005 actually fires through Django's real check
+        registry (as manage.py check / AppConfig.ready() invoke it), not
+        only when check_boundary_configuration() is called directly."""
+        from django.core.checks.registry import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = registry.run_checks()
+        assert any(e.id == "boundary.E005" for e in errors)
 
 
 @pytest.mark.django_db
@@ -260,3 +506,318 @@ class TestE006SkipsPathScopedModels:
         flagged = {e.msg for e in errors}
         assert not any("BrandAsset" in m for m in flagged)
         assert not any("AssetVariant" in m for m in flagged)
+
+
+def _fake_migration_state():
+    from django.apps import apps
+
+    return type("FakeState", (), {"apps": apps})()
+
+
+def _apply_rls_to_booking():
+    """Apply RLS to boundary_testapp_booking via the real migration
+    operations, the same mechanism tests/test_rls.py uses. This is the only
+    way RLS ends up on a table in this suite: tests/settings.py sets
+    MIGRATION_MODULES to None for every app, so pytest-django creates
+    tables straight from the model definitions with no RLS operations run,
+    and a table carries RLS only when a test applies it explicitly.
+    """
+    from django.db import connection
+
+    from boundary.migrations_ops import CreateTenantPolicy, EnableRLS
+
+    state = _fake_migration_state()
+    with connection.schema_editor() as editor:
+        EnableRLS("Booking").database_forwards("boundary_testapp", editor, state, state)
+        CreateTenantPolicy("Booking").database_forwards("boundary_testapp", editor, state, state)
+
+
+def _remove_rls_from_booking():
+    from django.db import connection
+
+    from boundary.migrations_ops import EnableRLS
+
+    state = _fake_migration_state()
+    with connection.schema_editor() as editor:
+        EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
+
+
+@pytest.mark.django_db
+class TestE006FiresOnMissingRls:
+    """Issue #34: boundary.E006 must be proven to actually fire.
+
+    Every prior test touching E006 (this file, tests/test_traversal.py)
+    only ever asserted it stayed silent, so its silence was never proven to
+    mean "RLS is present" rather than "the check cannot see". These tests
+    are the positive control: tests/settings.py disables Django migrations
+    for every app (MIGRATION_MODULES = None), so pytest-django's `db`
+    fixture creates boundary_testapp_booking straight from the model
+    definition with no RLS operations applied, which is genuinely the
+    "RLS absent" state, verified directly against pg_class below rather
+    than assumed. The "silent when present" arm then applies RLS via the
+    real EnableRLS/CreateTenantPolicy migration operations (the same
+    mechanism tests/test_rls.py uses to exercise them) and re-runs the same
+    check, so both arms exercise the identical code path and only the
+    database state differs.
+    """
+
+    def test_e006_fires_when_rls_absent(self, settings):
+        from django.db import connection
+
+        from boundary.checks import _check_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
+                ["boundary_testapp_booking"],
+            )
+            rls_enabled, rls_forced = cursor.fetchone()
+        assert not rls_enabled and not rls_forced, (
+            "precondition failed: boundary_testapp_booking already has RLS, "
+            "so this is not the absent state the test claims to construct"
+        )
+
+        errors = _check_rls_enabled()
+        e006 = [e for e in errors if e.id == "boundary.E006"]
+        assert any("boundary_testapp_booking" in e.msg and "Booking" in e.msg for e in e006), (
+            f"expected boundary.E006 to report the unprotected Booking table; got {[e.msg for e in e006]}"
+        )
+
+    def test_e006_silent_when_rls_enabled_and_forced(self, settings):
+        from django.db import connection
+
+        from boundary.checks import _check_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        _apply_rls_to_booking()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
+                    ["boundary_testapp_booking"],
+                )
+                rls_enabled, rls_forced = cursor.fetchone()
+            assert rls_enabled and rls_forced, (
+                "precondition failed: RLS was not actually applied to "
+                "boundary_testapp_booking, so this is not the present "
+                "state the test claims to construct"
+            )
+
+            errors = _check_rls_enabled()
+            e006 = [e for e in errors if e.id == "boundary.E006" and "boundary_testapp_booking" in e.msg]
+            assert not e006, f"expected boundary.E006 to stay silent for a protected table; got {[e.msg for e in e006]}"
+        finally:
+            _remove_rls_from_booking()
+
+
+@pytest.mark.django_db
+class TestE006CannotDetermineRlsState:
+    """Issue #34: E006's exception handling must not fail open.
+
+    A bare ``except Exception: pass`` produces zero errors for a permissions
+    failure, a dead connection, or a query timeout, which reads exactly
+    like "every table is correctly protected". These tests draw the line
+    the fix makes: django.db.utils.OperationalError/InterfaceError (the
+    connection itself is unreachable, e.g. before the database is
+    provisioned) stays a silent skip, because there is nothing to report
+    against; anything else (the connection is live and the query against
+    pg_class failed) must surface as boundary.W007 instead of vanishing.
+    """
+
+    def test_w007_fires_when_the_query_fails_on_a_live_connection(self, settings, monkeypatch):
+        from django.db import connection
+        from django.db.utils import ProgrammingError
+
+        from boundary.checks import _check_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        class _RaisingCursor:
+            def __enter__(self):
+                raise ProgrammingError("permission denied for table pg_class")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        monkeypatch.setattr(connection, "cursor", lambda: _RaisingCursor())
+
+        errors = _check_rls_enabled()
+        w007 = [e for e in errors if e.id == "boundary.W007"]
+        assert w007, "expected boundary.W007 when the pg_class query fails on a live connection"
+        assert "boundary_testapp_booking" in w007[0].msg
+        assert "permission denied" in w007[0].msg
+        assert not any(e.id == "boundary.E006" for e in errors), (
+            "a query failure must not also be reported as a confirmed missing policy"
+        )
+
+    def test_no_w007_when_the_connection_is_genuinely_unavailable(self, settings, monkeypatch):
+        from django.db import connection
+        from django.db.utils import OperationalError
+
+        from boundary.checks import _check_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        class _RaisingCursor:
+            def __enter__(self):
+                raise OperationalError("connection refused")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        monkeypatch.setattr(connection, "cursor", lambda: _RaisingCursor())
+
+        errors = _check_rls_enabled()
+        assert not any(e.id == "boundary.W007" for e in errors), (
+            "an unreachable connection is the legitimate pre-migrate skip, not a W007 case"
+        )
+        assert not any(e.id == "boundary.E006" for e in errors)
+
+    def test_w007_fires_for_rls_bypassable_when_the_query_fails(self, settings, monkeypatch):
+        from django.db import connection
+        from django.db.utils import ProgrammingError
+
+        from boundary.checks import _check_rls_bypassable
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        class _RaisingCursor:
+            def __enter__(self):
+                raise ProgrammingError("permission denied for table pg_roles")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        monkeypatch.setattr(connection, "cursor", lambda: _RaisingCursor())
+
+        errors = _check_rls_bypassable()
+        w007 = [e for e in errors if e.id == "boundary.W007"]
+        assert w007, "expected boundary.W007 when the pg_roles query fails on a live connection"
+        assert "permission denied" in w007[0].msg
+        assert not any(e.id == "boundary.W003" for e in errors)
+
+    def test_no_w007_for_rls_bypassable_when_the_connection_is_unavailable(self, settings, monkeypatch):
+        from django.db import connection
+        from django.db.utils import OperationalError
+
+        from boundary.checks import _check_rls_bypassable
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+
+        class _RaisingCursor:
+            def __enter__(self):
+                raise OperationalError("connection refused")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        monkeypatch.setattr(connection, "cursor", lambda: _RaisingCursor())
+
+        errors = _check_rls_bypassable()
+        assert errors == []
+
+
+@pytest.mark.django_db(transaction=True)
+class TestE006QualifiesTableLookupByOid:
+    """Issue #34: the pg_class lookup must resolve the model's real table,
+    not an arbitrary same-named row from another schema.
+
+    ``WHERE relname = %s`` with no schema qualification returns one row per
+    schema containing a same-named table, and the old code's ``fetchone()``
+    read whichever row PostgreSQL's index scan produced first. On this
+    instance ``public`` always carries a low, fixed system OID (2200), so a
+    naive "same name in two schemas" probe with the real table left in
+    ``public`` cannot by itself distinguish old from new: ``public`` sorts
+    first regardless. To build a discriminator that is not an accident of
+    OID ordering, this test moves the REAL table out of ``public`` into a
+    schema placed first on the connection's ``search_path`` (so it is
+    genuinely where Django resolves the table from), then creates an
+    unprotected decoy under the same name back in ``public``. The old,
+    unqualified query has no way to know which schema `search_path`
+    prefers and returns the first row by OID, which is the wrong, decoy
+    row here; ``to_regclass()`` follows ``search_path`` the same way any
+    ordinary query against the table would, and resolves the real one.
+    """
+
+    def test_check_resolves_the_search_path_table_not_a_decoy_in_public(self, settings):
+        from django.db import connection
+
+        from boundary.checks import _check_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        table = "boundary_testapp_booking"
+
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE SCHEMA IF NOT EXISTS tenantschema")
+            cursor.execute(f'ALTER TABLE public."{table}" SET SCHEMA tenantschema')
+            cursor.execute("SET search_path = tenantschema, public")
+
+        # EnableRLS/CreateTenantPolicy resolve the table name through this
+        # same connection, so with search_path set they operate on the
+        # relocated tenantschema.booking, the table Django itself now
+        # resolves the model to.
+        _apply_rls_to_booking()
+        try:
+            with connection.cursor() as cursor:
+                # The decoy: same table name, back in public, deliberately
+                # left WITHOUT RLS.
+                cursor.execute(f'CREATE TABLE public."{table}" (id serial primary key)')
+
+                cursor.execute(
+                    "SELECT n.nspname, c.relrowsecurity, c.relforcerowsecurity "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %s ORDER BY n.nspname",
+                    [table],
+                )
+                rows = dict((schema, (enabled, forced)) for schema, enabled, forced in cursor.fetchall())
+                assert rows == {"public": (False, False), "tenantschema": (True, True)}, (
+                    f"expected an unprotected decoy in public and the real, protected table in tenantschema; got {rows}"
+                )
+
+                # Prove the OLD, unqualified query actually reads the wrong
+                # row in this construction: fetchone() takes whichever row
+                # comes first with no regard for search_path, and here that
+                # is the unprotected public decoy.
+                cursor.execute(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
+                    [table],
+                )
+                old_query_result = cursor.fetchone()
+                assert old_query_result == (False, False), (
+                    f"expected this construction to reproduce the old query's false read; got {old_query_result}"
+                )
+
+            errors = _check_rls_enabled()
+            e006 = [e for e in errors if e.id == "boundary.E006" and table in e.msg]
+            assert not e006, (
+                f"expected the OID-qualified lookup to resolve the real, "
+                f"RLS-protected tenantschema.{table} via search_path, not "
+                f"the unprotected public decoy; got {[e.msg for e in e006]}"
+            )
+        finally:
+            from boundary.migrations_ops import DropTenantPolicy
+
+            with connection.cursor() as cursor:
+                cursor.execute(f'DROP TABLE IF EXISTS public."{table}"')
+            state = _fake_migration_state()
+            with connection.schema_editor() as editor:
+                DropTenantPolicy("Booking").database_forwards("boundary_testapp", editor, state, state)
+            _remove_rls_from_booking()
+            with connection.cursor() as cursor:
+                cursor.execute(f'ALTER TABLE tenantschema."{table}" SET SCHEMA public')
+                cursor.execute("RESET search_path")
+                cursor.execute("DROP SCHEMA IF EXISTS tenantschema CASCADE")
+
+    def test_to_regclass_returns_null_for_a_nonexistent_table(self):
+        """Sanity check for the row-is-None branch: to_regclass() must
+        behave the same as the old fetchone() == None case for a table
+        that genuinely does not exist, not raise."""
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass(%s)", ["definitely_does_not_exist_xyz"])
+            resolved = cursor.fetchone()[0]
+        assert resolved is None

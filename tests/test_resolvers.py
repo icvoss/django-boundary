@@ -168,7 +168,7 @@ class TestResolverCache:
             result = resolver.resolve(request)
         assert result == tenant_a
 
-    def test_cache_invalidated_on_save(self, rf, tenant_a):
+    def test_cache_invalidated_on_save(self, rf, tenant_a, django_assert_num_queries):
         resolver = SubdomainResolver()
         request = rf.get("/", HTTP_HOST="club-a.example.com")
 
@@ -179,11 +179,37 @@ class TestResolverCache:
         tenant_a.name = "Updated"
         tenant_a.save()
 
-        # Next resolve should hit DB again
-        result = resolver.resolve(request)
+        # Next resolve should hit DB again (cache miss). `result == tenant_a`
+        # alone is true for a cache hit and a cache miss alike, since the
+        # cached object is the same tenant either way (issue #35): asserting
+        # the query count is what actually distinguishes them.
+        with django_assert_num_queries(1):
+            result = resolver.resolve(request)
         assert result == tenant_a
 
-    def test_cache_expires_after_ttl(self, rf, tenant_a, settings):
+    def test_cache_invalidated_on_delete(self, rf, tenant_a, django_assert_num_queries):
+        """AC-RES-011/012/013 also covers post_delete invalidation (issue #35).
+
+        No test previously exercised the delete side even though
+        BoundaryConfig connects post_delete alongside post_save; this closes
+        that gap with the same query-count rigour as the save case.
+        """
+        resolver = SubdomainResolver()
+        request = rf.get("/", HTTP_HOST="club-a.example.com")
+
+        # Populate cache
+        resolver.resolve(request)
+
+        tenant_a.delete()
+
+        # Cache entry must be gone: resolving again queries the DB (and
+        # finds nothing, since the tenant no longer exists), rather than
+        # serving the now-deleted cached instance.
+        with django_assert_num_queries(1):
+            result = resolver.resolve(request)
+        assert result is None
+
+    def test_cache_expires_after_ttl(self, rf, tenant_a, settings, django_assert_num_queries):
         settings.BOUNDARY_RESOLVER_CACHE_TTL = 0  # Expire immediately
         resolver = SubdomainResolver()
         request = rf.get("/", HTTP_HOST="club-a.example.com")
@@ -191,6 +217,10 @@ class TestResolverCache:
         resolver.resolve(request)
         time.sleep(0.01)  # Ensure TTL has passed
 
-        # Should miss cache due to TTL
-        result = resolver.resolve(request)
+        # Should miss cache due to TTL. Same vacuousness as
+        # test_cache_invalidated_on_save (issue #35): `result == tenant_a`
+        # holds for a cache hit and a cache miss alike, so the query count
+        # is what actually proves the TTL expiry was honoured.
+        with django_assert_num_queries(1):
+            result = resolver.resolve(request)
         assert result == tenant_a

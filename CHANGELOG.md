@@ -6,6 +6,58 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`boundary.E005`: error when `BOUNDARY_REGIONS` is configured but
+  `RegionalRouter` is absent from `DATABASE_ROUTERS`** (issue #36). The
+  README has documented `boundary.E005` since before 0.5.3; the check
+  itself did not exist anywhere in the package, so any consumer who set
+  `BOUNDARY_REGIONS` and relied on the documented check to catch a missing
+  `DATABASE_ROUTERS` entry got no protection. Per `BR-REG-002`,
+  `RegionalRouter` is never added to `DATABASE_ROUTERS` automatically, so
+  a project that configures regions but forgets that line previously had
+  every query silently stay on the `default` database, with no error and
+  no warning: for a data-residency feature, a silent fallback to the
+  wrong database is a compliance problem. Matched by `issubclass` against
+  `RegionalRouter`, so a consumer subclass, or an already-constructed
+  router instance (Django accepts both forms in `DATABASE_ROUTERS`),
+  satisfies the check. Fires only when `BOUNDARY_REGIONS` is non-empty,
+  matching `RegionalRouter._route()`'s own treatment of an empty dict as
+  "not configured".
+- **`boundary.W006`: warn when a client-controlled resolver is configured
+  alongside `django.contrib.auth`** (issue #38). `HeaderResolver` and
+  `JWTClaimResolver` (and any subclass of either) take the tenant directly
+  from a value the client supplies: a header, or an unverified JWT claim.
+  boundary resolves *which* tenant a request targets; it never checks
+  *whether the caller may access it*, so an authenticated user of one
+  tenant can simply name another and every layer beneath resolution (the
+  ORM manager, RLS, the session variable) scopes correctly to it. Fires
+  only when the application also has authenticated users
+  (`django.contrib.auth` in `INSTALLED_APPS`), since that is the
+  configuration where the missing membership check actually bites; an
+  application with no authenticated users has nothing to mis-scope. The
+  hint points at the new "Enforce membership after resolution" section in
+  [choose-and-order-resolvers.md](docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution),
+  which documents the middleware shape and where it sits relative to
+  `TenantMiddleware`. A consumer who has already handled membership
+  silences it by ID via `SILENCED_SYSTEM_CHECKS`.
+- **`admin_bypass()` context manager for the RLS admin bypass flag** (issue
+  #37). The flag (`BOUNDARY_ADMIN_FLAG_VAR`, default `app.boundary_admin`)
+  previously had no API: consumers were directed by the docs to call
+  `set_config` by hand, and correctness depended entirely on passing the
+  right third argument. `admin_bypass()` hardcodes the transaction-local
+  form, so the unsafe session-scoped form (which can persist across
+  `CONN_MAX_AGE` connection reuse or an external pooler handing the
+  connection to an unrelated request) is not reachable through this API.
+  It reuses the same transaction-guarantee machinery as
+  `TenantContext.using()`, verifies the flag actually took effect before
+  running the wrapped block, and clears it explicitly on exit. Fires the
+  new `admin_bypass_activated` signal on entry (flag variable name and DB
+  alias) so use of the escape hatch is auditable. Nested calls on the same
+  alias are idempotent; only the outermost call clears the flag.
+- **`boundary.exceptions.AdminBypassNotActiveError`**, raised by
+  `admin_bypass()` if a read-back after setting the flag does not confirm
+  it is active (most likely `BOUNDARY_WRAP_ATOMIC=False` with no ambient
+  transaction), rather than silently proceeding as though the bypass were
+  in effect.
 - **`boundary.W003`: warn when the database connection role bypasses Row
   Level Security** (superuser or `BYPASSRLS`). PostgreSQL exempts such
   roles from every RLS policy, including `FORCE ROW LEVEL SECURITY`
@@ -21,9 +73,110 @@ All notable changes to django-boundary are documented here.
   `SILENCED_SYSTEM_CHECKS`. Fixes #21.
 - **Django 6.1 added to the CI test matrix** and declared via the
   `Framework :: Django :: 6.1` classifier.
+- **`boundary.W007`: warn when `boundary.E006` or `boundary.W003` cannot
+  determine the database state they check.** Both checks previously
+  swallowed any exception from their `pg_class`/`pg_roles` query and
+  reported nothing, which is indistinguishable from "every table is
+  correctly protected" or "this role does not bypass RLS": a permissions
+  error reading `pg_class`, a statement timeout, or a lock made the checks
+  fail open. The exception handling now distinguishes a genuinely
+  unreachable connection (`OperationalError`/`InterfaceError`, e.g. before
+  the database is provisioned, which stays a silent skip as before) from a
+  live connection whose query failed for some other reason, which now
+  raises `boundary.W007` instead of vanishing. Fixes #34.
+- **`clean()` validation rejects a cross-tenant foreign key reference**
+  (BR-ORM-013). Neither isolation layer catches a tenant-scoped row whose
+  own `tenant_id` is correct but whose FK points at another tenant's row:
+  the ORM manager filters on the row's own tenant column, and RLS's
+  `USING`/`WITH CHECK` predicate checks the same column, not what the
+  row's FK targets belong to. `TenantMixin.clean()` and the `clean()` on
+  the mixin `make_tenant_mixin()` produces now call
+  `boundary.models.validate_cross_tenant_fks()`, which raises
+  `django.core.exceptions.ValidationError` (keyed by field name) when an
+  FK to another tenant-scoped model (one with its own tenant column)
+  points at a row belonging to a different tenant than the instance
+  itself. A `None` FK, a FK to a non-tenant model, and a FK to a
+  path-scoped model are all left alone. **This fires on `full_clean()`
+  paths only** (`ModelForm` validation, an explicit `full_clean()` call):
+  `save()`, `bulk_create()`, `update()`, `bulk_update()`, and raw SQL do
+  not call `clean()` and remain unprotected, same as any other Django
+  model validation. See
+  [`docs/explanation/isolation-layers.md`](docs/explanation/isolation-layers.md)
+  for the full threat-model entry. Fixes #39.
 
 ### Fixed
 
+- **`docs/reference/settings.md` framed `BOUNDARY_RESOLVERS` purely as a
+  URL-shape and API-style choice and said `JWTClaimResolver` alone was
+  "usually sufficient" for internal APIs, with no statement that
+  resolution is not authorisation** (issue #38). Corrected: the resolver
+  table now marks which resolvers are client-controlled (`HeaderResolver`,
+  `JWTClaimResolver`, and their subclasses) versus derived from something
+  the client cannot freely choose (`SubdomainResolver`, `ExplicitResolver`,
+  and `SessionResolver` provided its session key is only ever written
+  server-side after a check of its own), and states plainly that the
+  consumer must verify the authenticated principal's membership of the
+  resolved tenant. Same correction applied to the README resolver table
+  and architecture diagram, `docs/explanation/how-resolution-works.md`,
+  and `docs/explanation/isolation-layers.md`'s threat model.
+- **`BoundaryConfig._connect_cache_invalidation_signals()` read
+  `BOUNDARY_TENANT_MODEL` directly and returned early when it was unset,
+  ignoring the `ICV_TENANT_MODEL` fallback (ADR-025 T2) that every other
+  resolution site in the package applies.** A project configured with
+  only `ICV_TENANT_MODEL`, the supported configuration that
+  `boundary.E001` explicitly accepts, therefore connected zero
+  `post_save`/`post_delete` receivers on its tenant model, with no error
+  or warning at startup. Resolver-cache entries in `SubdomainResolver`,
+  `HeaderResolver` and `SessionResolver` then went stale for up to
+  `BOUNDARY_RESOLVER_CACHE_TTL` seconds (default 60) on every worker
+  process after a tenant was updated or deleted, so `TenantMiddleware`
+  could keep serving a just-deactivated tenant. The signal connector now
+  calls `boundary.conf.resolve_tenant_model_setting()`, catching
+  `ImproperlyConfigured` to preserve the no-op-when-unset behaviour for a
+  project that has not configured boundary at all yet. Fixes #33.
+- **`test_cache_invalidated_on_save` and `test_cache_expires_after_ttl`
+  asserted `result == tenant_a`, which holds for a cache hit and a cache
+  miss alike, so both passed even with cache invalidation removed
+  entirely.** Both now wrap the post-invalidation resolve in
+  `django_assert_num_queries(1)`, matching the pattern their sibling
+  `test_cache_hit_avoids_query` already used, so they fail if the DB
+  isn't actually queried. A new `test_cache_invalidated_on_delete` adds
+  the coverage that was previously entirely missing for the `post_delete`
+  side of the same signal wiring. Fixes #35.
+- **`TenantMiddleware` silently disabled the RLS defence-in-depth layer for
+  every request when `ATOMIC_REQUESTS = True` was set on the default
+  database.** The middleware skipped its own transaction wrap whenever
+  `ATOMIC_REQUESTS` was already on, assuming Django's own transaction would
+  already be open when it called `TenantContext.set()`. It was not: Django's
+  `ATOMIC_REQUESTS` wraps the view, not the middleware chain, so at the point
+  the middleware set the PostgreSQL session variable no transaction had
+  opened yet, and the transaction-local `set_config(..., true)` call was
+  discarded before the view's transaction began. Application-level tenant
+  scoping (`TenantContext.get()`, the tenant-aware manager) was unaffected
+  and continued to report the correct tenant, but the RLS policies reading
+  `current_setting('app.current_tenant_id', true)` saw an empty session
+  variable throughout the request. Under `FORCE ROW LEVEL SECURITY` this
+  fails closed (no rows returned) rather than leaking data, but it meant RLS
+  provided no protection at all on any consumer running
+  `ATOMIC_REQUESTS = True`. `TenantMiddleware` now always wraps the request
+  in its own transaction (via `context._ensure_atomic()`, honouring
+  `BOUNDARY_WRAP_ATOMIC = False` for consumers who manage transactions
+  themselves), so the session variable is reliably in scope regardless of
+  the `ATOMIC_REQUESTS` setting; when `ATOMIC_REQUESTS` is also on, the
+  view's transaction now nests as a savepoint inside boundary's, and an
+  exception in the view still rolls back the whole request. If you run
+  `ATOMIC_REQUESTS = True` and rely on RLS, upgrade: no configuration
+  change is required. Fixes #40.
+- **`docs/explanation/isolation-layers.md` understated the RLS admin bypass
+  flag as visibility-only** ("sees every tenant's rows"). Verified against
+  the actual policy SQL as a non-superuser: `boundary_admin_bypass` has no
+  `WITH CHECK`, so PostgreSQL falls back to its `USING` clause for write
+  checks too, and permissive policies are combined with `OR`, so the flag
+  alone is sufficient to pass an `INSERT` or `UPDATE` for any tenant.
+  Corrected to state read AND write access, matching
+  `docs/how-to/cross-tenant-admin-operations.md`, which already had it
+  right. Both pages now also document the interaction with `CONN_MAX_AGE`
+  and connection pooling.
 - **`boundary.checks` was never imported anywhere the package itself
   runs, so every system check it defines (`E001`, `E003`, `E004`,
   `E006`, `W001`, `W002`, and now `W003`) silently never registered on a
@@ -38,6 +191,22 @@ All notable changes to django-boundary are documented here.
   so those tests run for real in CI instead of skipping (the `icv_test`
   bootstrap role from the `postgres:16` service image is itself a
   `BYPASSRLS` superuser).
+- **`boundary.E006`'s table lookup is now qualified by OID
+  (`to_regclass()`) instead of an unscoped `relname` match.** Where the
+  same table name exists in more than one schema (a partition archive, a
+  staging schema, a multi-entry `search_path`), the previous query
+  returned one `pg_class` row per matching schema with no `ORDER BY`, and
+  `fetchone()` read whichever row PostgreSQL's planner produced first,
+  which was not reliably the table the model's own table name actually
+  resolves to. The lookup now resolves the table the same way any
+  ordinary query against it would: through `to_regclass()`, which follows
+  the connection's `search_path`. Fixes #34.
+- **`boundary.E006` never had a positive test proving it can report a
+  missing policy.** Every prior test asserted only that it stays silent,
+  so its silence had never been distinguished from an inability to see.
+  The suite now includes a positive control that deliberately leaves RLS
+  absent on a tenant-scoped table and asserts `boundary.E006` fires, paired
+  with the existing "stays silent when protected" case. Fixes #34.
 
 ## [0.5.3] - 2026-08-01
 

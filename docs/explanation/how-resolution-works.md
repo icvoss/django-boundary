@@ -38,6 +38,8 @@ The built-in resolvers are `SubdomainResolver`, `HeaderResolver`, `JWTClaimResol
 
 Ordering is a security decision: placing `HeaderResolver` first lets any HTTP client name the tenant via a header. For public-facing apps, put `SubdomainResolver` first.
 
+**Resolution is not authorisation.** Whichever resolver wins, all it has established is *which* tenant this request names. It has not established that the caller is allowed to act as that tenant. `SubdomainResolver` derives the tenant from the `Host` header, which is constrained by `ALLOWED_HOSTS`; `HeaderResolver` and `JWTClaimResolver` take the tenant directly from a value the client controls, with nothing in this chain checking that the authenticated user actually belongs to it. Every layer downstream of resolution (`TenantContext`, the ORM manager, RLS) then correctly scopes to whatever tenant was resolved, which is exactly the problem: isolation working perfectly for the tenant the caller asked for, rather than the one they are a member of, looks identical to isolation working correctly. Verifying membership is the consumer's job, not boundary's; see [Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution) for where that check sits relative to this middleware, and `boundary.W006`, which flags the specific configuration (a client-controlled resolver with `django.contrib.auth` installed) where the gap has real consequences.
+
 ## Step 3: no resolver matched
 
 If the walk finishes with no tenant, behaviour depends on `BOUNDARY_REQUIRED` (default `True`):
@@ -63,7 +65,7 @@ def on_tenant_resolved(sender, tenant, resolver, request, **kwargs):
 tenant_resolved.connect(on_tenant_resolved)
 ```
 
-The three signals exported from `boundary.signals` are `tenant_resolved`, `tenant_resolution_failed`, and `strict_mode_violation`. They exist purely for observability, so you can attach metrics or logging without boundary depending on any metrics library.
+The signals exported from `boundary.signals` relevant to request resolution are `tenant_resolved`, `tenant_resolution_failed`, and `strict_mode_violation`. They exist purely for observability, so you can attach metrics or logging without boundary depending on any metrics library. (`boundary.signals` also exports `admin_bypass_activated`, fired on entry to `admin_bypass()`; see the [README signals reference](../../README.md#signals) for the full list.)
 
 The middleware then sets `request.tenant`. `request.tenant` is always set for backwards compatibility. If `BOUNDARY_REQUEST_ATTR` (which defaults to `BOUNDARY_TENANT_FK_FIELD`, in turn defaulting to `"tenant"`) differs from `"tenant"`, the same value is also assigned to that attribute, so a project using merchant terminology can read `request.merchant`.
 
@@ -80,10 +82,10 @@ The third argument to `set_config` is `true`, which scopes the setting to the cu
 
 ### Why the atomic wrapper
 
-Because `set_config(..., true)` is transaction-scoped, the middleware wraps the downstream call in `transaction.atomic()` when `BOUNDARY_WRAP_ATOMIC` is `True` (the default):
+Because `set_config(..., true)` is transaction-scoped, the middleware always wraps the downstream call in a transaction it controls, when `BOUNDARY_WRAP_ATOMIC` is `True` (the default), using `context._ensure_atomic()`:
 
 ```python
-with transaction.atomic():
+with _ensure_atomic():
     token = TenantContext.set(tenant)
     request._boundary_token = token
     try:
@@ -92,9 +94,13 @@ with transaction.atomic():
         TenantContext.clear(token)
 ```
 
-If `BOUNDARY_WRAP_ATOMIC` is `False`, or if the default database already has `ATOMIC_REQUESTS = True` (the middleware detects this and avoids double-wrapping), the same `set` / `get_response` / `clear` sequence runs without an extra `atomic()` block. In that case the session variable still flows through whatever transaction Django opens for your writes, and RLS still applies to those statements.
+`_ensure_atomic()` opens `transaction.atomic()` only if no transaction is already open on the connection (`connection.in_atomic_block` is `False`); if one is already open it is a no-op, so nested use never adds an unnecessary savepoint.
 
-If your project relies on RLS and you turn off both `BOUNDARY_WRAP_ATOMIC` and `ATOMIC_REQUESTS`, reads outside a transaction will not see the session variable. Keep at least one of them enabled when RLS is in play.
+Earlier versions (0.5.3 and before) skipped this wrap whenever the default database already had `ATOMIC_REQUESTS = True`, on the assumption that Django's own ATOMIC_REQUESTS transaction would already cover `TenantContext.set()`. That assumption was wrong: Django's `ATOMIC_REQUESTS` wraps the *view* (`BaseHandler.make_view_atomic`), not the middleware chain, so at the point the middleware called `TenantContext.set()` no transaction had opened yet. The `set_config(..., true)` call was therefore transaction-local to nothing and silently discarded before the view's transaction ever began, leaving the PostgreSQL session variable empty while `TenantContext.get()` still reported the tenant correctly. Under `FORCE ROW LEVEL SECURITY` this fails closed (the policy evaluates against a NULL session variable and returns no rows), not as a data leak, but it silently disabled the RLS defence-in-depth layer for every request served with `ATOMIC_REQUESTS = True` on the default database. If you are upgrading from 0.5.3 or earlier and ran with `ATOMIC_REQUESTS = True`, your RLS policies were not seeing the tenant session variable during requests: application-level scoping (the tenant-aware manager, `TenantContext.require()`) was unaffected, but the database-level second line of defence was not applying. Upgrading resolves this with no configuration change required.
+
+With the fix, boundary's own transaction is what makes the session variable visible; when the view's `ATOMIC_REQUESTS` transaction later opens, it nests as a savepoint inside boundary's transaction, and an unhandled exception in the view still unwinds through both, so the view's work still commits or rolls back as a unit.
+
+If `BOUNDARY_WRAP_ATOMIC` is `False`, `_ensure_atomic()` does not open a transaction; it logs a warning if none is already open, and the session variable will not survive past the next statement unless you wrap the request in your own transaction. If your project relies on RLS, keep `BOUNDARY_WRAP_ATOMIC` enabled, or wrap requests in your own `transaction.atomic()` if you disable it.
 
 ## Step 7: the context flows to the ORM
 

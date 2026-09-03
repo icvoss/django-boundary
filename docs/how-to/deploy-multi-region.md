@@ -216,7 +216,10 @@ before a regional job to reject unroutable tenants before any query runs.
 
 - **Forgetting to add the router.** Setting `BOUNDARY_REGIONS` alone does
   nothing: you must also add `boundary.routing.RegionalRouter` to
-  `DATABASE_ROUTERS`. Without it, every query stays on `default`.
+  `DATABASE_ROUTERS`. Without it, every query stays on `default`. System
+  check `boundary.E005` (Error) catches this at startup: it fires when
+  `BOUNDARY_REGIONS` is configured but `RegionalRouter` (or a subclass, or
+  an already-constructed instance) is absent from `DATABASE_ROUTERS`.
 
 - **Expecting silent fallback to be an error.** An unknown tenant region routes
   to `default` rather than failing. If you need data residency to be strictly

@@ -3,8 +3,8 @@
 import pytest
 from django.db import connection
 
-from boundary.context import TenantContext, tenant_scoped
-from boundary.exceptions import TenantNotSetError
+from boundary.context import TenantContext, admin_bypass, tenant_scoped
+from boundary.exceptions import AdminBypassNotActiveError, TenantNotSetError
 
 
 class TestTenantContextSetAndGet:
@@ -481,3 +481,217 @@ class TestRegionalSessionVarIsSet:
 
         assert "default" in cleared
         assert "eu-west" in cleared, "regional connection must be cleared too, not left carrying a stale tenant"
+
+
+def _get_admin_flag():
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT current_setting('app.boundary_admin', true)")
+        return cursor.fetchone()[0]
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassFlagLifecycle:
+    """Issue #37 AC: the admin flag is set inside the block and cleared after.
+
+    ``transaction=True`` runs the test itself without an ambient transaction
+    (real autocommit), matching a management command or Celery task, the same
+    condition ``TestTenantContextAutocommit`` exercises for the tenant
+    variable. Positive control: ``test_flag_is_true_inside_block`` proves the
+    absence check in ``test_flag_is_cleared_after_block`` could have caught a
+    flag that was never cleared, rather than the assertion being vacuously
+    true because the flag was never set in the first place.
+    """
+
+    def test_flag_is_true_inside_block(self):
+        assert connection.in_atomic_block is False  # genuinely autocommit
+        with admin_bypass():
+            assert _get_admin_flag() == "true"
+
+    def test_flag_is_cleared_after_block(self):
+        with admin_bypass():
+            pass
+        assert _get_admin_flag() == ""
+
+    def test_flag_is_cleared_after_exception_in_block(self):
+        with pytest.raises(ValueError), admin_bypass():
+            assert _get_admin_flag() == "true"
+            raise ValueError("boom")
+        assert _get_admin_flag() == ""
+
+    def test_honours_custom_admin_flag_var_setting(self, settings):
+        """BR-CTX-010 must read BOUNDARY_ADMIN_FLAG_VAR, never hardcode the
+        default variable name (mirrors TestCustomSessionVariables in
+        test_rls.py for the migration SQL side of the same setting)."""
+        settings.BOUNDARY_ADMIN_FLAG_VAR = "myapp.is_admin"
+
+        with admin_bypass():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_setting('myapp.is_admin', true)")
+                assert cursor.fetchone()[0] == "true"
+            # The default variable name must NOT have been touched: it was
+            # never set on this connection at all, so current_setting(...,
+            # true) returns SQL NULL (Python None), not the empty string a
+            # set-then-cleared variable would read back as.
+            assert _get_admin_flag() is None
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('myapp.is_admin', true)")
+            assert cursor.fetchone()[0] == ""
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassTransactionLocal:
+    """The flag does not survive past the block (transaction-local guarantee).
+
+    Distinct from the lifecycle tests above: this proves the underlying
+    set_config call really did use the transaction-local (true) form, by
+    checking from a SEPARATE connection while the first is still mid-block,
+    the same way TestRLSEnforcement's app_conn tests check isolation from
+    outside the connection that set the session variable.
+    """
+
+    def test_flag_not_visible_on_a_second_connection_while_active(self, app_conn):
+        """A positive control for the isolation claim: while admin_bypass()
+        holds the flag on the Django `default` connection, a second, entirely
+        separate connection (app_conn) must never see it, proving the flag is
+        connection-local, not process-global or somehow shared."""
+        with admin_bypass():
+            assert _get_admin_flag() == "true"
+            with app_conn.cursor() as cur:
+                cur.execute("SELECT current_setting('app.boundary_admin', true)")
+                # app_conn has never set this variable at all, so an
+                # untouched GUC reads back as SQL NULL (Python None), not
+                # the empty string a set-then-cleared variable would show.
+                assert cur.fetchone()[0] is None, "flag must not leak onto an unrelated connection"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassWrapAtomicFalse:
+    """Issue #37: BOUNDARY_WRAP_ATOMIC=False with no ambient transaction.
+
+    Mirrors TestTenantContextAutocommit.test_wrap_atomic_false_leaves_var_unset_and_warns,
+    but admin_bypass() makes a stricter choice than TenantContext.using() for
+    this one setting: rather than silently leaving the flag unset (a
+    correctness bug that is not self-announcing for the most privileged
+    variable in the package), it verifies the flag actually took with a
+    read-back and raises AdminBypassNotActiveError when it did not, instead
+    of proceeding to yield control believing the bypass is active.
+    """
+
+    def test_wrap_atomic_false_without_transaction_raises(self, settings):
+        settings.BOUNDARY_WRAP_ATOMIC = False
+        assert connection.in_atomic_block is False
+
+        with pytest.raises(AdminBypassNotActiveError), admin_bypass():
+            pytest.fail("block body must not run when the flag never activated")
+
+        # The flag must not be left set on the connection after the raise.
+        assert _get_admin_flag() == ""
+
+    def test_wrap_atomic_false_with_explicit_atomic_block_works(self, settings):
+        """The escape hatch: a caller managing transactions explicitly can
+        still use admin_bypass() by wrapping it in transaction.atomic()."""
+        from django.db import transaction
+
+        settings.BOUNDARY_WRAP_ATOMIC = False
+
+        with transaction.atomic(), admin_bypass():
+            assert _get_admin_flag() == "true"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassNesting:
+    """Issue #37: reentrant use on the same alias is idempotent.
+
+    Only the outermost admin_bypass() call clears the flag on exit; an inner
+    call's exit must not turn off an outer call's still-active bypass.
+    """
+
+    def test_inner_exit_does_not_clear_outer_flag(self):
+        with admin_bypass():
+            assert _get_admin_flag() == "true"
+            with admin_bypass():
+                assert _get_admin_flag() == "true"
+            # Inner block exited; outer bypass must still be active.
+            assert _get_admin_flag() == "true"
+        # Outer block exited; now it is cleared.
+        assert _get_admin_flag() == ""
+
+    def test_entering_while_tenant_active_requires_no_special_handling(self, tenant_a):
+        """Both session variables coexist: entering admin_bypass() while a
+        tenant is active in TenantContext sets the admin flag without
+        disturbing the tenant variable, and both are independently readable."""
+        with TenantContext.using(tenant_a):
+            with admin_bypass():
+                assert _get_admin_flag() == "true"
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT current_setting('app.current_tenant_id', true)")
+                    assert cursor.fetchone()[0] == str(tenant_a.pk)
+            # admin_bypass() exited; tenant context is still active and unaffected.
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_setting('app.current_tenant_id', true)")
+                assert cursor.fetchone()[0] == str(tenant_a.pk)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassSignal:
+    """Issue #37: an auditable signal fires on entry with the expected payload."""
+
+    def test_signal_fires_on_entry_with_flag_var_and_alias(self):
+        from boundary.signals import admin_bypass_activated
+
+        received = []
+
+        def _receiver(sender, **kwargs):
+            received.append(kwargs)
+
+        admin_bypass_activated.connect(_receiver, weak=False)
+        try:
+            with admin_bypass():
+                pass
+        finally:
+            admin_bypass_activated.disconnect(_receiver)
+
+        assert len(received) == 1
+        assert received[0]["flag_var"] == "app.boundary_admin"
+        assert received[0]["using"] == "default"
+
+    def test_signal_honours_custom_flag_var_setting(self, settings):
+        from boundary.signals import admin_bypass_activated
+
+        settings.BOUNDARY_ADMIN_FLAG_VAR = "myapp.is_admin"
+        received = []
+
+        def _receiver(sender, **kwargs):
+            received.append(kwargs)
+
+        admin_bypass_activated.connect(_receiver, weak=False)
+        try:
+            with admin_bypass():
+                pass
+        finally:
+            admin_bypass_activated.disconnect(_receiver)
+
+        assert received[0]["flag_var"] == "myapp.is_admin"
+
+    def test_signal_does_not_fire_when_flag_never_activates(self, settings):
+        """Negative control: if _ensure_atomic degrades to a no-op and the
+        read-back raises AdminBypassNotActiveError, the signal (an audit
+        trail of successful activation) must not have fired for a bypass
+        that was never actually active."""
+        from boundary.signals import admin_bypass_activated
+
+        settings.BOUNDARY_WRAP_ATOMIC = False
+        received = []
+
+        def _receiver(sender, **kwargs):
+            received.append(kwargs)
+
+        admin_bypass_activated.connect(_receiver, weak=False)
+        try:
+            with pytest.raises(AdminBypassNotActiveError), admin_bypass():
+                pass
+        finally:
+            admin_bypass_activated.disconnect(_receiver)
+
+        assert received == []

@@ -299,6 +299,18 @@ def switch_department(request, dept_id):
   DATABASE LAYER: PostgreSQL RLS policies (defence in depth)
 ```
 
+Every layer below RESOLUTION LAYER faithfully enforces isolation for
+whichever tenant was resolved. None of them ask whether the caller is
+allowed to act as that tenant: that is what RESOLUTION LAYER decides, and
+for a client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`) it
+decides purely from what the client sent. boundary's isolation guarantee is
+"every layer scopes to the resolved tenant correctly", not "the resolved
+tenant is the one this caller is allowed to see". Closing that second gap
+(authenticating the caller, then checking their membership of the resolved
+tenant) is the consumer's responsibility; see
+[Resolvers](#resolvers) and
+[Enforce membership after resolution](docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution).
+
 ### Defence in Depth
 
 Two independent layers enforce tenant isolation:
@@ -497,6 +509,36 @@ with TenantContext.using(tenant):
 The context manager is savepoint-safe: it explicitly restores the DB session
 variable on exit rather than relying on PostgreSQL savepoint rollback.
 
+### Admin Bypass
+
+`admin_bypass()` is the only supported way to set the RLS admin bypass flag
+(`BOUNDARY_ADMIN_FLAG_VAR`, default `app.boundary_admin`). It hardcodes the
+transaction-local form of `set_config`, so the unsafe session-scoped form
+(which can outlive a transaction and leak across pooled or reused
+connections) is not reachable through this API:
+
+```python
+from boundary.context import admin_bypass
+
+with admin_bypass():
+    # Full read/write access across every tenant in this block, even with
+    # FORCE ROW LEVEL SECURITY on the table. Clears automatically on exit.
+    Booking.unscoped.filter(court=1).update(is_paid=True)
+```
+
+The flag grants both visibility AND write access: the `boundary_admin_bypass`
+policy has no `WITH CHECK`, so PostgreSQL uses its `USING` clause for write
+checks too, and permissive policies are OR'd, so this policy alone is
+sufficient regardless of `boundary_tenant_isolation`'s own `WITH CHECK`. Treat
+it as full cross-tenant access, not a read-only viewer.
+
+Fires `boundary.signals.admin_bypass_activated` on entry (flag variable name
+and DB alias) for audit trails. Nested calls on the same alias are
+idempotent; only the outermost call clears the flag on exit. See the
+docstring on `admin_bypass()` for the full contract, including the
+`BOUNDARY_WRAP_ATOMIC=False` case and multi-region use with `all_regions()`.
+See also [Cross-tenant admin operations](docs/how-to/cross-tenant-admin-operations.md#5-bypass-rls-for-trusted-maintenance-work).
+
 ---
 
 ## Resolvers
@@ -504,17 +546,29 @@ variable on exit rather than relying on PostgreSQL savepoint rollback.
 Resolvers determine which tenant applies to an incoming request. Configure
 via `BOUNDARY_RESOLVERS`; first match wins.
 
-| Resolver | Source | Setting |
-|----------|--------|---------|
-| `SubdomainResolver` | `club.example.com` -> slug lookup | `BOUNDARY_SUBDOMAIN_FIELD` |
-| `HeaderResolver` | `X-Tenant-ID` header (UUID first, slug fallback) | `BOUNDARY_HEADER_NAME` |
-| `JWTClaimResolver` | JWT payload claim (no signature validation) | `BOUNDARY_JWT_CLAIM` |
-| `SessionResolver` | Django session key | `BOUNDARY_SESSION_KEY` |
-| `ExplicitResolver` | `request.boundary_tenant` set by upstream code | None |
+| Resolver | Source | Setting | Client-controlled? |
+|----------|--------|---------|---------------------|
+| `SubdomainResolver` | `club.example.com` -> slug lookup | `BOUNDARY_SUBDOMAIN_FIELD` | No (constrained by `ALLOWED_HOSTS`) |
+| `HeaderResolver` | `X-Tenant-ID` header (UUID first, slug fallback) | `BOUNDARY_HEADER_NAME` | **Yes** |
+| `JWTClaimResolver` | JWT payload claim (no signature validation) | `BOUNDARY_JWT_CLAIM` | **Yes** |
+| `SessionResolver` | Django session key | `BOUNDARY_SESSION_KEY` | No, provided the session key is only ever set server-side after its own check |
+| `ExplicitResolver` | `request.boundary_tenant` set by upstream code | None | No |
+
+**Resolution is not authorisation.** boundary resolves *which* tenant a
+request targets; it does not check *whether the caller may access it*. With
+`HeaderResolver` or `JWTClaimResolver` an authenticated user of one tenant
+can simply name another and every layer beneath resolution scopes correctly
+to it. Verifying that the authenticated principal is a member of the
+resolved tenant is the consumer's responsibility; see
+[Enforce membership after resolution](docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution).
+`boundary.W006` warns when a client-controlled resolver is configured
+alongside `django.contrib.auth`.
 
 **Security note:** Resolver ordering determines precedence. Placing
 `HeaderResolver` first allows any HTTP client to set the tenant via header.
-For public-facing apps, place `SubdomainResolver` first.
+For public-facing apps, place `SubdomainResolver` first. This is about
+precedence within the chain, and is a narrower concern than the
+authorisation gap above: it applies regardless of ordering.
 
 ### Custom resolvers
 
@@ -710,6 +764,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.W001` | Warning | STRICT_MODE is False |
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
+| `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
 
 ---
 
@@ -757,6 +812,7 @@ Booking.unscoped.create(court=1, tenant=specific_tenant)
 | `tenant_resolved` | `tenant, resolver, request` | After successful resolution |
 | `tenant_resolution_failed` | `request` | No resolver matched (REQUIRED=True) |
 | `strict_mode_violation` | `model, queryset` | Before TenantNotSetError is raised |
+| `admin_bypass_activated` | `flag_var, using` | On entry to `admin_bypass()` |
 
 ---
 

@@ -4,6 +4,21 @@ Registered in AppConfig.ready() and run at startup and during test collection.
 """
 
 from django.core.checks import Error, Tags, Warning, register
+from django.db.utils import InterfaceError, OperationalError
+
+# Exceptions that mean "the database connection itself is unavailable",
+# distinct from a query against a reachable database failing for some
+# other reason (permissions, a malformed statement, a lock timeout).
+# OperationalError covers connection refused, auth failure at the socket,
+# and DNS/host resolution failures; InterfaceError covers a connection
+# that has already been closed. Both are raised by connection.cursor()
+# before any SQL runs, which is exactly the pre-migrate /
+# DB-not-provisioned-yet case this module has always meant to skip
+# silently. A DatabaseError subclass raised BY the query itself
+# (ProgrammingError for a permissions failure reading pg_class, DataError,
+# etc.) is a different fact: the database is there and something is
+# wrong, which boundary.W007 exists to surface rather than swallow.
+_CONNECTION_UNAVAILABLE_ERRORS = (OperationalError, InterfaceError)
 
 
 @register(Tags.models)
@@ -18,6 +33,8 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_rls_enabled())
     errors.extend(_check_identity_double_resolve())
     errors.extend(_check_rls_bypassable())
+    errors.extend(_check_client_controlled_resolver_without_membership_check())
+    errors.extend(_check_regional_router_configured())
 
     return errors
 
@@ -157,6 +174,174 @@ def _check_identity_double_resolve():
     ]
 
 
+def _check_client_controlled_resolver_without_membership_check():
+    """W006: warn when a client-controlled resolver is configured alongside
+    django.contrib.auth with nothing downstream enforcing membership.
+
+    Per BR-RES-009 (issue #38): boundary resolves WHICH tenant a request
+    targets and never establishes WHETHER the caller may access it.
+    HeaderResolver and JWTClaimResolver read the tenant straight from
+    values the client fully controls (an arbitrary header, an unverified
+    JWT claim), so any authenticated caller can name any tenant and every
+    downstream layer then works correctly for that choice: the ORM filters
+    to it, RLS scopes to it, the session variable is set to it. Isolation
+    is intact and pointed at the tenant the caller asked for, not the one
+    they belong to.
+
+    This only bites when there are authenticated users to mis-scope in the
+    first place, hence gating on django.contrib.auth being installed. An
+    application with no authenticated users (a public API keyed entirely
+    by an API key that already encodes the tenant, for example) has no
+    membership boundary to have missed.
+
+    Matched by importing each configured resolver path and checking
+    issubclass against HeaderResolver / JWTClaimResolver, not by string
+    suffix like boundary.W002. A consumer subclass
+    (``class MyHeaderResolver(HeaderResolver): ...``) inherits the same
+    trust boundary unless it overrides resolve() to add its own
+    verification, and this check cannot tell those two cases apart from
+    the dotted path alone, so it treats every subclass as client-controlled
+    and lets a consumer who has actually verified membership silence the
+    ID. A path that fails to import is left to boundary.E003 to report;
+    this check has nothing useful to add for a broken path.
+    """
+    from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.resolvers import HeaderResolver, JWTClaimResolver
+
+    if "django.contrib.auth" not in settings.INSTALLED_APPS:
+        return []
+
+    resolver_paths = getattr(
+        settings,
+        "BOUNDARY_RESOLVERS",
+        ["boundary.resolvers.SubdomainResolver"],
+    )
+
+    client_controlled = []
+    for path in resolver_paths:
+        try:
+            resolver_class = import_string(path)
+        except ImportError:
+            continue  # boundary.E003 already reports this path
+        if issubclass(resolver_class, (HeaderResolver, JWTClaimResolver)):
+            client_controlled.append(path)
+
+    if not client_controlled:
+        return []
+
+    return [
+        Warning(
+            "A client-controlled resolver ("
+            + ", ".join(client_controlled)
+            + ") is configured in BOUNDARY_RESOLVERS alongside "
+            "django.contrib.auth. The tenant is taken directly from a "
+            "value the client supplies (a header or an unverified JWT "
+            "claim), so any authenticated caller can name any tenant. "
+            "boundary resolves tenancy; it does not check that the "
+            "authenticated principal is a member of the resolved tenant.",
+            hint=(
+                "Add a check, after TenantMiddleware and your "
+                "authentication middleware, that the authenticated user is "
+                "a member of request.tenant, and return 403 otherwise. See "
+                "docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution. "
+                "If icv-identity is installed, its own middleware provides "
+                "this per ADR-025 T1 and you should not hand-roll it. If "
+                "you have already handled membership elsewhere, silence "
+                "boundary.W006 in SILENCED_SYSTEM_CHECKS."
+            ),
+            id="boundary.W006",
+        )
+    ]
+
+
+def _check_regional_router_configured():
+    """E005: BOUNDARY_REGIONS configured but RegionalRouter absent from
+    DATABASE_ROUTERS.
+
+    Per BR-REG-002, RegionalRouter is never added to DATABASE_ROUTERS
+    automatically: the integrator adds it explicitly so the routing
+    configuration is visible, intentional, and auditable in version control.
+    That deliberate omission has a failure mode: a project that sets
+    BOUNDARY_REGIONS to declare its regions, but forgets the DATABASE_ROUTERS
+    line, gets no error. RegionalRouter._route() returns "default" for every
+    query the moment BOUNDARY_REGIONS is truthy but the router itself is
+    never consulted, so every tenant silently reads and writes the default
+    database regardless of its configured region. For a data-residency
+    feature (docs/how-to/deploy-multi-region.md), a silent fallback to the
+    wrong database is a compliance problem, not a cosmetic one (issue #36).
+
+    An empty BOUNDARY_REGIONS ({}) is treated as unconfigured, matching
+    RegionalRouter._route()'s own `if not regions: return "default"` check:
+    a project that has not yet populated any region has not opted into
+    regional routing, so there is nothing for this check to enforce yet.
+
+    Matched by issubclass against RegionalRouter, not by string suffix like
+    boundary.W002. Two things make issubclass the right call here, where
+    W002 uses a suffix match and boundary.W006 already established
+    issubclass as a workable pattern for this module:
+
+    - Django's own DATABASE_ROUTERS accepts either a dotted string (which
+      Django instantiates via import_string) or an already-constructed
+      router instance (django.db.utils.ConnectionRouter.routers). A pure
+      string check cannot see an instance at all, so it would silently
+      pass over a perfectly valid configuration.
+    - Subclassing a Django database router to compose it with other routing
+      concerns (multi-database read replicas, sharding) is an ordinary
+      pattern for this kind of class, even though
+      docs/how-to/deploy-multi-region.md does not itself document
+      subclassing RegionalRouter the way choose-and-order-resolvers.md
+      documents subclassing a resolver. A consumer subclass still performs
+      RegionalRouter's own _route() (or delegates to it via super()), so it
+      still satisfies BR-REG-002's intent: the routing decision is present
+      and explicit in DATABASE_ROUTERS, just wrapped.
+
+    A DATABASE_ROUTERS entry that is a dotted path importing successfully
+    but not a RegionalRouter (or subclass) is not this check's concern; an
+    unimportable path is a Django-level misconfiguration this check does
+    not attempt to diagnose, since DATABASE_ROUTERS has no boundary-owned
+    equivalent of boundary.E003 to defer to.
+    """
+    from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.routing import RegionalRouter
+
+    regions = getattr(settings, "BOUNDARY_REGIONS", None)
+    if not regions:
+        return []
+
+    database_routers = getattr(settings, "DATABASE_ROUTERS", [])
+
+    for entry in database_routers:
+        if isinstance(entry, str):
+            try:
+                router = import_string(entry)
+            except ImportError:
+                continue  # not this check's concern; see docstring
+        else:
+            # Django also accepts a constructed router instance in
+            # DATABASE_ROUTERS; check its class, not the string form.
+            router = type(entry)
+
+        if isinstance(router, type) and issubclass(router, RegionalRouter):
+            return []
+
+    return [
+        Error(
+            "BOUNDARY_REGIONS is configured but 'boundary.routing.RegionalRouter' is not present in DATABASE_ROUTERS.",
+            hint=(
+                "Add 'boundary.routing.RegionalRouter' to DATABASE_ROUTERS. "
+                "Without it, every query silently stays on the 'default' "
+                "database alias regardless of a tenant's configured region: "
+                "see docs/how-to/deploy-multi-region.md#common-pitfalls."
+            ),
+            id="boundary.E005",
+        )
+    ]
+
+
 def _check_rls_enabled():
     """E006: Verify RLS is enabled on all tenant-scoped tables (PostgreSQL only).
 
@@ -198,13 +383,28 @@ def _check_rls_enabled():
         table = model._meta.db_table
         try:
             with connection.cursor() as cursor:
+                # to_regclass() resolves *table* through the connection's own
+                # search_path, exactly as any ordinary query against the
+                # model's table would, and returns a single OID (or NULL if
+                # nothing resolves). WHERE relname = %s with no schema
+                # qualification instead returns one row per schema that
+                # happens to contain a same-named table (a partition
+                # archive, a staging schema, a multi-entry search_path), and
+                # fetchone() silently reads whichever row the planner's
+                # index scan produced first, which is not necessarily the
+                # table Django is actually configured against (issue #34).
                 cursor.execute(
-                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
                     [table],
                 )
                 row = cursor.fetchone()
                 if row is None:
-                    continue  # Table doesn't exist yet (pre-migration)
+                    # to_regclass() returns NULL for a name that resolves to
+                    # nothing on this search_path, which is the same
+                    # pre-migration state the old query's fetchone() == None
+                    # branch handled: the table doesn't exist yet, so there
+                    # is nothing to check.
+                    continue
                 rls_enabled, rls_forced = row
                 if not rls_enabled or not rls_forced:
                     errors.append(
@@ -215,8 +415,34 @@ def _check_rls_enabled():
                             id="boundary.E006",
                         )
                     )
-        except Exception:
-            pass  # DB not available at check time; skip
+        except _CONNECTION_UNAVAILABLE_ERRORS:
+            # The database itself is not reachable (connection refused,
+            # auth failure, closed connection): the legitimate skip this
+            # branch has always existed for, e.g. running `manage.py check`
+            # before the database is provisioned. Silence here is correct
+            # because there is nothing to report against.
+            continue
+        except Exception as exc:
+            # The connection IS there and the query failed for some other
+            # reason (a permissions error reading pg_class, a statement
+            # timeout, a lock). That is indistinguishable from "every table
+            # is correctly protected" if swallowed, which makes this check
+            # fail open exactly where it matters (issue #34). Report it
+            # instead of staying silent.
+            errors.append(
+                Warning(
+                    f"Could not determine Row Level Security state for table '{table}' (model {model.__name__}): {exc}",
+                    hint=(
+                        "The database connection is available but the query "
+                        "against pg_class failed, so boundary.E006 could not "
+                        "verify this table. Check the connecting role has "
+                        "SELECT on pg_class, and investigate the underlying "
+                        "error before treating the absence of boundary.E006 "
+                        "as a pass."
+                    ),
+                    id="boundary.W007",
+                )
+            )
 
     return errors
 
@@ -250,8 +476,29 @@ def _check_rls_bypassable():
         with connection.cursor() as cursor:
             cursor.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
             row = cursor.fetchone()
-    except Exception:
-        return []  # DB not available at check time; skip
+    except _CONNECTION_UNAVAILABLE_ERRORS:
+        # Genuinely unreachable connection: the same legitimate pre-migrate
+        # skip as _check_rls_enabled (issue #34).
+        return []
+    except Exception as exc:
+        # The connection is there and the query against pg_roles failed for
+        # some other reason. Silence here is the same fail-open trap E006
+        # had: report it as boundary.W007 instead of letting it read as
+        # "this role does not bypass RLS".
+        return [
+            Warning(
+                f"Could not determine whether the database connection role bypasses Row Level Security: {exc}",
+                hint=(
+                    "The database connection is available but the query "
+                    "against pg_roles failed, so boundary.W003 could not "
+                    "verify the connecting role. Check the connecting role "
+                    "has SELECT on pg_roles, and investigate the underlying "
+                    "error before treating the absence of boundary.W003 as "
+                    "a pass."
+                ),
+                id="boundary.W007",
+            )
+        ]
 
     if row is None:
         return []
