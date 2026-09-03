@@ -8,6 +8,7 @@ multi-tenancy with configurable FK field names.
 import logging
 from typing import ClassVar
 
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
@@ -82,6 +83,123 @@ def has_tenant_column(model: type) -> bool:
     if getattr(model, "boundary_tenant_path", None):
         return False
     return getattr(model, "_boundary_fk_field", None) is not None
+
+
+def validate_cross_tenant_fks(instance) -> None:
+    """Raise ValidationError if *instance* holds a cross-tenant FK reference (BR-ORM-013).
+
+    Neither isolation layer catches this (issue #39). The ORM layer's
+    ``TenantManager.get_queryset()`` filters on the ROW's OWN tenant column,
+    so a row correctly stamped for tenant A that points a plain FK at a row
+    belonging to tenant B is returned by every query, because its own
+    ``tenant_id`` is A. RLS enforces the same thing at the database: the
+    ``USING``/``WITH CHECK`` policy on the child table checks the child
+    row's own ``tenant_id`` column, not what its FK columns point at, and
+    PostgreSQL's referential-integrity check on the FK target runs as the
+    table owner, outside the parent table's policy. Both layers correctly
+    consider the row isolated; neither notices what it references.
+
+    This is called from ``TenantMixin.clean()`` and the ``clean()`` of the
+    mixin ``make_tenant_mixin()`` produces, so both entry points share one
+    implementation rather than duplicating the field-walking logic.
+
+    Scope, deliberately:
+
+    - **Only FKs to other tenant-scoped models with their own tenant
+      column** are checked (``is_tenant_model`` and ``has_tenant_column``
+      both true for the target model). A FK to a non-tenant model (
+      ``auth.User``, a lookup table) has no tenant to compare against and
+      is skipped without attempting to read one. A FK to a *path-scoped*
+      model (``make_tenant_path_mixin``, no local tenant column) is also
+      skipped: validating it would mean traversing that target's own
+      tenant path, which is a different, unbounded-hop check, not a cheap
+      local comparison, and path-scoped models are already documented as
+      an application-layer-only isolation contract. This is a known limit
+      of this check, not an oversight; see
+      docs/explanation/isolation-layers.md.
+    - **A None/unset FK is skipped.** There is nothing to validate, and it
+      is the caller's job (or a `null=False` field) to require a value.
+    - **An unsaved target (no pk yet) is skipped.** Its ``<field>_id`` is
+      None, so it falls out of the None check above; there is no row to
+      compare against yet, and full_clean() on a form is not the place to
+      demand the related object be saved first.
+    - **Compared against the instance's OWN tenant FK value, not
+      ``TenantContext.get()``.** An admin cross-tenant view, a data import,
+      or a management command may legitimately construct or edit a row
+      under one tenant's context while intentionally operating on another
+      tenant's row (see docs/how-to/cross-tenant-admin-operations.md).
+      Comparing against the ambient context would raise for those
+      legitimate paths and would also raise TenantNotSetError-shaped
+      confusion when no context is active at all. Comparing against the
+      instance's own value asks the only question that matters here: do
+      this row's own tenant and its FK target's tenant agree.
+    - **One query per checked FK field, not zero and not N+1 per row
+      collection.** Reading ``instance.some_fk`` would fetch and cache the
+      whole related object; this reads only the target's tenant id via
+      ``values_list(..., flat=True)`` scoped to the target's pk, so a
+      model with three tenant-scoped FKs issues up to three small
+      single-column lookups on ``clean()``, never a full object fetch and
+      never more than one query per field regardless of how many rows are
+      validated elsewhere. Callers validating many instances (a bulk
+      import loop) pay this cost per instance; that is the acknowledged
+      price of a correctness check that only fires on ``full_clean()``
+      paths in the first place (see the CHANGELOG and
+      docs/explanation/isolation-layers.md for the residual gap on
+      ``save()``, ``bulk_create``, ``bulk_update``, ``update()``, and raw
+      SQL, none of which call ``clean()``).
+    - **Self-referential FKs work the same way.** A tenant-scoped model
+      with an FK to its own model is just another FK whose target model
+      happens to equal ``type(instance)``; no special case is needed.
+
+    Raises:
+        ValidationError: keyed by the FK field name, when a cross-tenant
+            reference is found. Django's ``full_clean()`` collects one or
+            more of these into its usual ``{field: [messages]}`` shape.
+    """
+    own_fk_field = get_tenant_fk_field(type(instance))
+    if own_fk_field is None:
+        # Path-scoped instance: no local tenant column of its own to
+        # compare against, so there is nothing this check can do here.
+        return
+    own_tenant_id = getattr(instance, f"{own_fk_field}_id", None)
+    if own_tenant_id is None:
+        # Nothing to compare against yet (e.g. auto-populate has not run).
+        return
+
+    errors: dict[str, list[str]] = {}
+    for field in instance._meta.get_fields():
+        if not (getattr(field, "many_to_one", False) and isinstance(field, models.ForeignKey)):
+            continue
+        if field.name == own_fk_field:
+            continue  # the model's own tenant FK, not a cross-reference
+
+        target_model = field.related_model
+        if not (is_tenant_model(target_model) and has_tenant_column(target_model)):
+            continue
+
+        target_id = getattr(instance, field.attname, None)
+        if target_id is None:
+            continue
+
+        target_fk_field = get_tenant_fk_field(target_model)
+        target_tenant_id = (
+            target_model.unscoped.filter(pk=target_id).values_list(f"{target_fk_field}_id", flat=True).first()
+        )
+        if target_tenant_id is None:
+            # Target row does not exist (dangling FK). Not this check's
+            # concern; Django's own FK validation covers existence.
+            continue
+
+        if target_tenant_id != own_tenant_id:
+            label = boundary_settings.TENANT_LABEL
+            errors[field.name] = [
+                f"{field.name} belongs to a different {label} "
+                f"({target_tenant_id}) than this {type(instance).__name__} "
+                f"({own_tenant_id})."
+            ]
+
+    if errors:
+        raise ValidationError(errors)
 
 
 # ── QuerySet ──────────────────────────────────────────────────
@@ -286,6 +404,18 @@ def make_tenant_mixin(
                 setattr(self, fk_field, TenantContext.require())
             super().save(**kwargs)
 
+        def clean(self):
+            """Reject a cross-tenant FK reference (BR-ORM-013, issue #39).
+
+            See :func:`validate_cross_tenant_fks` for the full rationale
+            and scope. Only fires on ``full_clean()`` paths (ModelForm
+            validation, an explicit call); see
+            docs/explanation/isolation-layers.md for what this does and
+            does not cover.
+            """
+            super().clean()
+            validate_cross_tenant_fks(self)
+
     # Add the FK field dynamically. Resolved via resolve_tenant_model_setting()
     # (BOUNDARY_TENANT_MODEL first, falling back to ICV_TENANT_MODEL per
     # ADR-025 T2, issue #15) rather than settings.BOUNDARY_TENANT_MODEL
@@ -433,6 +563,17 @@ class TenantMixin(models.Model):
         ):
             self.tenant = TenantContext.require()
         super().save(**kwargs)
+
+    def clean(self):
+        """Reject a cross-tenant FK reference (BR-ORM-013, issue #39).
+
+        See :func:`validate_cross_tenant_fks` for the full rationale and
+        scope. Only fires on ``full_clean()`` paths (ModelForm validation,
+        an explicit call); see docs/explanation/isolation-layers.md for
+        what this does and does not cover.
+        """
+        super().clean()
+        validate_cross_tenant_fks(self)
 
 
 class TenantModel(TenantMixin):
