@@ -121,20 +121,30 @@ A failure in one tenant does not abort the run. Each tenant is isolated, so the 
 
 ### 5. Bypass RLS for trusted maintenance work
 
-When PostgreSQL row-level security is enabled, the database itself rejects rows outside the active tenant, even for the `unscoped` manager, unless the connection is a superuser or the admin bypass flag is set. boundary installs an admin bypass policy that lifts isolation when the `app.boundary_admin` session variable is `'true'`.
+When PostgreSQL row-level security is enabled, the database itself rejects rows outside the active tenant, even for the `unscoped` manager, unless the connection is a superuser or the admin bypass flag is set. boundary installs an admin bypass policy that lifts isolation, for both reads AND writes, when the `app.boundary_admin` session variable is `'true'`: the policy has no `WITH CHECK`, so PostgreSQL falls back to its `USING` clause for write checks too, and multiple permissive policies are combined with `OR`, so satisfying this policy alone is enough regardless of the tenant isolation policy's own `WITH CHECK`. An `INSERT` or `UPDATE` for a tenant other than the active one is accepted, not just made visible.
+
+Use `boundary.context.admin_bypass()` to set the flag. It is the only supported way to reach it:
 
 ```python
-from django.db import connection
+from boundary.context import admin_bypass
+from myapp.models import Booking
 
-with connection.cursor() as cur:
-    cur.execute("SELECT set_config('app.boundary_admin', 'true', true)")
-    # Queries in this transaction now see and write rows for all tenants,
-    # even with FORCE ROW LEVEL SECURITY on the table.
+with admin_bypass():
+    # Queries in this block see and write rows for all tenants, even with
+    # FORCE ROW LEVEL SECURITY on the table.
+    Booking.unscoped.filter(court=1).update(is_paid=True)
 ```
 
-The variable name is configurable via `BOUNDARY_ADMIN_FLAG_VAR` (default `app.boundary_admin`). The third argument to `set_config` (`true`) scopes the flag to the current transaction, so it clears automatically on commit or rollback.
+`admin_bypass()` hardcodes the transaction-local form of `set_config` (the third argument is always `true`): a consumer cannot reach the session-scoped form through this API, because the session-scoped form is unsafe under connection reuse (see below) and the whole point of the function is to remove that failure mode rather than merely warn about it. It guarantees an active transaction (opening one automatically unless `BOUNDARY_WRAP_ATOMIC=False`, matching `TenantContext.using()`), verifies the flag actually took effect before running your code, and clears it explicitly on exit rather than relying only on the transaction ending. It also fires `boundary.signals.admin_bypass_activated` on entry, so every use of this escape hatch is observable. See the [README signals reference](../../README.md#signals) and the docstring on `admin_bypass()` for the full contract, including nested use and multi-region operations.
 
-> Safety: the admin flag disables the database's last line of defence. Set it only inside a tightly scoped transaction for trusted maintenance, never on a connection that serves tenant traffic, and never leave it set across requests.
+The variable name is configurable via `BOUNDARY_ADMIN_FLAG_VAR` (default `app.boundary_admin`); `admin_bypass()` always reads it from settings rather than a hardcoded string, so a customised name is honoured automatically.
+
+If you must set the flag with a hand-written `set_config` call (there is no supported reason to, but if you are debugging boundary itself or writing a migration operation), the third argument MUST be `true`, never `false` or omitted. The difference is not cosmetic:
+
+- **Transaction-local (`true`, what `admin_bypass()` always uses):** scoped to the current transaction. It clears automatically on commit or rollback, and it cannot survive a connection being returned to a pool or reused for the next request under `CONN_MAX_AGE`, because the transaction that held it is already gone by the time that happens.
+- **Session-scoped (`false`, never reachable through `admin_bypass()`):** persists on the connection until something clears it, across every subsequent statement and transaction on that connection. Under Django's `CONN_MAX_AGE` (a connection reused across multiple requests) or behind an external pooler such as PgBouncer (a connection handed to a completely different, unrelated request), a session-scoped flag set for one piece of maintenance work silently stays active for whatever request or task picks up that connection next, with no isolation at all and no indication why. `DISCARD ALL`, which some poolers run on connection handback, resets session-level `set_config` state, but relying on pooler configuration to clean up after an unsafe API is a second point of failure, not a fix. This is the exact failure mode `admin_bypass()` exists to make unreachable.
+
+> Safety: the admin flag disables the database's last line of defence. Use `admin_bypass()` for trusted maintenance only, never on a connection that serves tenant traffic, and never assume it is still active outside the `with` block: `admin_bypass()` clears it explicitly, but a hand-rolled session-scoped `set_config` would not.
 
 ## Verify it worked
 
@@ -142,7 +152,7 @@ The variable name is configurable via `BOUNDARY_ADMIN_FLAG_VAR` (default `app.bo
 - `all_regions()`: with `BOUNDARY_REGIONS` set to three regions, confirm the yielded aliases match the configured keys; with it unset, confirm you get `["default"]`.
 - `boundary_run`: run it with a harmless inner command such as `python manage.py boundary_run --tenant <slug> showmigrations --list` and confirm no `CommandError`.
 - `boundary_run_all`: run `python manage.py boundary_run_all showmigrations --json` and confirm one JSON line per active tenant, each with `status: ok`.
-- RLS bypass: with isolation applied and rows for two tenants, set `app.boundary_admin` to `'true'` in a transaction and confirm a raw `SELECT count(*)` returns the full count instead of the per-tenant count.
+- RLS bypass: with isolation applied and rows for two tenants, enter `admin_bypass()` and confirm a raw `SELECT count(*)` returns the full count instead of the per-tenant count, and that `current_setting('app.boundary_admin', true)` reads `''` again immediately after the block exits.
 
 ## Common pitfalls
 
@@ -151,9 +161,10 @@ The variable name is configurable via `BOUNDARY_ADMIN_FLAG_VAR` (default `app.bo
 - Reaching for `unscoped` in tenant-facing request code: this defeats isolation. Use the default `objects` manager and a proper `TenantContext` instead. See [How tenant resolution works](../explanation/how-resolution-works.md).
 - Forgetting that `boundary_run_all` only targets `is_active=True` tenants. Inactive tenants are skipped silently.
 - Passing inner-command flags before the inner command name in `boundary_run`. The inner command name comes first, then its arguments.
-- Leaving the `app.boundary_admin` flag set outside a short transaction. Always scope it with the transaction-local form of `set_config`.
+- Setting `app.boundary_admin` by hand instead of via `admin_bypass()`. A hand-written `set_config` call with the third argument `false` (or a `SET` statement, which is always session-scoped) leaves the flag active on the connection indefinitely, and under `CONN_MAX_AGE` or an external pooler that connection is handed to a later, unrelated request. `admin_bypass()` makes this failure mode unreachable by hardcoding the transaction-local form; there is no supported way to opt into the session-scoped form through it.
+- Assuming `admin_bypass()` only widens what is visible. It also lifts the write check (no `WITH CHECK` on the bypass policy, permissive policies OR together), so code inside the block can INSERT or UPDATE rows for any tenant, not only read them.
 
 ## Related
 
 - [README](../../README.md) for the full settings reference, RLS setup, and the regional routing model.
-- README sections on the [`unscoped` manager](../../README.md#models), [`all_regions` / `specific_region`](../../README.md#multi-region-with-data-residency), and the [`boundary_run` / `boundary_run_all` commands](../../README.md#management-commands).
+- README sections on the [`unscoped` manager](../../README.md#models), [`all_regions` / `specific_region`](../../README.md#multi-region-with-data-residency), the [`boundary_run` / `boundary_run_all` commands](../../README.md#management-commands), and [`admin_bypass()`](../../README.md#admin-bypass).

@@ -207,51 +207,6 @@ class TestRLSOperations:
         _remove_rls()
 
 
-@pytest.fixture
-def app_conn():
-    """Raw psycopg connection as non-superuser icv_app role for RLS testing.
-
-    Superusers bypass RLS even with FORCE ROW LEVEL SECURITY.
-    These tests MUST run as a non-superuser to verify enforcement.
-
-    Grants icv_app SELECT/INSERT/UPDATE/DELETE on the test tables for the
-    duration of the fixture, then revokes on teardown.
-    """
-    import psycopg
-
-    db = connection.settings_dict
-    try:
-        conn = psycopg.connect(
-            host=db.get("HOST", "localhost"),
-            port=db.get("PORT", 5432),
-            dbname=db["NAME"],
-            user="icv_app",
-            password="icv_dev",
-            autocommit=False,
-        )
-    except Exception as e:
-        pytest.skip(f"icv_app role not available: {e}")
-
-    # Grant table access to the non-superuser role (run as superuser via Django conn).
-    tables = (
-        "boundary_testapp_booking",
-        "boundary_testapp_tenant",
-        "boundary_testapp_brand",
-        "boundary_testapp_brandasset",
-    )
-    with connection.cursor() as cur:
-        for table in tables:
-            cur.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{table}" TO icv_app')
-
-    yield conn
-    conn.close()
-
-    # Revoke grants on teardown.
-    with connection.cursor() as cur:
-        for table in tables:
-            cur.execute(f'REVOKE ALL ON "{table}" FROM icv_app')
-
-
 @pytest.mark.django_db(transaction=True)
 class TestRLSEnforcement:
     """AC-RLS-001/002/003/006/007: Database-level enforcement tests.
@@ -321,6 +276,70 @@ class TestRLSEnforcement:
                 count = cur.fetchone()[0]
                 cur.execute("COMMIT")
             assert count == 2, f"Expected 2, got {count}"
+        finally:
+            _remove_rls()
+
+    def test_rls_admin_bypass_allows_cross_tenant_insert(self, tenant_a, tenant_b, app_conn):
+        """Issue #37: the admin flag does not just widen visibility, it also
+        lifts the write check. boundary_admin_bypass has a USING clause and
+        no WITH CHECK, so PostgreSQL falls back to USING for the write check
+        too; since permissive policies are OR'd, satisfying admin_bypass's
+        USING (the flag is 'true') is sufficient on its own, regardless of
+        what boundary_tenant_isolation's WITH CHECK says. Verified by direct
+        probe against a standalone table before this test was written; this
+        pins that behaviour against the actual migrations_ops.py SQL. See
+        test_rls_blocks_cross_tenant_insert for the positive control (same
+        INSERT, same tables, no admin flag, blocked)."""
+        _apply_rls()
+        try:
+            with app_conn.cursor() as cur:
+                cur.execute("BEGIN")
+                cur.execute("SELECT set_config('app.boundary_admin', 'true', true)")
+                # No app.current_tenant_id set at all: the INSERT disagrees
+                # with the active (absent) tenant context and is accepted
+                # anyway, because the admin policy imposes no tenant check.
+                cur.execute(
+                    "INSERT INTO boundary_testapp_booking (tenant_id, court, is_paid) VALUES (%s, %s, false)",
+                    [str(tenant_b.pk), 77],
+                )
+                cur.execute(
+                    "SELECT count(*) FROM boundary_testapp_booking WHERE tenant_id = %s",
+                    [str(tenant_b.pk)],
+                )
+                count = cur.fetchone()[0]
+                cur.execute("ROLLBACK")  # Don't persist test data
+            assert count == 1, f"Expected the cross-tenant INSERT to succeed under the admin flag, got count={count}"
+        finally:
+            _remove_rls()
+
+    def test_rls_admin_bypass_allows_cross_tenant_update(self, tenant_a, tenant_b, app_conn):
+        """Issue #37: the admin flag also lifts the write check for UPDATE,
+        including an UPDATE that moves a row to a DIFFERENT tenant than the
+        one it started with. Same OR'd-permissive-policy mechanism as the
+        INSERT case above."""
+        from boundary_testapp.models import Booking
+
+        _apply_rls()
+        try:
+            with set_tenant(tenant_a):
+                booking = Booking.objects.create(court=9)
+
+            with app_conn.cursor() as cur:
+                cur.execute("BEGIN")
+                cur.execute("SELECT set_config('app.boundary_admin', 'true', true)")
+                cur.execute(
+                    "UPDATE boundary_testapp_booking SET tenant_id = %s WHERE id = %s",
+                    [str(tenant_b.pk), booking.pk],
+                )
+                cur.execute(
+                    "SELECT tenant_id FROM boundary_testapp_booking WHERE id = %s",
+                    [booking.pk],
+                )
+                new_tenant_id = cur.fetchone()[0]
+                cur.execute("ROLLBACK")  # Don't persist test data
+            assert str(new_tenant_id) == str(tenant_b.pk), (
+                "Expected the admin flag to allow moving a row to a different tenant via UPDATE"
+            )
         finally:
             _remove_rls()
 
