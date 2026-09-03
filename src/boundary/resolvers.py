@@ -78,16 +78,53 @@ class BaseResolver:
 # ── Built-in Resolvers ────────────────────────────────────────
 
 
+def _slug_for_configured_parent(host: str, parent_domains: tuple[str, ...]) -> str | None:
+    """Return the single label above one of ``parent_domains``, or None.
+
+    BR-RES-010: the host must be exactly ``<one-label>.<parent-domain>`` for
+    one of the configured parents, both already lower-cased. This is a
+    label-boundary suffix match, not a substring match: ``host.endswith(
+    parent)`` would wrongly accept ``evil-example.com`` or ``evilexample.com``
+    against a parent of ``example.com``, because both strings literally end
+    with those characters without there being a ``.`` boundary in the right
+    place. Splitting the host into labels and comparing everything after the
+    first label to the parent's own labels avoids that: a false match would
+    need the parent's labels to appear, unchanged, as a trailing run of the
+    host's own labels.
+
+    Also rejects any host at a different depth than one label above the
+    parent: ``club-a.staging.example.co.uk`` does not resolve under parent
+    ``example.co.uk``, only ``club-a.example.co.uk`` does.
+    """
+    host_labels = host.split(".")
+    for parent in parent_domains:
+        parent_labels = parent.lower().split(".")
+        if len(host_labels) == len(parent_labels) + 1 and host_labels[1:] == parent_labels:
+            return host_labels[0]
+    return None
+
+
 class SubdomainResolver(BaseResolver):
     """Resolve tenant from the first subdomain of the request host."""
 
     def resolve(self, request):
         host = request.get_host().split(":")[0]
-        parts = host.split(".")
-        if len(parts) < 3:
-            return None
+        # A trailing dot denotes a fully-qualified hostname (RFC 1035) and
+        # carries no identity of its own, so it is stripped before any
+        # further parsing.
+        host = host.rstrip(".").lower()
 
-        slug = parts[0]
+        parent_domains = boundary_settings.SUBDOMAIN_PARENT_DOMAIN
+        if parent_domains is not None:
+            slug = _slug_for_configured_parent(host, parent_domains)
+            if slug is None:
+                return None
+        else:
+            parts = host.split(".")
+            if len(parts) < 3:
+                return None
+            slug = parts[0]
+
         logger.debug(
             "SubdomainResolver attempt",
             extra={"resolver_name": "SubdomainResolver", "lookup_value": slug},

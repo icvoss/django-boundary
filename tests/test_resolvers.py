@@ -51,6 +51,117 @@ class TestSubdomainResolver:
 
 
 @pytest.mark.django_db
+class TestSubdomainResolverParentDomain:
+    """Issue #22: BOUNDARY_SUBDOMAIN_PARENT_DOMAIN constrains SubdomainResolver
+    to hosts under the deployment's own parent domain(s), closing the
+    cross-tenant-serving vector where a foreign host's first label happens to
+    collide with a tenant slug (`shop.example.co.uk` resolving the tenant
+    slugged `shop` on a deployment that never intended to serve that host)."""
+
+    def test_valid_host_under_configured_parent_resolves(self, rf, tenant_a, settings):
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="club-a.example.com")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+    def test_foreign_host_with_colliding_label_is_rejected(self, rf, tenant_a, settings):
+        """The motivating case from the issue: a foreign host whose first
+        label happens to match a tenant slug must not resolve that tenant."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="club-a.evil.org")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_multi_label_parent_domain_resolves_at_one_level(self, rf, tenant_a, settings):
+        """example.co.uk is the motivating multi-label parent from the issue.
+        Naive label counting (len(parts) < 3) breaks on it; suffix matching
+        must not."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.co.uk"
+        request = rf.get("/", HTTP_HOST="club-a.example.co.uk")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+    def test_multi_label_parent_domain_rejects_extra_depth(self, rf, tenant_a, settings):
+        """Host must be EXACTLY one label above the parent, not any depth
+        below it."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.co.uk"
+        request = rf.get("/", HTTP_HOST="club-a.staging.example.co.uk")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_case_insensitive_match(self, rf, tenant_a, settings):
+        """Hostnames are case-insensitive; both the configured parent and
+        the incoming Host header must be normalised before comparison."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "Example.COM"
+        request = rf.get("/", HTTP_HOST="CLUB-A.Example.COM")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+    def test_trailing_dot_on_host_is_accepted(self, rf, tenant_a, settings):
+        """shop.example.com. is a valid fully-qualified hostname."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="club-a.example.com.")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+    def test_substring_match_is_rejected_not_suffix(self, rf, tenant_a, settings):
+        """The obvious wrong implementation is host.endswith(parent), which
+        wrongly accepts a host that merely ends with the parent's characters
+        without a label boundary. evilexample.com is NOT a subdomain of
+        example.com."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="evilexample.com")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_hyphenated_substring_match_is_rejected(self, rf, tenant_a, settings):
+        """A hyphenated variant of the same substring trap:
+        evil-example.com must not match parent example.com."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="evil-example.com")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_prefixed_variant_not_example_is_rejected(self, rf, tenant_a, settings):
+        """notexample.com must not match parent example.com."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="notexample.com")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_bare_parent_domain_with_no_label_is_rejected(self, rf, tenant_a, settings):
+        """The parent domain itself, with no subdomain label, must not
+        resolve: exactly one label above the parent is required."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        request = rf.get("/", HTTP_HOST="example.com")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_accepts_a_list_of_parent_domains(self, rf, tenant_a, settings):
+        """A deployment may legitimately serve several parent domains, e.g.
+        app.example.com and app.example.co.uk."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = ["example.com", "example.co.uk"]
+        request = rf.get("/", HTTP_HOST="club-a.example.co.uk")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+    def test_list_of_parent_domains_still_rejects_foreign_host(self, rf, tenant_a, settings):
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = ["example.com", "example.co.uk"]
+        request = rf.get("/", HTTP_HOST="club-a.evil.org")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) is None
+
+    def test_unset_preserves_current_behaviour(self, rf, tenant_a, settings):
+        """Default-unset must resolve exactly as before this feature: any
+        three-plus-label host resolves its first label, with no parent-domain
+        check at all."""
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        request = rf.get("/", HTTP_HOST="club-a.evil.org")
+        resolver = SubdomainResolver()
+        assert resolver.resolve(request) == tenant_a
+
+
+@pytest.mark.django_db
 class TestHeaderResolver:
     """AC-RES-002/014: Header resolution (UUID first, slug fallback)."""
 

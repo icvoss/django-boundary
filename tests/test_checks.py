@@ -182,6 +182,92 @@ class TestW006ClientControlledResolverWithoutMembershipCheck:
 
 
 @pytest.mark.django_db
+class TestW008SubdomainResolverWithoutParentDomain:
+    """Issue #22: SubdomainResolver with no BOUNDARY_SUBDOMAIN_PARENT_DOMAIN
+    resolves the first label of ANY three-plus-label host, including one
+    outside the deployment's own domain, which is the cross-tenant-serving
+    vector the setting exists to close. This check warns at startup so an
+    existing consumer upgrading sees the gap rather than discovering it from
+    a foreign host colliding with a tenant slug."""
+
+    def test_fires_for_subdomain_resolver_without_parent_domain(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W008" for e in errors)
+
+    def test_fires_for_a_subclass_of_subdomain_resolver(self, settings):
+        """Matched by issubclass, like boundary.W006, so a consumer subclass
+        inherits the same unconstrained-host behaviour unless it overrides
+        resolve() itself."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary_testapp.resolvers.CustomSubdomainResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W008" for e in errors)
+
+    def test_absent_when_parent_domain_is_configured(self, settings):
+        """Positive control: setting BOUNDARY_SUBDOMAIN_PARENT_DOMAIN must
+        silence the warning, proving the check actually inspects the
+        setting rather than firing unconditionally whenever
+        SubdomainResolver is configured."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W008" for e in errors)
+
+    def test_absent_when_subdomain_resolver_not_configured(self, settings):
+        """Positive control: a deployment that never uses SubdomainResolver
+        has nothing for this check to warn about."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.ExplicitResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W008" for e in errors)
+
+    def test_absent_for_unimportable_resolver_path(self, settings):
+        """A broken path is boundary.E003's concern; W008 has nothing to
+        add and must not raise trying to import it."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["nonexistent.Resolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W008" for e in errors)
+        assert any(e.id == "boundary.E003" for e in errors)
+
+    def test_message_names_the_setting_and_the_hint_points_at_it(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        w008 = next(e for e in errors if e.id == "boundary.W008")
+        assert "boundary.resolvers.SubdomainResolver" in w008.msg
+        assert "BOUNDARY_SUBDOMAIN_PARENT_DOMAIN" in w008.hint
+        assert "SILENCED_SYSTEM_CHECKS" in w008.hint
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        """Proves W008 actually fires through Django's real check registry
+        (as manage.py check / AppConfig.ready() invoke it), not only when
+        check_boundary_configuration() is called directly (issue #31)."""
+        from django.core.checks.registry import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = None
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = registry.run_checks()
+        assert any(e.id == "boundary.W008" for e in errors)
+
+
+@pytest.mark.django_db
 class TestE001IcvTenantModelFallback:
     """Issue #15: _check_tenant_model() must accept ICV_TENANT_MODEL too
     (ADR-025 T2), not only BOUNDARY_TENANT_MODEL."""

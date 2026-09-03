@@ -4,6 +4,39 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`BOUNDARY_SUBDOMAIN_PARENT_DOMAIN`: constrain `SubdomainResolver` to your
+  own domain(s)** (issue #22). `SubdomainResolver.resolve()` previously took
+  the first label of *any* host with three or more labels and looked it up as
+  a tenant slug, with no check that the host belonged to the deployment's own
+  domain. A deployment serving both platform subdomains and customer-owned
+  custom domains from the same resolver chain could therefore resolve the
+  wrong tenant for a foreign host whose first label happened to collide with
+  a tenant slug: `shop.example.co.uk`, a domain never intended to serve
+  tenant-by-subdomain traffic, would still resolve whichever tenant was
+  slugged `shop`. That is cross-tenant serving.
+
+  Setting `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` to your own parent domain (a
+  string, or a list of strings for a deployment with several parent domains)
+  makes `SubdomainResolver` return `None` unless the host is exactly
+  `<one-label>.<parent-domain>` for one of the configured parents. Matching
+  is case-insensitive and by label boundary rather than substring, so
+  `evilexample.com` and `evil-example.com` do not match a parent of
+  `example.com`, and it is exactly one level deep, so
+  `club-a.staging.example.com` does not match either. Multi-label parent
+  domains (`example.co.uk`) work correctly. A trailing dot on the incoming
+  host is stripped before matching.
+
+  **Nothing changes for anyone who does not set this setting.** It is unset
+  by default, and `SubdomainResolver` resolves exactly as it always has when
+  it is unset. `boundary.W008` warns at startup when `SubdomainResolver` is
+  configured without it, as a prompt rather than an error, because a
+  deployment whose `ALLOWED_HOSTS` is already a small, fully-trusted, closed
+  list has nothing to gain from setting it; silence the warning in
+  `SILENCED_SYSTEM_CHECKS` if that describes your deployment. See
+  [Constrain SubdomainResolver to your own domain](docs/how-to/choose-and-order-resolvers.md#constrain-subdomainresolver-to-your-own-domain).
+
 ### Fixed
 
 - **`TenantManager.from_queryset(CustomQuerySet)` now works** (issue #29).

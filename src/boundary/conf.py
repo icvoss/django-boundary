@@ -86,6 +86,28 @@ class _Settings:
         return _setting("BOUNDARY_SUBDOMAIN_FIELD", "slug")
 
     @property
+    def SUBDOMAIN_PARENT_DOMAIN(self):  # noqa: N802
+        """One or more parent domains SubdomainResolver is constrained to.
+
+        Accepts a single domain string, a list of domain strings, or None
+        (the default). When set, SubdomainResolver.resolve() only resolves a
+        host that is exactly ``<one-label>.<parent-domain>`` for one of the
+        configured parents; any other host, including one at a different
+        depth or with an unrelated suffix, returns None. See BR-RES-010 and
+        docs/how-to/choose-and-order-resolvers.md for the cross-tenant
+        serving risk this closes.
+
+        A bare string is normalised to a single-item tuple so resolvers
+        always iterate a sequence regardless of which form was configured.
+        """
+        value = _setting("BOUNDARY_SUBDOMAIN_PARENT_DOMAIN")
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return (value,)
+        return tuple(value)
+
+    @property
     def HEADER_NAME(self):  # noqa: N802
         return _setting("BOUNDARY_HEADER_NAME", "X-Tenant-ID")
 
