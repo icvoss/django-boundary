@@ -80,10 +80,10 @@ The third argument to `set_config` is `true`, which scopes the setting to the cu
 
 ### Why the atomic wrapper
 
-Because `set_config(..., true)` is transaction-scoped, the middleware wraps the downstream call in `transaction.atomic()` when `BOUNDARY_WRAP_ATOMIC` is `True` (the default):
+Because `set_config(..., true)` is transaction-scoped, the middleware always wraps the downstream call in a transaction it controls, when `BOUNDARY_WRAP_ATOMIC` is `True` (the default), using `context._ensure_atomic()`:
 
 ```python
-with transaction.atomic():
+with _ensure_atomic():
     token = TenantContext.set(tenant)
     request._boundary_token = token
     try:
@@ -92,9 +92,13 @@ with transaction.atomic():
         TenantContext.clear(token)
 ```
 
-If `BOUNDARY_WRAP_ATOMIC` is `False`, or if the default database already has `ATOMIC_REQUESTS = True` (the middleware detects this and avoids double-wrapping), the same `set` / `get_response` / `clear` sequence runs without an extra `atomic()` block. In that case the session variable still flows through whatever transaction Django opens for your writes, and RLS still applies to those statements.
+`_ensure_atomic()` opens `transaction.atomic()` only if no transaction is already open on the connection (`connection.in_atomic_block` is `False`); if one is already open it is a no-op, so nested use never adds an unnecessary savepoint.
 
-If your project relies on RLS and you turn off both `BOUNDARY_WRAP_ATOMIC` and `ATOMIC_REQUESTS`, reads outside a transaction will not see the session variable. Keep at least one of them enabled when RLS is in play.
+Earlier versions (0.5.3 and before) skipped this wrap whenever the default database already had `ATOMIC_REQUESTS = True`, on the assumption that Django's own ATOMIC_REQUESTS transaction would already cover `TenantContext.set()`. That assumption was wrong: Django's `ATOMIC_REQUESTS` wraps the *view* (`BaseHandler.make_view_atomic`), not the middleware chain, so at the point the middleware called `TenantContext.set()` no transaction had opened yet. The `set_config(..., true)` call was therefore transaction-local to nothing and silently discarded before the view's transaction ever began, leaving the PostgreSQL session variable empty while `TenantContext.get()` still reported the tenant correctly. Under `FORCE ROW LEVEL SECURITY` this fails closed (the policy evaluates against a NULL session variable and returns no rows), not as a data leak, but it silently disabled the RLS defence-in-depth layer for every request served with `ATOMIC_REQUESTS = True` on the default database. If you are upgrading from 0.5.3 or earlier and ran with `ATOMIC_REQUESTS = True`, your RLS policies were not seeing the tenant session variable during requests: application-level scoping (the tenant-aware manager, `TenantContext.require()`) was unaffected, but the database-level second line of defence was not applying. Upgrading resolves this with no configuration change required.
+
+With the fix, boundary's own transaction is what makes the session variable visible; when the view's `ATOMIC_REQUESTS` transaction later opens, it nests as a savepoint inside boundary's transaction, and an unhandled exception in the view still unwinds through both, so the view's work still commits or rolls back as a unit.
+
+If `BOUNDARY_WRAP_ATOMIC` is `False`, `_ensure_atomic()` does not open a transaction; it logs a warning if none is already open, and the session variable will not survive past the next statement unless you wrap the request in your own transaction. If your project relies on RLS, keep `BOUNDARY_WRAP_ATOMIC` enabled, or wrap requests in your own `transaction.atomic()` if you disable it.
 
 ## Step 7: the context flows to the ORM
 
