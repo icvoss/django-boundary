@@ -38,6 +38,8 @@ The built-in resolvers are `SubdomainResolver`, `HeaderResolver`, `JWTClaimResol
 
 Ordering is a security decision: placing `HeaderResolver` first lets any HTTP client name the tenant via a header. For public-facing apps, put `SubdomainResolver` first.
 
+**Resolution is not authorisation.** Whichever resolver wins, all it has established is *which* tenant this request names. It has not established that the caller is allowed to act as that tenant. `SubdomainResolver` derives the tenant from the `Host` header, which is constrained by `ALLOWED_HOSTS`; `HeaderResolver` and `JWTClaimResolver` take the tenant directly from a value the client controls, with nothing in this chain checking that the authenticated user actually belongs to it. Every layer downstream of resolution (`TenantContext`, the ORM manager, RLS) then correctly scopes to whatever tenant was resolved, which is exactly the problem: isolation working perfectly for the tenant the caller asked for, rather than the one they are a member of, looks identical to isolation working correctly. Verifying membership is the consumer's job, not boundary's; see [Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution) for where that check sits relative to this middleware, and `boundary.W006`, which flags the specific configuration (a client-controlled resolver with `django.contrib.auth` installed) where the gap has real consequences.
+
 ## Step 3: no resolver matched
 
 If the walk finishes with no tenant, behaviour depends on `BOUNDARY_REQUIRED` (default `True`):

@@ -44,7 +44,9 @@ In short: the ORM layer is broad and convenient but only covers code that goes t
 
 ## The threat model
 
-The layers are designed against three concrete failure modes, in roughly increasing severity.
+The layers are designed against three concrete failure modes, in roughly increasing severity. All three assume the tenant these layers are enforcing against is the *right* tenant. A fourth failure mode sits upstream of all of them:
+
+0. **The wrong tenant, correctly enforced.** boundary resolves which tenant a request targets; it does not check whether the caller may access it. With a client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`), an authenticated caller can simply name a tenant they do not belong to, and every layer below (ORM, RLS) then does exactly what it is designed to do: scope perfectly to that tenant. None of the three failure modes below fire, because nothing was bypassed and nothing leaked across whichever tenant boundary was told to enforce. See [How tenant resolution works](how-resolution-works.md#step-2-walking-the-resolver-chain) and [Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution) for the check that belongs to the consumer, not to boundary.
 
 1. **Accidental cross-tenant leaks in application code.** A developer writes a query but forgets to scope it, or builds a related lookup that crosses tenants. This is the most common and most likely failure. The ORM layer handles it by making correct scoping the default: there is no unscoped query to forget, because `objects` is already filtered. Strict mode (below) hardens this further by refusing to run when no tenant is set, rather than silently returning everything.
 
@@ -88,4 +90,5 @@ Boundary surfaces gaps in this posture through system checks: `boundary.E006` fl
 - [Cross-tenant admin operations](../how-to/cross-tenant-admin-operations.md)
 - [Write tenant-safe tests](../how-to/write-tenant-safe-tests.md)
 - [Set up a tenant model](../how-to/set-up-a-tenant-model.md)
+- [Choose and order resolvers: Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution)
 - README: [Defence in Depth](../../README.md#how-it-works), [Row Level Security](../../README.md#row-level-security), [Settings Reference](../../README.md#settings-reference)

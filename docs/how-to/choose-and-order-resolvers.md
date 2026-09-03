@@ -6,6 +6,8 @@ Pick the right built-in resolver for how your clients identify a tenant, order t
 
 A resolver answers one question per request: which tenant does this request belong to? The middleware walks `BOUNDARY_RESOLVERS` in order, calls `resolve(request)` on each, and stops at the first resolver that returns a tenant. First match wins.
 
+**A resolver answers *which* tenant, never *whether the caller may access it*.** That second question, whether the authenticated principal is actually a member of the resolved tenant, is entirely the consumer's responsibility. See [Enforce membership after resolution](#enforce-membership-after-resolution) below before choosing `HeaderResolver` or `JWTClaimResolver` for anything with authenticated users.
+
 ## Prerequisites
 
 - `boundary.middleware.TenantMiddleware` installed in `MIDDLEWARE`.
@@ -29,10 +31,10 @@ All built-ins live in `boundary.resolvers` and subclass `BaseResolver`. Each `re
 When to use each:
 
 - **SubdomainResolver**: public-facing multi-tenant apps where each tenant has its own subdomain. Requires a host with at least three labels (`slug.domain.tld`); a bare `example.com` returns `None`. This is the default when `BOUNDARY_RESOLVERS` is unset.
-- **HeaderResolver**: internal or service-to-service APIs where a trusted client names the tenant. It tries the header value as a UUID pk, then as a raw pk, then as a slug (`SUBDOMAIN_FIELD`), so both `X-Tenant-ID: <uuid>` and `X-Tenant-ID: club-a` work. Treat the header as a trust boundary: anyone who can set it picks the tenant.
-- **JWTClaimResolver**: APIs that already authenticate with a bearer token carrying the tenant in a claim. It base64-decodes the JWT payload and reads the claim, but does NOT verify the signature, so put real token verification (for example DRF auth or an upstream gateway) in front of it. The claim value must be the tenant pk.
-- **SessionResolver**: server-rendered apps where the user selects or is assigned a tenant and you store its pk in `request.session[BOUNDARY_SESSION_KEY]`.
-- **ExplicitResolver**: when other code (a different middleware, a test, a management command path) has already set `request.boundary_tenant`. It is a pure attribute read with no DB lookup, useful as a first-priority override or in test setups.
+- **HeaderResolver**: internal or service-to-service APIs where a trusted client names the tenant. It tries the header value as a UUID pk, then as a raw pk, then as a slug (`SUBDOMAIN_FIELD`), so both `X-Tenant-ID: <uuid>` and `X-Tenant-ID: club-a` work. **Client-controlled**: any caller can set the header to any value, so the resolved tenant is whatever the caller asked for, not necessarily one they belong to. If the application has authenticated users, pair this with the membership check in [Enforce membership after resolution](#enforce-membership-after-resolution); `boundary.W006` warns when it is missing.
+- **JWTClaimResolver**: APIs that already authenticate with a bearer token carrying the tenant in a claim. It base64-decodes the JWT payload and reads the claim, but does NOT verify the signature, so put real token verification (for example DRF auth or an upstream gateway) in front of it. The claim value must be the tenant pk. **Client-controlled**: boundary trusts whatever the claim says once the token's signature has been verified elsewhere; a valid token proves who the caller is, not which tenants they may act as. The same membership check applies as for `HeaderResolver`.
+- **SessionResolver**: server-rendered apps where the user selects or is assigned a tenant and you store its pk in `request.session[BOUNDARY_SESSION_KEY]`. Not client-controlled in the header/JWT sense (the client cannot set an arbitrary session value by tampering with a cookie), but the trust boundary shifts to whatever server-side code writes that session key: if a "switch tenant" view sets it from a client-supplied id without checking membership first, the same gap reappears one layer up.
+- **ExplicitResolver**: when other code (a different middleware, a test, a management command path) has already set `request.boundary_tenant`. It is a pure attribute read with no DB lookup, useful as a first-priority override or in test setups. Not client-controlled: it never reads the request at all, so whatever set the attribute already made (or deferred) the access decision.
 
 ### 2. Configure the order
 
@@ -126,10 +128,77 @@ def test_subdomain_resolution(tenant_a):
 
 To confirm ordering end to end, send a real request through the middleware and read the resolved tenant off the request. After successful resolution the middleware sends the `tenant_resolved` signal with `tenant`, `resolver`, and `request`; if nothing matches and `BOUNDARY_REQUIRED` is `True` it sends `tenant_resolution_failed` and returns a 404. The resolved tenant is available as `request.tenant` (and as `request.<BOUNDARY_REQUEST_ATTR>` when you have customised that).
 
+## Enforce membership after resolution
+
+Resolution only answers *which* tenant a request names. It never checks *whether the authenticated caller belongs to that tenant*. For `HeaderResolver` and `JWTClaimResolver` the tenant comes straight from client-supplied input (a header value, an unverified JWT claim), so if your application has authenticated users, add an explicit membership check. `boundary.W006` warns at startup when a client-controlled resolver is configured alongside `django.contrib.auth` and nothing has silenced the check, which is the configuration this section addresses.
+
+### Where the check sits
+
+The membership check runs as its own middleware, positioned **after** `TenantMiddleware` (so `request.tenant` is set) and **after** your authentication middleware (so `request.user` is set and authenticated):
+
+```python
+# settings.py
+MIDDLEWARE = [
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",  # sets request.user
+    "boundary.middleware.TenantMiddleware",                     # sets request.tenant
+    "myapp.middleware.TenantMembershipMiddleware",               # checks request.user is a member of request.tenant
+    # ...
+]
+```
+
+If `TenantMiddleware` runs first, an unauthenticated request that fails resolution already gets `boundary`'s own 404 (`BOUNDARY_REQUIRED = True`, the default) before your membership check ever runs, so the check does not need to defend against a missing `request.tenant`.
+
+### A worked example
+
+The membership model itself belongs to your application; boundary has no opinion on it and ships no such model. The shape below is illustrative, not a contract boundary ships:
+
+```python
+# myapp/middleware.py
+from django.http import HttpResponseForbidden
+
+
+class TenantMembershipMiddleware:
+    """Enforce that request.user belongs to request.tenant.
+
+    Runs after boundary.middleware.TenantMiddleware and after
+    AuthenticationMiddleware. boundary resolves tenancy; it does not
+    authorise access, so this check is the application's responsibility
+    (issue #38 / BR-RES-009).
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        tenant = getattr(request, "tenant", None)
+        user = getattr(request, "user", None)
+
+        if tenant is not None and user is not None and user.is_authenticated:
+            # Replace with your own membership model / lookup. A common
+            # shape is a through-table (Membership) or an M2M on the user
+            # or tenant model; the details are yours to design.
+            if not user.memberships.filter(tenant=tenant).exists():
+                return HttpResponseForbidden(f"Not a member of {tenant}.")
+
+        return self.get_response(request)
+```
+
+A request with no resolved tenant (`BOUNDARY_REQUIRED = False`, public routes) or no authenticated user passes through unchanged; there is nothing to check membership against yet, and those cases are the caller's own concern further down the stack.
+
+### Interaction with `BOUNDARY_REQUIRED` and the inactive-tenant 403
+
+`TenantMiddleware` already returns two responses of its own before your membership check ever runs: a 404 when `BOUNDARY_REQUIRED = True` and no resolver matched, and a 403 when the resolved tenant has `is_active = False`. Your membership check is a third, independent gate, checking a different fact (is *this user* allowed in *this* tenant, as opposed to does the tenant exist and is it active) and should return its own 403 rather than trying to reuse boundary's.
+
+### If you use icv-identity
+
+If `icv-identity` is installed, it owns the tenant domain model and provides its own middleware for this per ADR-025 T1; you should not hand-roll `TenantMembershipMiddleware` on top of it. See icv-identity's own documentation for the specifics: boundary does not import `icv_identity` and this guide does not describe its internals.
+
 ## Common pitfalls
 
 - **Trusting `HeaderResolver` on public endpoints.** Any client can set the header, so any client can choose the tenant. Use it only behind a trusted boundary, and do not place it ahead of `SubdomainResolver` on public-facing apps.
 - **Assuming `JWTClaimResolver` validates the token.** It decodes the payload without verifying the signature. Authenticate the token separately before relying on the resolved tenant.
+- **Assuming resolution is authorisation.** Neither `HeaderResolver` nor `JWTClaimResolver` checks that the caller belongs to the tenant they named; they just read the value. See [Enforce membership after resolution](#enforce-membership-after-resolution) above. `boundary.W006` exists specifically to catch this gap in the one configuration where it bites: a client-controlled resolver alongside `django.contrib.auth`.
 - **Subdomain lookups on a two-label host.** `SubdomainResolver` returns `None` for `example.com` because it needs at least three labels. Local development on `localhost` will not resolve; use a `*.localhost` style host or a different resolver in dev.
 - **Wrong lookup field.** `SubdomainResolver` and the `HeaderResolver` slug fallback both look up `BOUNDARY_SUBDOMAIN_FIELD` (default `"slug"`). If your tenant key column has another name, set it once via `BOUNDARY_SUBDOMAIN_FIELD`.
 - **Claim or session value is not the pk.** `JWTClaimResolver` and `SessionResolver` look up the tenant by primary key. Store the tenant pk, not its slug, in the claim or session.
@@ -138,5 +207,6 @@ To confirm ordering end to end, send a real request through the middleware and r
 ## Related
 
 - [README: Resolvers](../../README.md#resolvers): full resolver table and resolver-cache behaviour.
-- [Settings reference](../reference/settings.md): all `BOUNDARY_` settings and defaults.
+- [Settings reference](../reference/settings.md): all `BOUNDARY_` settings and defaults, including `boundary.W006`.
 - [README: Signals](../../README.md#signals): `tenant_resolved` and `tenant_resolution_failed`.
+- [README: System Checks](../../README.md#system-checks): full table of `boundary.E*` / `boundary.W*` checks.

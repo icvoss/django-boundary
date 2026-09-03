@@ -84,6 +84,104 @@ class TestSystemChecks:
 
 
 @pytest.mark.django_db
+class TestW006ClientControlledResolverWithoutMembershipCheck:
+    """Issue #38: a client-controlled resolver (HeaderResolver,
+    JWTClaimResolver) combined with django.contrib.auth is the
+    configuration where the missing membership check actually bites: the
+    app has authenticated users, and tenant selection is nonetheless taken
+    from client-supplied input."""
+
+    def test_fires_for_header_resolver_with_auth(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_fires_for_jwt_claim_resolver_with_auth(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.JWTClaimResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_fires_for_a_subclass_of_a_client_controlled_resolver(self, settings):
+        """A consumer subclass inherits the same client-controlled trust
+        boundary; matched by issubclass, not dotted-path suffix, so this
+        must fire even though the path differs from the built-in."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary_testapp.resolvers.CustomHeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_subdomain_resolver_with_auth(self, settings):
+        """Positive control: SubdomainResolver derives the tenant from the
+        Host header, which ALLOWED_HOSTS constrains, not from a value the
+        client freely chooses. Proves the check discriminates by resolver
+        class rather than firing unconditionally whenever auth is
+        installed."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_header_resolver_without_auth(self, settings):
+        """Positive control: without django.contrib.auth installed there
+        are no authenticated users to mis-scope, so the same
+        client-controlled resolver must not fire. Proves the check
+        discriminates by INSTALLED_APPS rather than firing on the resolver
+        alone."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        settings.INSTALLED_APPS = [app for app in settings.INSTALLED_APPS if app != "django.contrib.auth"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+
+    def test_absent_for_unimportable_resolver_path(self, settings):
+        """A broken path is boundary.E003's concern; W006 has nothing to
+        add and must not raise trying to import it."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["nonexistent.Resolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.W006" for e in errors)
+        assert any(e.id == "boundary.E003" for e in errors)
+
+    def test_message_names_the_resolver_and_the_hint_points_at_the_pattern(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        w006 = next(e for e in errors if e.id == "boundary.W006")
+        assert "boundary.resolvers.HeaderResolver" in w006.msg
+        assert "SILENCED_SYSTEM_CHECKS" in w006.hint
+        assert "membership" in w006.hint
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        """Issue #31: the whole check module once failed to register at
+        all. Proves W006 actually fires through Django's real check
+        registry (as manage.py check / AppConfig.ready() invoke it), not
+        only when check_boundary_configuration() is called directly."""
+        from django.core.checks.registry import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.HeaderResolver"]
+        # django.contrib.auth is already in the base test INSTALLED_APPS.
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        errors = registry.run_checks()
+        assert any(e.id == "boundary.W006" for e in errors)
+
+
+@pytest.mark.django_db
 class TestE001IcvTenantModelFallback:
     """Issue #15: _check_tenant_model() must accept ICV_TENANT_MODEL too
     (ADR-025 T2), not only BOUNDARY_TENANT_MODEL."""

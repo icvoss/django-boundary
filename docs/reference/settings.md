@@ -118,19 +118,23 @@ When `True`, `TenantMiddleware` returns a 404 response if no configured resolver
 
 Ordered list of dotted-path resolver class names. `TenantMiddleware` tries each resolver in order and uses the first non-`None` result. The built-in resolvers are:
 
-| Class | Resolves from | Configured by |
-|---|---|---|
-| `boundary.resolvers.SubdomainResolver` | Subdomain slug (e.g. `acme.app.com`) | `BOUNDARY_SUBDOMAIN_FIELD` |
-| `boundary.resolvers.HeaderResolver` | HTTP header value | `BOUNDARY_HEADER_NAME` |
-| `boundary.resolvers.JWTClaimResolver` | JWT payload claim | `BOUNDARY_JWT_CLAIM` |
-| `boundary.resolvers.SessionResolver` | Django session key | `BOUNDARY_SESSION_KEY` |
-| `boundary.resolvers.ExplicitResolver` | `request.boundary_tenant` set upstream | none |
+| Class | Resolves from | Configured by | Client-controlled? |
+|---|---|---|---|
+| `boundary.resolvers.SubdomainResolver` | Subdomain slug (e.g. `acme.app.com`) | `BOUNDARY_SUBDOMAIN_FIELD` | No -- derived from the `Host` header, constrained by `ALLOWED_HOSTS` |
+| `boundary.resolvers.HeaderResolver` | HTTP header value | `BOUNDARY_HEADER_NAME` | **Yes** -- any caller can set the header to any value |
+| `boundary.resolvers.JWTClaimResolver` | JWT payload claim | `BOUNDARY_JWT_CLAIM` | **Yes** -- the claim is read without signature verification; boundary trusts whatever the token says |
+| `boundary.resolvers.SessionResolver` | Django session key | `BOUNDARY_SESSION_KEY` | No, provided only server-side code writes the session key -- see the note below |
+| `boundary.resolvers.ExplicitResolver` | `request.boundary_tenant` set upstream | none | No -- read-only attribute access; whatever set `request.boundary_tenant` already decided |
 
-**When to change it:** Change the list to match your URL and auth strategy. For public-facing SaaS, `SubdomainResolver` first is the right choice. For internal APIs backed by a JWT auth middleware, `JWTClaimResolver` alone is usually sufficient.
+**Resolution is not authorisation.** boundary resolves *which* tenant a request targets. It does not establish *whether the caller may access that tenant*. For `HeaderResolver` and `JWTClaimResolver` this is not a hypothetical: the value comes directly from the client, so an authenticated user of tenant A can simply ask for tenant B and get it, because every layer beneath resolution (the ORM manager, RLS, the session variable) then correctly scopes to whichever tenant was named. Isolation works; it is just pointed at the tenant the caller asked for rather than the one they belong to. The consumer is responsible for verifying that the authenticated principal is a member of the resolved tenant, after `TenantMiddleware` has set `request.tenant`. See [choose-and-order-resolvers.md](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution) for where that check sits and a worked example, and `boundary.W006` below, which flags the specific configuration where this gap bites.
 
-**Security note:** Resolver order determines precedence. Placing `HeaderResolver` first allows any HTTP client to set the tenant by sending a header. For public-facing applications keep `HeaderResolver` last or omit it.
+**When to change it:** Change the list to match your URL and auth strategy. For public-facing SaaS, `SubdomainResolver` first is the right choice, since the tenant then comes from something the client cannot freely choose. For internal APIs backed by a JWT auth middleware, `JWTClaimResolver` still requires a membership check downstream: it is convenient, not sufficient, for authorisation on its own.
 
-**System check:** `boundary.E003` (Error) fires for any class path in this list that cannot be imported.
+**Security note:** Resolver order determines precedence. Placing `HeaderResolver` first allows any HTTP client to set the tenant by sending a header. For public-facing applications keep `HeaderResolver` last or omit it. This governs precedence *within* the chain; it does not substitute for the membership check above, which applies regardless of where a client-controlled resolver sits in the order.
+
+**System check:** `boundary.E003` (Error) fires for any class path in this list that cannot be imported. `boundary.W006` (Warning) fires when a client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass of either) is configured alongside `django.contrib.auth`.
+
+**A note on `SessionResolver`:** the session key itself lives server-side and cannot be forged by tampering with a cookie the way a header can be, but that only holds if nothing in your application lets an authenticated user set `request.session[BOUNDARY_SESSION_KEY]` to an arbitrary value without a membership check of its own (a "switch tenant" view that trusts a client-supplied tenant id, for example). Treat the *code that writes the session key* as the trust boundary to audit, not the resolver.
 
 ---
 

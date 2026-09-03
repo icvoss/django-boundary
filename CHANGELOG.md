@@ -6,6 +6,23 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`boundary.W006`: warn when a client-controlled resolver is configured
+  alongside `django.contrib.auth`** (issue #38). `HeaderResolver` and
+  `JWTClaimResolver` (and any subclass of either) take the tenant directly
+  from a value the client supplies: a header, or an unverified JWT claim.
+  boundary resolves *which* tenant a request targets; it never checks
+  *whether the caller may access it*, so an authenticated user of one
+  tenant can simply name another and every layer beneath resolution (the
+  ORM manager, RLS, the session variable) scopes correctly to it. Fires
+  only when the application also has authenticated users
+  (`django.contrib.auth` in `INSTALLED_APPS`), since that is the
+  configuration where the missing membership check actually bites; an
+  application with no authenticated users has nothing to mis-scope. The
+  hint points at the new "Enforce membership after resolution" section in
+  [choose-and-order-resolvers.md](docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution),
+  which documents the middleware shape and where it sits relative to
+  `TenantMiddleware`. A consumer who has already handled membership
+  silences it by ID via `SILENCED_SYSTEM_CHECKS`.
 - **`admin_bypass()` context manager for the RLS admin bypass flag** (issue
   #37). The flag (`BOUNDARY_ADMIN_FLAG_VAR`, default `app.boundary_admin`)
   previously had no API: consumers were directed by the docs to call
@@ -54,6 +71,19 @@ All notable changes to django-boundary are documented here.
 
 ### Fixed
 
+- **`docs/reference/settings.md` framed `BOUNDARY_RESOLVERS` purely as a
+  URL-shape and API-style choice and said `JWTClaimResolver` alone was
+  "usually sufficient" for internal APIs, with no statement that
+  resolution is not authorisation** (issue #38). Corrected: the resolver
+  table now marks which resolvers are client-controlled (`HeaderResolver`,
+  `JWTClaimResolver`, and their subclasses) versus derived from something
+  the client cannot freely choose (`SubdomainResolver`, `ExplicitResolver`,
+  and `SessionResolver` provided its session key is only ever written
+  server-side after a check of its own), and states plainly that the
+  consumer must verify the authenticated principal's membership of the
+  resolved tenant. Same correction applied to the README resolver table
+  and architecture diagram, `docs/explanation/how-resolution-works.md`,
+  and `docs/explanation/isolation-layers.md`'s threat model.
 - **`BoundaryConfig._connect_cache_invalidation_signals()` read
   `BOUNDARY_TENANT_MODEL` directly and returned early when it was unset,
   ignoring the `ICV_TENANT_MODEL` fallback (ADR-025 T2) that every other
