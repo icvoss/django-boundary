@@ -26,6 +26,18 @@ class TestAutomaticFiltering:
         with set_tenant(tenant_b):
             assert Booking.objects.count() == 1
 
+    def test_default_manager_returns_tenant_queryset(self, tenant_a):
+        """Issue #29 regression guard: a plain TenantManager with no
+        from_queryset() must still return a TenantQuerySet instance, not
+        Django's own default plain QuerySet.
+        """
+        from boundary_testapp.models import Booking
+
+        from boundary.models import TenantQuerySet
+
+        with set_tenant(tenant_a):
+            assert type(Booking.objects.get_queryset()) is TenantQuerySet
+
 
 @pytest.mark.django_db
 class TestStrictMode:
@@ -51,6 +63,33 @@ class TestStrictMode:
             Booking.objects.create(court=2)
 
         assert Booking.objects.count() == 2
+
+
+@pytest.mark.django_db
+class TestFromQuerySet:
+    """Issue #29: TenantManager.get_queryset() must honour a custom
+    _queryset_class set via TenantManager.from_queryset(), not hardcode
+    TenantQuerySet.
+    """
+
+    def test_custom_queryset_method_reachable_through_manager(self, tenant_a, tenant_b):
+        from boundary_testapp.models import BookingWithCustomQuerySet, PaidCourtQuerySet
+
+        with set_tenant(tenant_a):
+            BookingWithCustomQuerySet.objects.create(court=1, is_paid=True)
+            BookingWithCustomQuerySet.objects.create(court=2, is_paid=False)
+        with set_tenant(tenant_b):
+            BookingWithCustomQuerySet.objects.create(court=3, is_paid=True)
+
+        with set_tenant(tenant_a):
+            qs = BookingWithCustomQuerySet.objects.get_queryset()
+            # Class check first: distinguishes "method missing" from
+            # "wrong class returned" if this ever regresses.
+            assert type(qs) is PaidCourtQuerySet
+
+            paid = BookingWithCustomQuerySet.objects.paid()
+            assert isinstance(paid, PaidCourtQuerySet)
+            assert list(paid.values_list("court", flat=True)) == [1]
 
 
 @pytest.mark.django_db
