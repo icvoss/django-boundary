@@ -1,5 +1,6 @@
 """Concrete test models for boundary's own test suite."""
 
+from django.conf import settings
 from django.db import models
 
 from boundary.models import (
@@ -27,18 +28,35 @@ class Booking(TenantModel):
         app_label = "boundary_testapp"
 
 
-# ── Custom FK field name models (for make_tenant_mixin tests) ──
+class Invoice(TenantModel):
+    """Tenant-scoped model with a direct FK to another tenant-scoped model,
+    a self-referential FK, and a FK to a non-tenant model (issue #39,
+    cross-tenant FK validation fixtures).
+    """
 
-MerchantMixin = make_tenant_mixin("merchant")
-
-
-class Product(MerchantMixin):
-    """Model using a custom FK field name via make_tenant_mixin."""
-
-    sku = models.CharField(max_length=50)
+    booking = models.ForeignKey(Booking, on_delete=models.CASCADE, null=True, blank=True)
+    corrected_by = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="corrections",
+    )
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    amount = models.IntegerField(default=0)
 
     class Meta:
         app_label = "boundary_testapp"
+
+
+# ── Custom FK field name models (for make_tenant_mixin tests) ──
+
+MerchantMixin = make_tenant_mixin("merchant")
 
 
 # ── Indirect / traversal-scoped models (make_tenant_path_mixin) ──
@@ -48,6 +66,22 @@ class Brand(MerchantMixin):
     """Direct-FK parent that path-scoped models reach the tenant through."""
 
     name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "boundary_testapp"
+
+
+class Product(MerchantMixin):
+    """Model using a custom FK field name via make_tenant_mixin.
+
+    Carries a direct FK to another make_tenant_mixin()-based model
+    (Brand) so the cross-tenant FK validation (issue #39) has a fixture
+    proving the make_tenant_mixin() path gets the same clean() coverage
+    as TenantMixin.
+    """
+
+    sku = models.CharField(max_length=50)
+    brand = models.ForeignKey(Brand, on_delete=models.CASCADE, null=True, blank=True)
 
     class Meta:
         app_label = "boundary_testapp"

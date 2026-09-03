@@ -51,6 +51,25 @@ All notable changes to django-boundary are documented here.
   the database is provisioned, which stays a silent skip as before) from a
   live connection whose query failed for some other reason, which now
   raises `boundary.W007` instead of vanishing. Fixes #34.
+- **`clean()` validation rejects a cross-tenant foreign key reference**
+  (BR-ORM-013). Neither isolation layer catches a tenant-scoped row whose
+  own `tenant_id` is correct but whose FK points at another tenant's row:
+  the ORM manager filters on the row's own tenant column, and RLS's
+  `USING`/`WITH CHECK` predicate checks the same column, not what the
+  row's FK targets belong to. `TenantMixin.clean()` and the `clean()` on
+  the mixin `make_tenant_mixin()` produces now call
+  `boundary.models.validate_cross_tenant_fks()`, which raises
+  `django.core.exceptions.ValidationError` (keyed by field name) when an
+  FK to another tenant-scoped model (one with its own tenant column)
+  points at a row belonging to a different tenant than the instance
+  itself. A `None` FK, a FK to a non-tenant model, and a FK to a
+  path-scoped model are all left alone. **This fires on `full_clean()`
+  paths only** (`ModelForm` validation, an explicit `full_clean()` call):
+  `save()`, `bulk_create()`, `update()`, `bulk_update()`, and raw SQL do
+  not call `clean()` and remain unprotected, same as any other Django
+  model validation. See
+  [`docs/explanation/isolation-layers.md`](docs/explanation/isolation-layers.md)
+  for the full threat-model entry. Fixes #39.
 
 ### Fixed
 
