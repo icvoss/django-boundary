@@ -33,6 +33,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_rls_enabled())
     errors.extend(_check_identity_double_resolve())
     errors.extend(_check_rls_bypassable())
+    errors.extend(_check_client_controlled_resolver_without_membership_check())
 
     return errors
 
@@ -168,6 +169,88 @@ def _check_identity_double_resolve():
                 "and bridge, or run boundary-only without icv-identity's middleware."
             ),
             id="boundary.W002",
+        )
+    ]
+
+
+def _check_client_controlled_resolver_without_membership_check():
+    """W006: warn when a client-controlled resolver is configured alongside
+    django.contrib.auth with nothing downstream enforcing membership.
+
+    Per BR-RES-009 (issue #38): boundary resolves WHICH tenant a request
+    targets and never establishes WHETHER the caller may access it.
+    HeaderResolver and JWTClaimResolver read the tenant straight from
+    values the client fully controls (an arbitrary header, an unverified
+    JWT claim), so any authenticated caller can name any tenant and every
+    downstream layer then works correctly for that choice: the ORM filters
+    to it, RLS scopes to it, the session variable is set to it. Isolation
+    is intact and pointed at the tenant the caller asked for, not the one
+    they belong to.
+
+    This only bites when there are authenticated users to mis-scope in the
+    first place, hence gating on django.contrib.auth being installed. An
+    application with no authenticated users (a public API keyed entirely
+    by an API key that already encodes the tenant, for example) has no
+    membership boundary to have missed.
+
+    Matched by importing each configured resolver path and checking
+    issubclass against HeaderResolver / JWTClaimResolver, not by string
+    suffix like boundary.W002. A consumer subclass
+    (``class MyHeaderResolver(HeaderResolver): ...``) inherits the same
+    trust boundary unless it overrides resolve() to add its own
+    verification, and this check cannot tell those two cases apart from
+    the dotted path alone, so it treats every subclass as client-controlled
+    and lets a consumer who has actually verified membership silence the
+    ID. A path that fails to import is left to boundary.E003 to report;
+    this check has nothing useful to add for a broken path.
+    """
+    from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.resolvers import HeaderResolver, JWTClaimResolver
+
+    if "django.contrib.auth" not in settings.INSTALLED_APPS:
+        return []
+
+    resolver_paths = getattr(
+        settings,
+        "BOUNDARY_RESOLVERS",
+        ["boundary.resolvers.SubdomainResolver"],
+    )
+
+    client_controlled = []
+    for path in resolver_paths:
+        try:
+            resolver_class = import_string(path)
+        except ImportError:
+            continue  # boundary.E003 already reports this path
+        if issubclass(resolver_class, (HeaderResolver, JWTClaimResolver)):
+            client_controlled.append(path)
+
+    if not client_controlled:
+        return []
+
+    return [
+        Warning(
+            "A client-controlled resolver ("
+            + ", ".join(client_controlled)
+            + ") is configured in BOUNDARY_RESOLVERS alongside "
+            "django.contrib.auth. The tenant is taken directly from a "
+            "value the client supplies (a header or an unverified JWT "
+            "claim), so any authenticated caller can name any tenant. "
+            "boundary resolves tenancy; it does not check that the "
+            "authenticated principal is a member of the resolved tenant.",
+            hint=(
+                "Add a check, after TenantMiddleware and your "
+                "authentication middleware, that the authenticated user is "
+                "a member of request.tenant, and return 403 otherwise. See "
+                "docs/how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution. "
+                "If icv-identity is installed, its own middleware provides "
+                "this per ADR-025 T1 and you should not hand-roll it. If "
+                "you have already handled membership elsewhere, silence "
+                "boundary.W006 in SILENCED_SYSTEM_CHECKS."
+            ),
+            id="boundary.W006",
         )
     ]
 
