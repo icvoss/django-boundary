@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-03
+
 ### Added
 
 - **`boundary.E005`: error when `BOUNDARY_REGIONS` is configured but

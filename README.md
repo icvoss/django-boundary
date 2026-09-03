@@ -483,6 +483,34 @@ System checks, regional routing, and RLS verification all use
 `is_tenant_model()` internally, so custom FK models are automatically
 recognised.
 
+### Cross-tenant foreign key validation
+
+A row correctly scoped to tenant A can still hold a foreign key pointing at
+tenant B's row. Neither isolation layer catches that on its own: the row's
+own `tenant_id` is A, so the ORM filter passes it and the RLS policy
+predicate is satisfied. Tenant-scoped models therefore validate their
+foreign keys on `clean()`:
+
+```python
+booking = Booking(tenant=tenant_a, venue=venue_owned_by_tenant_b)
+booking.full_clean()   # ValidationError, keyed by the FK field
+```
+
+Only foreign keys whose target is itself tenant-scoped and owns a local
+tenant column are checked. A foreign key to `auth.User` or a lookup table
+is skipped, as is a `None` value, and the comparison is against the
+instance's own tenant rather than the active context, so an admin or import
+path operating on another tenant's row is not falsely rejected.
+
+**This fires on `full_clean()` paths only**, most notably `ModelForm`
+validation. Django does not call `clean()` from `save()`, `bulk_create()`,
+`update()`, `bulk_update()` or raw SQL, so a cross-tenant foreign key
+assigned through any of those is written with the reference intact. Where
+your writes go through `save()` in a service function rather than a form,
+validate explicitly. See
+[Isolation layers](docs/explanation/isolation-layers.md) for the full
+threat model.
+
 ---
 
 ## Context
@@ -765,6 +793,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
 | `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
+| `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |
 
 ---
 

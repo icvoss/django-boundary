@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.4.x | Yes       |
+| 0.6.x | Yes       |
 
-Only the latest release in the `0.4.x` series receives security fixes.
+Only the latest release in the `0.6.x` series receives security fixes.
 
 ## Reporting a Vulnerability
 
