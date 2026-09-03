@@ -21,6 +21,17 @@ All notable changes to django-boundary are documented here.
   `SILENCED_SYSTEM_CHECKS`. Fixes #21.
 - **Django 6.1 added to the CI test matrix** and declared via the
   `Framework :: Django :: 6.1` classifier.
+- **`boundary.W007`: warn when `boundary.E006` or `boundary.W003` cannot
+  determine the database state they check.** Both checks previously
+  swallowed any exception from their `pg_class`/`pg_roles` query and
+  reported nothing, which is indistinguishable from "every table is
+  correctly protected" or "this role does not bypass RLS": a permissions
+  error reading `pg_class`, a statement timeout, or a lock made the checks
+  fail open. The exception handling now distinguishes a genuinely
+  unreachable connection (`OperationalError`/`InterfaceError`, e.g. before
+  the database is provisioned, which stays a silent skip as before) from a
+  live connection whose query failed for some other reason, which now
+  raises `boundary.W007` instead of vanishing. Fixes #34.
 
 ### Fixed
 
@@ -62,6 +73,22 @@ All notable changes to django-boundary are documented here.
   so those tests run for real in CI instead of skipping (the `icv_test`
   bootstrap role from the `postgres:16` service image is itself a
   `BYPASSRLS` superuser).
+- **`boundary.E006`'s table lookup is now qualified by OID
+  (`to_regclass()`) instead of an unscoped `relname` match.** Where the
+  same table name exists in more than one schema (a partition archive, a
+  staging schema, a multi-entry `search_path`), the previous query
+  returned one `pg_class` row per matching schema with no `ORDER BY`, and
+  `fetchone()` read whichever row PostgreSQL's planner produced first,
+  which was not reliably the table the model's own table name actually
+  resolves to. The lookup now resolves the table the same way any
+  ordinary query against it would: through `to_regclass()`, which follows
+  the connection's `search_path`. Fixes #34.
+- **`boundary.E006` never had a positive test proving it can report a
+  missing policy.** Every prior test asserted only that it stays silent,
+  so its silence had never been distinguished from an inability to see.
+  The suite now includes a positive control that deliberately leaves RLS
+  absent on a tenant-scoped table and asserts `boundary.E006` fires, paired
+  with the existing "stays silent when protected" case. Fixes #34.
 
 ## [0.5.3] - 2026-08-01
 
