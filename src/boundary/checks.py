@@ -34,6 +34,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_identity_double_resolve())
     errors.extend(_check_rls_bypassable())
     errors.extend(_check_client_controlled_resolver_without_membership_check())
+    errors.extend(_check_regional_router_configured())
 
     return errors
 
@@ -251,6 +252,92 @@ def _check_client_controlled_resolver_without_membership_check():
                 "boundary.W006 in SILENCED_SYSTEM_CHECKS."
             ),
             id="boundary.W006",
+        )
+    ]
+
+
+def _check_regional_router_configured():
+    """E005: BOUNDARY_REGIONS configured but RegionalRouter absent from
+    DATABASE_ROUTERS.
+
+    Per BR-REG-002, RegionalRouter is never added to DATABASE_ROUTERS
+    automatically: the integrator adds it explicitly so the routing
+    configuration is visible, intentional, and auditable in version control.
+    That deliberate omission has a failure mode: a project that sets
+    BOUNDARY_REGIONS to declare its regions, but forgets the DATABASE_ROUTERS
+    line, gets no error. RegionalRouter._route() returns "default" for every
+    query the moment BOUNDARY_REGIONS is truthy but the router itself is
+    never consulted, so every tenant silently reads and writes the default
+    database regardless of its configured region. For a data-residency
+    feature (docs/how-to/deploy-multi-region.md), a silent fallback to the
+    wrong database is a compliance problem, not a cosmetic one (issue #36).
+
+    An empty BOUNDARY_REGIONS ({}) is treated as unconfigured, matching
+    RegionalRouter._route()'s own `if not regions: return "default"` check:
+    a project that has not yet populated any region has not opted into
+    regional routing, so there is nothing for this check to enforce yet.
+
+    Matched by issubclass against RegionalRouter, not by string suffix like
+    boundary.W002. Two things make issubclass the right call here, where
+    W002 uses a suffix match and boundary.W006 already established
+    issubclass as a workable pattern for this module:
+
+    - Django's own DATABASE_ROUTERS accepts either a dotted string (which
+      Django instantiates via import_string) or an already-constructed
+      router instance (django.db.utils.ConnectionRouter.routers). A pure
+      string check cannot see an instance at all, so it would silently
+      pass over a perfectly valid configuration.
+    - Subclassing a Django database router to compose it with other routing
+      concerns (multi-database read replicas, sharding) is an ordinary
+      pattern for this kind of class, even though
+      docs/how-to/deploy-multi-region.md does not itself document
+      subclassing RegionalRouter the way choose-and-order-resolvers.md
+      documents subclassing a resolver. A consumer subclass still performs
+      RegionalRouter's own _route() (or delegates to it via super()), so it
+      still satisfies BR-REG-002's intent: the routing decision is present
+      and explicit in DATABASE_ROUTERS, just wrapped.
+
+    A DATABASE_ROUTERS entry that is a dotted path importing successfully
+    but not a RegionalRouter (or subclass) is not this check's concern; an
+    unimportable path is a Django-level misconfiguration this check does
+    not attempt to diagnose, since DATABASE_ROUTERS has no boundary-owned
+    equivalent of boundary.E003 to defer to.
+    """
+    from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.routing import RegionalRouter
+
+    regions = getattr(settings, "BOUNDARY_REGIONS", None)
+    if not regions:
+        return []
+
+    database_routers = getattr(settings, "DATABASE_ROUTERS", [])
+
+    for entry in database_routers:
+        if isinstance(entry, str):
+            try:
+                router = import_string(entry)
+            except ImportError:
+                continue  # not this check's concern; see docstring
+        else:
+            # Django also accepts a constructed router instance in
+            # DATABASE_ROUTERS; check its class, not the string form.
+            router = type(entry)
+
+        if isinstance(router, type) and issubclass(router, RegionalRouter):
+            return []
+
+    return [
+        Error(
+            "BOUNDARY_REGIONS is configured but 'boundary.routing.RegionalRouter' is not present in DATABASE_ROUTERS.",
+            hint=(
+                "Add 'boundary.routing.RegionalRouter' to DATABASE_ROUTERS. "
+                "Without it, every query silently stays on the 'default' "
+                "database alias regardless of a tenant's configured region: "
+                "see docs/how-to/deploy-multi-region.md#common-pitfalls."
+            ),
+            id="boundary.E005",
         )
     ]
 

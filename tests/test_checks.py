@@ -208,6 +208,154 @@ class TestE001IcvTenantModelFallback:
 
 
 @pytest.mark.django_db
+class TestE005RegionalRouterConfigured:
+    """Issue #36: BOUNDARY_REGIONS documented a system check, boundary.E005,
+    that did not exist anywhere in the package; the README row and the
+    apps.py ready() comment both claimed it. BR-REG-002 requires
+    RegionalRouter be added to DATABASE_ROUTERS explicitly, never
+    automatically, so this configuration is visible and auditable; E005 is
+    what catches the case where an integrator sets BOUNDARY_REGIONS and
+    forgets that step, which otherwise fails silently: RegionalRouter._route()
+    returns "default" for every query the moment BOUNDARY_REGIONS is truthy,
+    with no error and no warning."""
+
+    def test_fires_when_regions_set_and_router_absent(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_router_present(self, settings):
+        """Positive control: the documented configuration from
+        deploy-multi-region.md must not fire."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = ["boundary.routing.RegionalRouter"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_regions_unset(self, settings):
+        """Positive control: without BOUNDARY_REGIONS there is nothing to
+        enforce, regardless of DATABASE_ROUTERS."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = None
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_when_regions_is_empty_dict(self, settings):
+        """Positive control: RegionalRouter._route() treats an empty
+        BOUNDARY_REGIONS the same as unset (`if not regions: return
+        "default"`), so this check must match that, not fire on the
+        presence of the setting alone."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_a_subclass_of_regional_router(self, settings):
+        """Matched by issubclass, not dotted-path suffix: a consumer
+        subclass that composes RegionalRouter with other routing concerns
+        still performs the same routing decision and must not fire."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = ["boundary_testapp.routing.CustomRegionalRouter"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_a_router_instance(self, settings):
+        """Django's own DATABASE_ROUTERS accepts a constructed router
+        instance, not only a dotted string; this check must not crash on
+        one and must recognise a RegionalRouter instance as satisfying the
+        requirement."""
+        from boundary.routing import RegionalRouter
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [RegionalRouter()]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_absent_for_an_unrelated_router_instance(self, settings):
+        """An instance of some other router class must not accidentally
+        satisfy the check."""
+
+        class UnrelatedRouter:
+            def db_for_read(self, model, **hints):
+                return None
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [UnrelatedRouter()]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E005" for e in errors)
+
+    def test_does_not_raise_for_a_router_path_alongside_regional_router(self, settings):
+        """A broken DATABASE_ROUTERS path is not this check's concern, and
+        in practice Django itself refuses an unimportable entry the moment
+        DATABASE_ROUTERS is touched (django.db.utils.ConnectionRouter.routers
+        calls import_string() eagerly, so an unimportable path raises
+        ModuleNotFoundError before this check ever runs, not something this
+        check could catch or needs to). What this check must not do is trip
+        over an *importable* but unrelated entry sitting alongside a valid
+        RegionalRouter path."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = [
+            "boundary_testapp.routing.CustomRegionalRouter",
+            "django.db.utils.ConnectionRouter",
+        ]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E005" for e in errors)
+
+    def test_message_and_hint(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = check_boundary_configuration(None)
+        e005 = next(e for e in errors if e.id == "boundary.E005")
+        assert "BOUNDARY_REGIONS" in e005.msg
+        assert "DATABASE_ROUTERS" in e005.msg
+        assert "boundary.routing.RegionalRouter" in e005.hint
+        assert "DATABASE_ROUTERS" in e005.hint
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        """Issue #31: the whole check module once failed to register at
+        all. Proves E005 actually fires through Django's real check
+        registry (as manage.py check / AppConfig.ready() invoke it), not
+        only when check_boundary_configuration() is called directly."""
+        from django.core.checks.registry import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary.middleware.TenantMiddleware"]
+        settings.BOUNDARY_REGIONS = {"uk": {"ENGINE": "django.db.backends.postgresql"}}
+        settings.DATABASE_ROUTERS = []
+        errors = registry.run_checks()
+        assert any(e.id == "boundary.E005" for e in errors)
+
+
+@pytest.mark.django_db
 class TestW003RlsBypassableRole:
     """Issue #21: warn when the connecting role bypasses RLS entirely.
 

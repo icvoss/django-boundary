@@ -6,6 +6,22 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`boundary.E005`: error when `BOUNDARY_REGIONS` is configured but
+  `RegionalRouter` is absent from `DATABASE_ROUTERS`** (issue #36). The
+  README has documented `boundary.E005` since before 0.5.3; the check
+  itself did not exist anywhere in the package, so any consumer who set
+  `BOUNDARY_REGIONS` and relied on the documented check to catch a missing
+  `DATABASE_ROUTERS` entry got no protection. Per `BR-REG-002`,
+  `RegionalRouter` is never added to `DATABASE_ROUTERS` automatically, so
+  a project that configures regions but forgets that line previously had
+  every query silently stay on the `default` database, with no error and
+  no warning: for a data-residency feature, a silent fallback to the
+  wrong database is a compliance problem. Matched by `issubclass` against
+  `RegionalRouter`, so a consumer subclass, or an already-constructed
+  router instance (Django accepts both forms in `DATABASE_ROUTERS`),
+  satisfies the check. Fires only when `BOUNDARY_REGIONS` is non-empty,
+  matching `RegionalRouter._route()`'s own treatment of an empty dict as
+  "not configured".
 - **`boundary.W006`: warn when a client-controlled resolver is configured
   alongside `django.contrib.auth`** (issue #38). `HeaderResolver` and
   `JWTClaimResolver` (and any subclass of either) take the tenant directly
