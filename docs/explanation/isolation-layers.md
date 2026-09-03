@@ -12,6 +12,16 @@ The effect is that ordinary application code never has to remember to scope its 
 
 The ORM layer is the primary, always-on isolation mechanism. It works on any database backend, including SQLite in tests, because it is pure Python query construction.
 
+**`TenantManager` is designed to be subclassed, not replaced.** A consuming package that owns a manager with its own contract, custom queryset methods, or its own exception raised when no tenant is set, keeps that contract by subclassing `TenantManager` and re-raising, rather than boundary's manager replacing it outright:
+
+```python
+class ArticleManager(TenantManager):
+    def published(self):
+        return self.filter(status="published")
+```
+
+Boundary's tenant filtering, strict-mode branch and auto-populate all run underneath; the package's own methods and exceptions stay in force above it. `TenantManager.from_queryset()` composes the same way when the package also needs a custom queryset: see [Add boundary to an existing app](../how-to/add-boundary-to-an-existing-app.md) for the worked example. See [Scope a package's models into your tenancy](../how-to/scope-a-packages-models.md) for the full worked composition, including the MRO trap that silently drops this manager if the consumer's model subclass declares no `objects` of its own.
+
 ### Database layer: PostgreSQL Row Level Security
 
 The database layer is built from the migration operations in `boundary.migrations_ops`: `EnableRLS`, `CreateTenantPolicy`, and `DropTenantPolicy`. `EnableRLS` runs `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` followed by `FORCE ROW LEVEL SECURITY` so the policy applies even to the table owner. `CreateTenantPolicy` installs two policies and a helper function:
@@ -104,5 +114,6 @@ Boundary surfaces gaps in this posture through system checks: `boundary.E006` fl
 - [Cross-tenant admin operations](../how-to/cross-tenant-admin-operations.md)
 - [Write tenant-safe tests](../how-to/write-tenant-safe-tests.md)
 - [Set up a tenant model](../how-to/set-up-a-tenant-model.md)
+- [Scope a package's models into your tenancy](../how-to/scope-a-packages-models.md)
 - [Choose and order resolvers: Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution)
 - README: [Defence in Depth](../../README.md#how-it-works), [Row Level Security](../../README.md#row-level-security), [Settings Reference](../../README.md#settings-reference)

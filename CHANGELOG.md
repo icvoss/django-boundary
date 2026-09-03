@@ -37,6 +37,18 @@ All notable changes to django-boundary are documented here.
   `SILENCED_SYSTEM_CHECKS` if that describes your deployment. See
   [Constrain SubdomainResolver to your own domain](docs/how-to/choose-and-order-resolvers.md#constrain-subdomainresolver-to-your-own-domain).
 
+- **Documentation: "Scope a package's models into your tenancy"** (issue
+  #27), the pattern ADR-074 D5/D6 mandates for tenant-scoping a third-party
+  ICV package's abstract model, `class Article(TenantMixin, AbstractArticle)`
+  with the manager declared explicitly. No worked example of this composition
+  existed anywhere in the docs before this; every prior mention of
+  `TenantMixin` covered a consumer's own model only. States inline, at the
+  snippet, that a subclass declaring no `objects` silently loses the
+  package's manager to boundary's `TenantManager`, with a green test suite.
+  Also documents that `TenantManager` is intended to be subclassed
+  (`docs/explanation/isolation-layers.md`), so a package keeps its own
+  manager contract while boundary's scoping still applies underneath.
+
 ### Fixed
 
 - **`TenantManager.from_queryset(CustomQuerySet)` now works** (issue #29).
