@@ -39,6 +39,7 @@ nav:
   - How-to guides:
       - Set up a tenant model: how-to/set-up-a-tenant-model.md
       - Add boundary to an existing app: how-to/add-boundary-to-an-existing-app.md
+      - Scope a package's models into your tenancy: how-to/scope-a-packages-models.md
       - Choose and order resolvers: how-to/choose-and-order-resolvers.md
       - Customise the terminology: how-to/customise-terminology.md
       - Write tenant-safe tests: how-to/write-tenant-safe-tests.md

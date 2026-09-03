@@ -15,6 +15,7 @@ the [settings reference](reference/settings.md).
 | Scope a model that reaches the tenant through a relation | [Scope a model through a relation](how-to/scope-models-through-a-relation.md) |
 | Scope a service or task that already holds the tenant | [Scope a function that holds the tenant](how-to/scope-a-function-that-holds-the-tenant.md) |
 | Add boundary to an app that already has data | [Add boundary to an existing app](how-to/add-boundary-to-an-existing-app.md) |
+| Tenant-scope a model an installed package ships | [Scope a package's models into your tenancy](how-to/scope-a-packages-models.md) |
 | Decide how requests map to tenants | [Choose and order resolvers](how-to/choose-and-order-resolvers.md) |
 | Rename "tenant" to merchant, organisation, club | [Customise the terminology](how-to/customise-terminology.md) |
 | Write tests that don't leak across tenants | [Write tenant-safe tests](how-to/write-tenant-safe-tests.md) |
