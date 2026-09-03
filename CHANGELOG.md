@@ -24,6 +24,30 @@ All notable changes to django-boundary are documented here.
 
 ### Fixed
 
+- **`BoundaryConfig._connect_cache_invalidation_signals()` read
+  `BOUNDARY_TENANT_MODEL` directly and returned early when it was unset,
+  ignoring the `ICV_TENANT_MODEL` fallback (ADR-025 T2) that every other
+  resolution site in the package applies.** A project configured with
+  only `ICV_TENANT_MODEL`, the supported configuration that
+  `boundary.E001` explicitly accepts, therefore connected zero
+  `post_save`/`post_delete` receivers on its tenant model, with no error
+  or warning at startup. Resolver-cache entries in `SubdomainResolver`,
+  `HeaderResolver` and `SessionResolver` then went stale for up to
+  `BOUNDARY_RESOLVER_CACHE_TTL` seconds (default 60) on every worker
+  process after a tenant was updated or deleted, so `TenantMiddleware`
+  could keep serving a just-deactivated tenant. The signal connector now
+  calls `boundary.conf.resolve_tenant_model_setting()`, catching
+  `ImproperlyConfigured` to preserve the no-op-when-unset behaviour for a
+  project that has not configured boundary at all yet. Fixes #33.
+- **`test_cache_invalidated_on_save` and `test_cache_expires_after_ttl`
+  asserted `result == tenant_a`, which holds for a cache hit and a cache
+  miss alike, so both passed even with cache invalidation removed
+  entirely.** Both now wrap the post-invalidation resolve in
+  `django_assert_num_queries(1)`, matching the pattern their sibling
+  `test_cache_hit_avoids_query` already used, so they fail if the DB
+  isn't actually queried. A new `test_cache_invalidated_on_delete` adds
+  the coverage that was previously entirely missing for the `post_delete`
+  side of the same signal wiring. Fixes #35.
 - **`boundary.checks` was never imported anywhere the package itself
   runs, so every system check it defines (`E001`, `E003`, `E004`,
   `E006`, `W001`, `W002`, and now `W003`) silently never registered on a
