@@ -2,7 +2,7 @@
 
 All notable changes to django-boundary are documented here.
 
-## [Unreleased]
+## [0.7.0] - 2026-09-03
 
 ### Added
 
