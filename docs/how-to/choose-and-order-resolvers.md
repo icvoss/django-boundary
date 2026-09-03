@@ -22,7 +22,7 @@ All built-ins live in `boundary.resolvers` and subclass `BaseResolver`. Each `re
 
 | Resolver | Reads from | Lookup | Setting |
 |----------|-----------|--------|---------|
-| `SubdomainResolver` | First label of the host (`club-a.example.com`) | `SUBDOMAIN_FIELD` on the tenant model | `BOUNDARY_SUBDOMAIN_FIELD` (default `"slug"`) |
+| `SubdomainResolver` | First label of the host (`club-a.example.com`) | `SUBDOMAIN_FIELD` on the tenant model | `BOUNDARY_SUBDOMAIN_FIELD` (default `"slug"`), `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` (default `None`) |
 | `HeaderResolver` | An HTTP header | UUID pk, then raw pk, then slug | `BOUNDARY_HEADER_NAME` (default `"X-Tenant-ID"`) |
 | `JWTClaimResolver` | The `Authorization: Bearer` token payload | tenant pk from a claim, signature NOT validated | `BOUNDARY_JWT_CLAIM` (default `"tenant_id"`) |
 | `SessionResolver` | The Django session | tenant pk from a session key | `BOUNDARY_SESSION_KEY` (default `"boundary_tenant_id"`) |
@@ -30,7 +30,7 @@ All built-ins live in `boundary.resolvers` and subclass `BaseResolver`. Each `re
 
 When to use each:
 
-- **SubdomainResolver**: public-facing multi-tenant apps where each tenant has its own subdomain. Requires a host with at least three labels (`slug.domain.tld`); a bare `example.com` returns `None`. This is the default when `BOUNDARY_RESOLVERS` is unset.
+- **SubdomainResolver**: public-facing multi-tenant apps where each tenant has its own subdomain. Requires a host with at least three labels (`slug.domain.tld`); a bare `example.com` returns `None`. This is the default when `BOUNDARY_RESOLVERS` is unset. If the deployment serves any host it does not fully control (a customer-owned custom domain, for example), set `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN`; see [Constrain SubdomainResolver to your own domain](#constrain-subdomainresolver-to-your-own-domain) below.
 - **HeaderResolver**: internal or service-to-service APIs where a trusted client names the tenant. It tries the header value as a UUID pk, then as a raw pk, then as a slug (`SUBDOMAIN_FIELD`), so both `X-Tenant-ID: <uuid>` and `X-Tenant-ID: club-a` work. **Client-controlled**: any caller can set the header to any value, so the resolved tenant is whatever the caller asked for, not necessarily one they belong to. If the application has authenticated users, pair this with the membership check in [Enforce membership after resolution](#enforce-membership-after-resolution); `boundary.W006` warns when it is missing.
 - **JWTClaimResolver**: APIs that already authenticate with a bearer token carrying the tenant in a claim. It base64-decodes the JWT payload and reads the claim, but does NOT verify the signature, so put real token verification (for example DRF auth or an upstream gateway) in front of it. The claim value must be the tenant pk. **Client-controlled**: boundary trusts whatever the claim says once the token's signature has been verified elsewhere; a valid token proves who the caller is, not which tenants they may act as. The same membership check applies as for `HeaderResolver`.
 - **SessionResolver**: server-rendered apps where the user selects or is assigned a tenant and you store its pk in `request.session[BOUNDARY_SESSION_KEY]`. Not client-controlled in the header/JWT sense (the client cannot set an arbitrary session value by tampering with a cookie), but the trust boundary shifts to whatever server-side code writes that session key: if a "switch tenant" view sets it from a client-supplied id without checking membership first, the same gap reappears one layer up.
@@ -66,6 +66,25 @@ BOUNDARY_SESSION_KEY = "boundary_tenant_id"  # session key SessionResolver reads
 Note that `HeaderResolver`'s slug fallback uses `BOUNDARY_SUBDOMAIN_FIELD`, not a separate setting.
 
 The full settings table is in the [settings reference](../reference/settings.md).
+
+### Constrain SubdomainResolver to your own domain
+
+`SubdomainResolver.resolve()` takes the first label of any host with three or more labels and looks it up as a tenant slug. It does not check that the host is one your deployment actually intends to serve; it only checks that the *shape* looks like `slug.domain.tld`. `ALLOWED_HOSTS` constrains which hosts Django will answer at all, but a deployment that serves several domains behind one `ALLOWED_HOSTS` entry (a wildcard, or a list that includes customer-owned custom domains alongside your own platform subdomains) still lets every one of those hosts through to `SubdomainResolver`.
+
+This matters because a foreign host can collide with a tenant slug by accident. If your platform has a tenant slugged `shop`, and a customer separately points their own domain `shop.example.co.uk` (a domain you never intended to serve tenant-by-subdomain traffic on, but that still passes `ALLOWED_HOSTS` because it is on the customer's custom-domain allowlist for a different feature) at your application, `SubdomainResolver` resolves the `shop` tenant for it, because the first label matches, with no check that `example.co.uk` is a domain you control. That is cross-tenant serving: a request meant for one customer's custom domain gets served in the security context of an unrelated tenant.
+
+`BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` closes this by constraining `SubdomainResolver` to hosts that are exactly one label above a domain (or one of several domains) you name explicitly:
+
+```python
+# settings.py
+BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = "example.com"
+# or, for a deployment serving several parent domains:
+BOUNDARY_SUBDOMAIN_PARENT_DOMAIN = ["example.com", "example.co.uk"]
+```
+
+With this set, `club-a.example.com` still resolves the `club-a` tenant, but `club-a.evil.org` returns `None` even though it has three labels and would otherwise have matched. Matching is case-insensitive, by label boundary rather than substring (`evilexample.com` and `evil-example.com` do not match a parent of `example.com`), and exactly one level deep (`club-a.staging.example.com` does not match a parent of `example.com`; only `club-a.example.com` does).
+
+**This setting is opt-in and unset by default**, which preserves the exact pre-existing behaviour for backwards compatibility. `boundary.W008` warns at startup when `SubdomainResolver` is configured without it, as a prompt to make a deliberate choice rather than an error, because a deployment whose `ALLOWED_HOSTS` is already a small, fully-trusted, closed list has nothing to gain from it. If that describes your deployment, silence `boundary.W008` in `SILENCED_SYSTEM_CHECKS` rather than leaving the warning unaddressed.
 
 ### 4. Write a custom resolver
 
@@ -200,6 +219,7 @@ If `icv-identity` is installed, it owns the tenant domain model and provides its
 - **Assuming `JWTClaimResolver` validates the token.** It decodes the payload without verifying the signature. Authenticate the token separately before relying on the resolved tenant.
 - **Assuming resolution is authorisation.** Neither `HeaderResolver` nor `JWTClaimResolver` checks that the caller belongs to the tenant they named; they just read the value. See [Enforce membership after resolution](#enforce-membership-after-resolution) above. `boundary.W006` exists specifically to catch this gap in the one configuration where it bites: a client-controlled resolver alongside `django.contrib.auth`.
 - **Subdomain lookups on a two-label host.** `SubdomainResolver` returns `None` for `example.com` because it needs at least three labels. Local development on `localhost` will not resolve; use a `*.localhost` style host or a different resolver in dev.
+- **Assuming `ALLOWED_HOSTS` is a domain boundary.** It constrains which hosts Django answers at all, not which hosts `SubdomainResolver` should resolve tenants from. A deployment serving customer-owned custom domains alongside platform subdomains needs `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` too; see [Constrain SubdomainResolver to your own domain](#constrain-subdomainresolver-to-your-own-domain).
 - **Wrong lookup field.** `SubdomainResolver` and the `HeaderResolver` slug fallback both look up `BOUNDARY_SUBDOMAIN_FIELD` (default `"slug"`). If your tenant key column has another name, set it once via `BOUNDARY_SUBDOMAIN_FIELD`.
 - **Claim or session value is not the pk.** `JWTClaimResolver` and `SessionResolver` look up the tenant by primary key. Store the tenant pk, not its slug, in the claim or session.
 - **Letting `resolve` raise.** A raised exception is logged and skipped per resolver, but you lose control over the fallback. Catch and return `None` yourself.

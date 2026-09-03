@@ -132,7 +132,7 @@ Ordered list of dotted-path resolver class names. `TenantMiddleware` tries each 
 
 **Security note:** Resolver order determines precedence. Placing `HeaderResolver` first allows any HTTP client to set the tenant by sending a header. For public-facing applications keep `HeaderResolver` last or omit it. This governs precedence *within* the chain; it does not substitute for the membership check above, which applies regardless of where a client-controlled resolver sits in the order.
 
-**System check:** `boundary.E003` (Error) fires for any class path in this list that cannot be imported. `boundary.W006` (Warning) fires when a client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass of either) is configured alongside `django.contrib.auth`.
+**System check:** `boundary.E003` (Error) fires for any class path in this list that cannot be imported. `boundary.W006` (Warning) fires when a client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass of either) is configured alongside `django.contrib.auth`. `boundary.W008` (Warning) fires when `SubdomainResolver` (or a subclass) is configured without `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN`.
 
 **A note on `SessionResolver`:** the session key itself lives server-side and cannot be forged by tampering with a cookie the way a header can be, but that only holds if nothing in your application lets an authenticated user set `request.session[BOUNDARY_SESSION_KEY]` to an arbitrary value without a membership check of its own (a "switch tenant" view that trusts a client-supplied tenant id, for example). Treat the *code that writes the session key* as the trust boundary to audit, not the resolver.
 
@@ -150,6 +150,25 @@ The field on the tenant model that `SubdomainResolver` uses for the lookup. The 
 **When to change it:** If your tenant model uses a field other than `slug` to identify tenants by subdomain -- for example, `"domain"` or `"short_code"`.
 
 **Interactions:** Only used by `SubdomainResolver`. Has no effect if that resolver is not in `BOUNDARY_RESOLVERS`.
+
+---
+
+### `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN`
+
+| | |
+|---|---|
+| **Type** | `str \| list[str] \| None` |
+| **Default** | `None` |
+
+Constrains `SubdomainResolver` to hosts that are exactly `<one-label>.<parent-domain>` for one of the configured parent domains. Accepts a single domain string, a list of domain strings (for a deployment that legitimately serves several parent domains, for example `app.example.com` and `app.example.co.uk`), or `None`. Matching is case-insensitive and by label boundary, not substring: `example.com` matches `club-a.example.com` but not `evilexample.com`, `evil-example.com`, or `club-a.staging.example.co.uk` (a different depth). A trailing dot on the incoming host (`club-a.example.com.`) is stripped before matching, since it denotes the same fully-qualified hostname.
+
+**When to change it:** Set this whenever `SubdomainResolver` is configured and the deployment's `ALLOWED_HOSTS` is not a small, fully-trusted, closed list -- in particular whenever any customer-owned custom domain is served from the same resolver chain as platform subdomains. Without it, `SubdomainResolver` takes the first label of *any* host with three or more labels and looks it up as a tenant slug, so a foreign host whose first label happens to collide with a tenant slug (`shop.example.co.uk` on a deployment that never intended to serve that host) resolves the wrong tenant. That is cross-tenant serving.
+
+**Default is unset for backwards compatibility.** Leaving it unset preserves the exact pre-existing `SubdomainResolver` behaviour (any three-plus-label host resolves its first label). This is a deliberate compatibility default, not a recommendation: a deployment that serves any host it does not fully control should set this.
+
+**Interactions:** Only used by `SubdomainResolver` (and its subclasses). Has no effect if that resolver is not in `BOUNDARY_RESOLVERS`.
+
+**System check:** `boundary.W008` (Warning) fires when `SubdomainResolver` (or a subclass) is configured in `BOUNDARY_RESOLVERS` and this setting is unset.
 
 ---
 

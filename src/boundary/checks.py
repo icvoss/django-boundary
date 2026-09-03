@@ -35,6 +35,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_rls_bypassable())
     errors.extend(_check_client_controlled_resolver_without_membership_check())
     errors.extend(_check_regional_router_configured())
+    errors.extend(_check_subdomain_resolver_without_parent_domain())
 
     return errors
 
@@ -338,6 +339,83 @@ def _check_regional_router_configured():
                 "see docs/how-to/deploy-multi-region.md#common-pitfalls."
             ),
             id="boundary.E005",
+        )
+    ]
+
+
+def _check_subdomain_resolver_without_parent_domain():
+    """W008: warn when SubdomainResolver is configured without
+    BOUNDARY_SUBDOMAIN_PARENT_DOMAIN.
+
+    Per BR-RES-010 (issue #22): SubdomainResolver.resolve() takes the first
+    label of any host with three or more labels and looks it up as a tenant
+    slug, with no check that the host belongs to the deployment's own
+    domain. A deployment that serves both platform subdomains and
+    customer-owned custom domains from the same resolver chain will resolve
+    the WRONG tenant for a foreign host whose first label happens to match a
+    tenant slug: `shop.example.co.uk`, a domain the deployment never
+    intended to serve, still resolves whichever tenant is slugged `shop`.
+    That is cross-tenant serving.
+
+    BOUNDARY_SUBDOMAIN_PARENT_DOMAIN closes this by constraining resolution
+    to hosts that are exactly one label above one of the configured parent
+    domains. Leaving it unset preserves the pre-existing behaviour (a
+    project with a single, closed set of hosts behind ALLOWED_HOSTS may
+    never hit the foreign-host case in practice), so this check is a
+    Warning, not an Error, and does not fire unless SubdomainResolver (or a
+    subclass) is actually configured.
+
+    Matched by issubclass against SubdomainResolver, following the pattern
+    boundary.W006 already established for this module: a consumer subclass
+    inherits the same unconstrained-host behaviour unless it overrides
+    resolve() itself, and issubclass sees that where a dotted-path suffix
+    match would not. A path that fails to import is left to boundary.E003
+    to report; this check has nothing useful to add for a broken path.
+    """
+    from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.resolvers import SubdomainResolver
+
+    if getattr(settings, "BOUNDARY_SUBDOMAIN_PARENT_DOMAIN", None):
+        return []
+
+    resolver_paths = getattr(
+        settings,
+        "BOUNDARY_RESOLVERS",
+        ["boundary.resolvers.SubdomainResolver"],
+    )
+
+    unconstrained = []
+    for path in resolver_paths:
+        try:
+            resolver_class = import_string(path)
+        except ImportError:
+            continue  # boundary.E003 already reports this path
+        if issubclass(resolver_class, SubdomainResolver):
+            unconstrained.append(path)
+
+    if not unconstrained:
+        return []
+
+    return [
+        Warning(
+            "SubdomainResolver (" + ", ".join(unconstrained) + ") is configured "
+            "in BOUNDARY_RESOLVERS without BOUNDARY_SUBDOMAIN_PARENT_DOMAIN. It "
+            "resolves the first label of ANY host with three or more labels, "
+            "including a foreign host outside your own domain whose first "
+            "label happens to match a tenant slug.",
+            hint=(
+                "Set BOUNDARY_SUBDOMAIN_PARENT_DOMAIN to your deployment's own "
+                "parent domain (or a list of them) so SubdomainResolver only "
+                "resolves a host that is exactly <slug>.<your-domain>. See "
+                "docs/how-to/choose-and-order-resolvers.md#constrain-subdomainresolver-to-your-own-domain. "
+                "If every host this deployment serves is already guaranteed to "
+                "be your own (ALLOWED_HOSTS is a closed list with no "
+                "customer-owned custom domains), silence boundary.W008 in "
+                "SILENCED_SYSTEM_CHECKS."
+            ),
+            id="boundary.W008",
         )
     ]
 
