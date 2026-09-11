@@ -78,6 +78,10 @@ class _Settings:
         return _setting("BOUNDARY_WRAP_ATOMIC", True)
 
     @property
+    def SET_DB_SESSION_VAR(self):  # noqa: N802
+        return _setting("BOUNDARY_SET_DB_SESSION_VAR", True)
+
+    @property
     def RESOLVERS(self):  # noqa: N802
         return _setting("BOUNDARY_RESOLVERS", ["boundary.resolvers.SubdomainResolver"])
 

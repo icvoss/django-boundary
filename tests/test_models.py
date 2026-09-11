@@ -218,6 +218,29 @@ class TestBulkUpdate:
             with pytest.raises(ValueError, match="Cross-tenant"):
                 Booking.objects.bulk_update([booking_b], ["is_paid"])
 
+    def test_bulk_update_accepts_same_tenant(self, tenant_a):
+        """Positive control for AC-ORM-014 (issue #57).
+
+        The sibling negative test above proves bulk_update() rejects a
+        cross-tenant object; nothing proved the ordinary same-tenant case
+        still calls through to Django's own bulk_update() and succeeds.
+        Asserting only the absence of an exception would pass against a
+        silently no-op implementation, so this re-reads both rows from the
+        database afterwards and asserts the change actually persisted.
+        """
+        from boundary_testapp.models import Booking
+
+        with set_tenant(tenant_a):
+            booking_1 = Booking.objects.create(court=1)
+            booking_2 = Booking.objects.create(court=2)
+
+            booking_1.is_paid = True
+            booking_2.is_paid = True
+            Booking.objects.bulk_update([booking_1, booking_2], ["is_paid"])
+
+            assert Booking.objects.get(pk=booking_1.pk).is_paid is True
+            assert Booking.objects.get(pk=booking_2.pk).is_paid is True
+
 
 @pytest.mark.django_db
 class TestAbstractTenant:

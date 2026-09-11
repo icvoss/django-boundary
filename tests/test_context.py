@@ -189,6 +189,47 @@ class TestTenantContextDBSession:
 
 
 @pytest.mark.django_db(transaction=True)
+class TestSetDbSessionVarOptOut:
+    """Issue #53: BOUNDARY_SET_DB_SESSION_VAR gates whether the session
+    variable is written at all.
+
+    The "off" arm asserts zero queries with django_assert_num_queries(0):
+    if _set_db_session/_clear_db_session were made to issue SQL regardless
+    of the setting, this would fail on a query count, not on an exception.
+    The "on" arm re-proves today's behaviour is unchanged at the default.
+    """
+
+    def _get_session_var(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('app.current_tenant_id', true)")
+            return cursor.fetchone()[0]
+
+    def test_opt_out_issues_no_queries_on_set_and_clear(self, tenant_a, settings, django_assert_num_queries):
+        from django.db import transaction
+
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        with transaction.atomic():
+            with django_assert_num_queries(0):
+                token = TenantContext.set(tenant_a)
+            with django_assert_num_queries(0):
+                TenantContext.clear(token)
+
+    def test_default_still_issues_the_set_config_queries(self, tenant_a, settings, django_assert_num_queries):
+        from django.db import transaction
+
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+
+        with transaction.atomic():
+            with django_assert_num_queries(1):
+                token = TenantContext.set(tenant_a)
+            assert self._get_session_var() == str(tenant_a.pk)
+            with django_assert_num_queries(1):
+                TenantContext.clear(token)
+            assert self._get_session_var() == ""
+
+
+@pytest.mark.django_db(transaction=True)
 class TestTenantContextSavepointBehaviour:
     """AC-CTX-008: Nested context restores DB session variable after savepoint."""
 
