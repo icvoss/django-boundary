@@ -100,6 +100,12 @@ def _ensure_atomic(using: str = "default"):
         # in BOUNDARY_REGIONS but not in DATABASES, typically in tests that
         # only want to verify routing logic). Treat as safe no-op: tests that
         # mock _set_db_session/_clear_db_session don't require actual atomicity.
+        # Debug, not warning (issue #56): the contract classifies this branch
+        # as deliberate tolerance, not a correctness risk.
+        logger.debug(
+            "No connection configured for alias; skipping atomic wrap",
+            extra={"using": using},
+        )
         return nullcontext()
     if not boundary_settings.WRAP_ATOMIC:
         if not connection.in_atomic_block:
@@ -289,6 +295,15 @@ class TenantContext:
                     "SELECT set_config(%s, %s, true)",
                     [boundary_settings.DB_SESSION_VAR, tenant_id],
                 )
+        else:
+            # RLS risk (issue #56): the ContextVar is set, but the DB session
+            # variable is not, because the connection was never opened. If
+            # this connection is later opened without going through this call
+            # again, RLS on it sees no tenant.
+            logger.warning(
+                "Skipped setting DB session variable: connection not open",
+                extra={"using": using, "tenant_id": tenant_id},
+            )
 
     @staticmethod
     def _clear_db_session(using: str = "default") -> None:
@@ -300,6 +315,14 @@ class TenantContext:
                     "SELECT set_config(%s, '', true)",
                     [boundary_settings.DB_SESSION_VAR],
                 )
+        else:
+            # RLS risk (issue #56): see the matching branch in
+            # _set_db_session. The ContextVar is cleared, but there is no
+            # open connection to clear the DB session variable on.
+            logger.warning(
+                "Skipped clearing DB session variable: connection not open",
+                extra={"using": using},
+            )
 
     @staticmethod
     def invalidate_cache(tenant) -> None:
@@ -450,10 +473,26 @@ def admin_bypass(*, using: str = "default"):
                     # Only the call that actually turned the flag on clears
                     # it; an inner nested call leaves an outer call's bypass
                     # active for the outer call to clear.
-                    with connection.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT set_config(%s, '', true)",
-                            [boundary_settings.ADMIN_FLAG_VAR],
+                    #
+                    # Guarded (issue #60): if the caller's block raised inside
+                    # a transaction that is now aborted, an unguarded execute
+                    # here would raise TransactionManagementError, which
+                    # replaces the caller's original exception rather than
+                    # propagating alongside it. Best-effort cleanup only; a
+                    # failed clear can leave the bypass flag set on this
+                    # connection until it next recycles. Mirrors the pattern
+                    # at TenantContext.using() and TenantContext.clear().
+                    try:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT set_config(%s, '', true)",
+                                [boundary_settings.ADMIN_FLAG_VAR],
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Failed to clear admin bypass flag",
+                            extra={"flag_var": boundary_settings.ADMIN_FLAG_VAR, "using": using},
+                            exc_info=True,
                         )
     finally:
         _admin_bypass_depth.reset(depth_token)

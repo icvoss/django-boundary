@@ -21,6 +21,34 @@ logger = logging.getLogger("boundary.routing")
 
 _region_override: ContextVar[str | None] = ContextVar("boundary_region_override", default=None)
 
+# Warn-once cache for the "tenant has a region, but it is not in
+# BOUNDARY_REGIONS" fallback (issue #59). _route() runs on every ORM query,
+# so an unconditional warning would flood; this is usually configuration
+# drift (a decommissioned region, a bad write), not an expected routing
+# case, so it deserves one warning per (tenant, region) pair rather than
+# silence. Bounded so a process that churns through many distinct
+# (tenant, region) pairs cannot grow this without limit: past the cap,
+# further distinct pairs stop producing warnings for the rest of the
+# process's life (a broad reset rather than a precise LRU, judged
+# acceptable because the condition is a one-off config fix, not an ongoing
+# per-tenant signal).
+_MAX_UNMATCHED_REGION_WARNINGS = 10_000
+_warned_unmatched_regions: set[tuple[str, str | None]] = set()
+
+
+def _warn_unmatched_region_once(tenant_pk: str, region: str | None) -> None:
+    """Log a warning for an unmatched tenant region, at most once per pair."""
+    key = (tenant_pk, region)
+    if key in _warned_unmatched_regions:
+        return
+    if len(_warned_unmatched_regions) >= _MAX_UNMATCHED_REGION_WARNINGS:
+        _warned_unmatched_regions.clear()
+    _warned_unmatched_regions.add(key)
+    logger.warning(
+        "Tenant region not in BOUNDARY_REGIONS, falling back to default",
+        extra={"tenant_id": tenant_pk, "region": region},
+    )
+
 
 class RegionalRouter:
     """Django database router that routes tenant-scoped queries by region.
@@ -69,10 +97,14 @@ class RegionalRouter:
         region_field = boundary_settings.REGION_FIELD
         region = getattr(tenant, region_field, None)
         if not region or region not in regions:
+            # Keep the debug line for full-detail tracing, plus a warning
+            # (issue #59) so a misconfigured tenant is operator-visible even
+            # when debug logging is off, without flooding on every query.
             logger.debug(
                 "Region not in BOUNDARY_REGIONS, falling back to default",
                 extra={"tenant_id": str(tenant.pk), "region": region},
             )
+            _warn_unmatched_region_once(str(tenant.pk), region)
             return "default"
 
         logger.debug(
