@@ -44,3 +44,19 @@ class AdminBypassNotActiveError(BoundaryError):
     postcondition and raising here surfaces the misconfiguration at the
     point of entry instead.
     """
+
+
+class RLSNotEnforcedError(BoundaryError):
+    """assert_rls_enforced() found the connecting role or a tenant table is
+    not actually enforcing Row Level Security (issue #55).
+
+    Raised rather than returning a bool so a consumer who calls the
+    assertion directly (outside the pytest fixture wrapper) cannot
+    accidentally ignore a falsy return value. The message names which of
+    the two conditions failed and the value observed, so the run stops
+    loudly instead of the suite proceeding to pass every isolation test
+    vacuously against a bypassing connection or an unprotected table
+    (the same trap boundary.W003 and boundary.E006 diagnose at
+    ``manage.py check`` time, but that check never runs under a plain
+    ``pytest`` invocation).
+    """
