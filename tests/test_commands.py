@@ -74,6 +74,7 @@ class TestBoundaryProvision:
             sys.path.remove(str(tmp_path))
             settings.BOUNDARY_POST_PROVISION_HOOK = None
 
+    @pytest.mark.django_db(databases=["default", "eu-west"])
     def test_writes_to_regional_database(self, capsys, settings):
         """Issue #62: with BOUNDARY_REGIONS configured, a tenant provisioned
         with --region must land on that region's own database alias, not
@@ -114,6 +115,7 @@ class TestBoundaryProvision:
 
         assert not Tenant.objects.using("default").filter(slug="bad-region-club").exists()
 
+    @pytest.mark.django_db(databases=["default", "eu-west"])
     def test_hook_fires_once_for_regional_tenant(self, settings, tmp_path):
         """Issue #62: the post-provision hook must still fire exactly once,
         after the row is written, with the same tenant argument as today,
@@ -122,9 +124,7 @@ class TestBoundaryProvision:
         calls_file = tmp_path / "calls.txt"
         hook_module = tmp_path / "region_hook.py"
         hook_module.write_text(
-            f"def hook(tenant):\n"
-            f"    with open('{calls_file}', 'a') as f:\n"
-            f"        f.write(str(tenant.pk) + chr(10))\n"
+            f"def hook(tenant):\n    with open('{calls_file}', 'a') as f:\n        f.write(str(tenant.pk) + chr(10))\n"
         )
         import sys
 
