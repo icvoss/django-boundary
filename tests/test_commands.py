@@ -74,6 +74,81 @@ class TestBoundaryProvision:
             sys.path.remove(str(tmp_path))
             settings.BOUNDARY_POST_PROVISION_HOOK = None
 
+    def test_writes_to_regional_database(self, capsys, settings):
+        """Issue #62: with BOUNDARY_REGIONS configured, a tenant provisioned
+        with --region must land on that region's own database alias, not
+        "default". Asserts row presence on both aliases directly, not a
+        mocked create(using=...) call, so the test fails on the unfixed
+        command (which calls TenantModel.objects.create(**kwargs) with no
+        using=, landing every row on "default" regardless of --region).
+        """
+        from boundary_testapp.models import Tenant
+
+        settings.BOUNDARY_REGIONS = {"eu-west": {"ENGINE": "django.db.backends.sqlite3"}}
+
+        call_command(
+            "boundary_provision",
+            name="EU Club",
+            slug="eu-region-club",
+            region="eu-west",
+        )
+
+        assert Tenant.objects.using("eu-west").filter(slug="eu-region-club").exists()
+        assert not Tenant.objects.using("default").filter(slug="eu-region-club").exists()
+
+    def test_unknown_region_raises_command_error(self, settings):
+        """Issue #62: a --region not present in BOUNDARY_REGIONS must fail
+        the command rather than silently writing to "default".
+        """
+        settings.BOUNDARY_REGIONS = {"eu-west": {"ENGINE": "django.db.backends.sqlite3"}}
+
+        with pytest.raises(CommandError, match="ap-southeast"):
+            call_command(
+                "boundary_provision",
+                name="Bad Region Club",
+                slug="bad-region-club",
+                region="ap-southeast",
+            )
+
+        from boundary_testapp.models import Tenant
+
+        assert not Tenant.objects.using("default").filter(slug="bad-region-club").exists()
+
+    def test_hook_fires_once_for_regional_tenant(self, settings, tmp_path):
+        """Issue #62: the post-provision hook must still fire exactly once,
+        after the row is written, with the same tenant argument as today,
+        when the tenant is written to a regional alias.
+        """
+        calls_file = tmp_path / "calls.txt"
+        hook_module = tmp_path / "region_hook.py"
+        hook_module.write_text(
+            f"def hook(tenant):\n"
+            f"    with open('{calls_file}', 'a') as f:\n"
+            f"        f.write(str(tenant.pk) + chr(10))\n"
+        )
+        import sys
+
+        sys.path.insert(0, str(tmp_path))
+        try:
+            settings.BOUNDARY_REGIONS = {"eu-west": {"ENGINE": "django.db.backends.sqlite3"}}
+            settings.BOUNDARY_POST_PROVISION_HOOK = "region_hook.hook"
+
+            call_command(
+                "boundary_provision",
+                name="Hooked Regional Club",
+                slug="hooked-regional-club",
+                region="eu-west",
+            )
+
+            from boundary_testapp.models import Tenant
+
+            tenant = Tenant.objects.using("eu-west").get(slug="hooked-regional-club")
+            recorded_calls = calls_file.read_text().splitlines()
+            assert recorded_calls == [str(tenant.pk)]
+        finally:
+            sys.path.remove(str(tmp_path))
+            settings.BOUNDARY_POST_PROVISION_HOOK = None
+
 
 @pytest.mark.django_db
 class TestBoundaryDeprovision:

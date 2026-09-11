@@ -206,6 +206,17 @@ raises `RegionNotConfiguredError` if `BOUNDARY_REGIONS` is unset, no tenant is
 active, or the tenant's region is not configured. Use it at provisioning time or
 before a regional job to reject unroutable tenants before any query runs.
 
+`manage.py boundary_provision` is the supported provisioning path when
+`BOUNDARY_REGIONS` is set: it resolves `--region` with `require_region()` and
+writes the tenant row to that region's own database alias, or fails with a
+`CommandError` naming the region and the configured keys if the region is not
+one of them. `RegionalRouter._route()` always returns `default` during
+provisioning, because no tenant is active in `TenantContext` yet, so creating
+a tenant through any other route, the ORM directly, the admin, a signup view,
+leaves the consumer responsible for writing the row to the correct alias
+themselves (for example with `tenant.save(using=region)`), the same way
+`boundary_provision` does internally.
+
 ## Common pitfalls
 
 - **Region key does not match a database alias.** A `BOUNDARY_REGIONS` key is

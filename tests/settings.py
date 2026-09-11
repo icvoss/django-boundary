@@ -25,7 +25,16 @@ DATABASES = {
         "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "icv_test_password"),
         "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
         "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-    }
+    },
+    # A second, genuinely separate alias for regional-routing tests that
+    # must prove a row landed on a non-default database (issue #62). SQLite
+    # keeps this alias free of the PostgreSQL fixture/role setup the tests
+    # above need, since these tests only exercise Command.save(using=...)
+    # against a plain table, never RLS.
+    "eu-west": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": ":memory:",
+    },
 }
 
 MIGRATION_MODULES = {
