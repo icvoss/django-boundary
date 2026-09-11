@@ -36,6 +36,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_client_controlled_resolver_without_membership_check())
     errors.extend(_check_regional_router_configured())
     errors.extend(_check_subdomain_resolver_without_parent_domain())
+    errors.extend(_check_db_session_var_disabled_with_rls_enabled())
 
     return errors
 
@@ -568,6 +569,100 @@ def _check_rls_enabled():
                         "SELECT on pg_class, and investigate the underlying "
                         "error before treating the absence of boundary.E006 "
                         "as a pass."
+                    ),
+                    id="boundary.W007",
+                )
+            )
+
+    return errors
+
+
+def _check_db_session_var_disabled_with_rls_enabled():
+    """W009: warn when BOUNDARY_SET_DB_SESSION_VAR is off but RLS is live.
+
+    Issue #53 added BOUNDARY_SET_DB_SESSION_VAR (default True) so a
+    deployment using boundary for ORM-layer scoping only, with no RLS
+    policies enabled, can skip the set_config() round trip on every context
+    entry and exit. RLS enforcement depends entirely on that session
+    variable: a deployment that has since enabled RLS on a tenant table but
+    left the opt-out on would silently stop writing the variable RLS reads,
+    which is a genuine isolation failure, not a performance choice. This
+    check closes that footgun by firing only when both conditions hold at
+    once.
+
+    Reuses the same pg_class probe as ``_check_rls_enabled`` (boundary.E006):
+    ``to_regclass()`` resolves the table through the connection's own
+    search_path exactly as an ordinary query would, avoiding the
+    unqualified ``WHERE relname = %s`` ambiguity issue #34 identified.
+    PostgreSQL-only and skipped when the database is unavailable, matching
+    E006's own gates; a table that does not exist yet (pre-migration) has
+    nothing for this check to warn about either.
+    """
+    from django.apps import apps
+    from django.conf import settings
+    from django.db import connection
+
+    if getattr(settings, "BOUNDARY_SET_DB_SESSION_VAR", True):
+        return []
+
+    if connection.vendor != "postgresql":
+        return []
+
+    model_string = getattr(settings, "BOUNDARY_TENANT_MODEL", None) or getattr(settings, "ICV_TENANT_MODEL", None)
+    if not model_string:
+        return []  # E001 will catch this
+
+    from boundary.models import has_tenant_column, is_tenant_model
+
+    errors = []
+    for model in apps.get_models():
+        if not is_tenant_model(model):
+            continue
+        if model._meta.abstract:
+            continue
+        if not has_tenant_column(model):
+            continue
+
+        table = model._meta.db_table
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
+                    [table],
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    continue
+                rls_enabled, rls_forced = row
+                if rls_enabled and rls_forced:
+                    errors.append(
+                        Warning(
+                            f"BOUNDARY_SET_DB_SESSION_VAR is False but table '{table}' "
+                            f"(model {model.__name__}) has Row Level Security enabled "
+                            f"and forced. RLS depends on the session variable this "
+                            f"setting disables writing, so tenant isolation on this "
+                            f"table is not actually enforced.",
+                            hint=(
+                                "Set BOUNDARY_SET_DB_SESSION_VAR = True (the default), "
+                                "or remove RLS from this table if the opt-out is "
+                                "intentional. See the BOUNDARY_SET_DB_SESSION_VAR entry "
+                                "in README.md."
+                            ),
+                            id="boundary.W009",
+                        )
+                    )
+        except _CONNECTION_UNAVAILABLE_ERRORS:
+            continue
+        except Exception as exc:
+            errors.append(
+                Warning(
+                    f"Could not determine Row Level Security state for table "
+                    f"'{table}' (model {model.__name__}) while checking "
+                    f"BOUNDARY_SET_DB_SESSION_VAR: {exc}",
+                    hint=(
+                        "The database connection is available but the query "
+                        "against pg_class failed, so boundary.W009 could not "
+                        "verify this table."
                     ),
                     id="boundary.W007",
                 )

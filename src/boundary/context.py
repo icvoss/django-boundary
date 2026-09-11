@@ -279,9 +279,19 @@ class TenantContext:
     def _set_db_session(tenant_id: str, using: str = "default") -> None:
         """Set the PostgreSQL session variable via parameterised set_config().
 
-        Uses SELECT set_config(%s, %s, true) — the third argument scopes
+        Uses SELECT set_config(%s, %s, true): the third argument scopes
         the setting to the current transaction (BR-CTX-002).
+
+        Gated by ``BOUNDARY_SET_DB_SESSION_VAR`` (default ``True``, issue
+        #53): a deployment that uses boundary for ORM-layer scoping only,
+        with no RLS policies enabled, pays a round trip per context entry
+        and exit for a session variable nothing reads. Setting it to
+        ``False`` returns before issuing any SQL. ``BOUNDARY_DB_SESSION_VAR``
+        itself stays a pure name so ``migrations_ops.py``, which reads the
+        same name for RLS policy definitions, is unaffected by this opt-out.
         """
+        if not boundary_settings.SET_DB_SESSION_VAR:
+            return
         connection = connections[using]
         if connection.connection is not None:
             with connection.cursor() as cursor:
@@ -292,7 +302,13 @@ class TenantContext:
 
     @staticmethod
     def _clear_db_session(using: str = "default") -> None:
-        """Reset the PostgreSQL session variable to empty string."""
+        """Reset the PostgreSQL session variable to empty string.
+
+        Gated by ``BOUNDARY_SET_DB_SESSION_VAR`` (default ``True``, issue
+        #53); see ``_set_db_session`` for the rationale.
+        """
+        if not boundary_settings.SET_DB_SESSION_VAR:
+            return
         connection = connections[using]
         if connection.connection is not None:
             with connection.cursor() as cursor:

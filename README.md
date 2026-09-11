@@ -42,11 +42,29 @@ by subdomain (`client-a.app.com`) or JWT claim from the auth provider.
 session or header. `STRICT_MODE` catches accidental cross-department data
 exposure during development.
 
+### What boundary does not do
+
+- **Authentication, session management or login.** That is your own auth
+  stack. boundary's resolvers read an already-authenticated request; they
+  never authenticate one.
+- **Membership, RBAC or authorisation.** Resolving a tenant is not
+  authorising a caller against it. Your project (or icv-identity, for ICV
+  ecosystem consumers) owns that check.
+- **Providing the tenant domain model itself.** You define your own tenant
+  model and point `BOUNDARY_TENANT_MODEL` at it, or use the bundled
+  `AbstractTenant` convenience base.
+- **Non-PostgreSQL Row Level Security.** The ORM filtering layer works on
+  any Django-supported database, but RLS enforcement requires PostgreSQL
+  14+, with no database-level backstop elsewhere.
+- **Cross-region data migration.** Moving a tenant's data from one regional
+  database to another is your own operational tooling.
+- **Frontend, API or Django admin components.** You wire your own admin and
+  views to use the `unscoped` manager or tenant-filtered querysets.
+
 ### When NOT to use boundary
 
 - **Single-tenant apps**: no need for isolation machinery.
 - **Schema-per-tenant**: use [django-tenants](https://github.com/django-tenants/django-tenants) instead (different trade-offs at scale).
-- **Non-PostgreSQL databases**: the ORM layer works on any database, but RLS enforcement requires PostgreSQL 14+.
 
 ---
 
@@ -781,6 +799,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `BOUNDARY_REGIONS` | `None` | Regional DB configs (activates routing) |
 | `BOUNDARY_REGION_FIELD` | `"region"` | Tenant field storing region key |
 | `BOUNDARY_DB_SESSION_VAR` | `"app.current_tenant_id"` | PostgreSQL session variable |
+| `BOUNDARY_SET_DB_SESSION_VAR` | `True` | Whether to write the PostgreSQL session variable at all. Set to `False` to skip the `set_config()` round trip on every context entry and exit for a deployment using boundary for ORM-layer scoping only, with no RLS policies enabled. Disabling this while RLS is actually enabled on a tenant table is a genuine isolation failure, not a performance choice; `boundary.W009` warns when both are true at once |
 | `BOUNDARY_WRAP_ATOMIC` | `True` | Wrap requests in `transaction.atomic()` |
 | `BOUNDARY_RESOLVER_CACHE_SIZE` | `1000` | LRU cache max entries |
 | `BOUNDARY_RESOLVER_CACHE_TTL` | `60` | Cache TTL in seconds |
@@ -804,6 +823,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
 | `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |
 | `boundary.W008` | Warning | `SubdomainResolver` (or a subclass) is in `BOUNDARY_RESOLVERS` without `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` set: it resolves the first label of any three-plus-label host, including a foreign host outside the deployment's own domain (issue #22) |
+| `boundary.W009` | Warning | `BOUNDARY_SET_DB_SESSION_VAR` is `False` but Row Level Security is enabled and forced on a tenant-scoped table: RLS depends on the session variable the opt-out stops writing, so isolation on that table is not enforced (issue #53) |
 
 ---
 
