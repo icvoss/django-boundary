@@ -35,11 +35,72 @@ class TestSystemChecks:
         assert any(e.id == "boundary.E003" for e in errors)
 
     def test_e004_missing_middleware(self, settings):
+        """Control: unrelated/empty MIDDLEWARE must still fire E004."""
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
         settings.MIDDLEWARE = []
         errors = check_boundary_configuration(None)
         assert any(e.id == "boundary.E004" for e in errors)
+
+    def test_e004_absent_when_unrelated_middleware_present(self, settings):
+        """Control: a MIDDLEWARE list with unrelated entries only must still
+        fire E004, proving the check is not vacuously silent whenever
+        MIDDLEWARE is merely non-empty."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E004" for e in errors)
+
+    def test_e004_absent_when_identity_middleware_present_and_boundary_absent(self, settings):
+        """Issue #54: icv-identity owns tenant resolution per ADR-025 T1. A
+        deployment that mounts icv-identity's TenantContextMiddleware and no
+        boundary middleware at all is the documented, intended shape, not a
+        misconfiguration; fails on the unfixed code (unconditional literal
+        string test)."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["icv_identity.tenants.middleware.TenantContextMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+
+    def test_e004_absent_for_a_subclass_of_tenant_middleware(self, settings):
+        """Issue #52: a consumer subclass of TenantMiddleware (Magmify's
+        host-scoped SiteTenantBoundaryMiddleware is the documented-in-the-wild
+        case) still resolves tenant on every request; matched by issubclass,
+        not dotted-path suffix. Fails on the unfixed code (literal string
+        membership test cannot see a subclass)."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["boundary_testapp.middleware.CustomTenantMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+
+    def test_e004_fires_and_does_not_raise_for_an_unimportable_middleware_path(self, settings):
+        """Control for the import guard: an unimportable dotted path must
+        not raise (ImportError/AttributeError caught), and since it
+        satisfies neither the identity nor the subclass condition, E004
+        still fires."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["nonexistent.middleware.DoesNotExist"]
+        errors = check_boundary_configuration(None)
+        assert any(e.id == "boundary.E004" for e in errors)
+
+    def test_e004_absent_and_w002_fires_when_both_boundary_and_identity_mounted(self, settings):
+        """Existing behaviour preserved: when both boundary's own
+        TenantMiddleware and icv-identity's TenantContextMiddleware are
+        mounted, E004 stays silent (a boundary middleware entry is present)
+        and W002 fires to flag the double resolution."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = [
+            "boundary.middleware.TenantMiddleware",
+            "icv_identity.tenants.middleware.TenantContextMiddleware",
+        ]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+        assert any(e.id == "boundary.W002" for e in errors)
 
     def test_w001_strict_mode_disabled(self, settings):
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
