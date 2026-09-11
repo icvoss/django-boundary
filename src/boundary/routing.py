@@ -27,11 +27,12 @@ _region_override: ContextVar[str | None] = ContextVar("boundary_region_override"
 # drift (a decommissioned region, a bad write), not an expected routing
 # case, so it deserves one warning per (tenant, region) pair rather than
 # silence. Bounded so a process that churns through many distinct
-# (tenant, region) pairs cannot grow this without limit: past the cap,
-# further distinct pairs stop producing warnings for the rest of the
-# process's life (a broad reset rather than a precise LRU, judged
-# acceptable because the condition is a one-off config fix, not an ongoing
-# per-tenant signal).
+# (tenant, region) pairs cannot grow this without limit: at the cap the
+# whole set is cleared, so a pair warned before the reset may warn once
+# more afterwards. A broad reset rather than a precise LRU, judged
+# acceptable because the condition is a one-off config fix, not an
+# ongoing per-tenant signal, and a duplicate warning after a reset is
+# cheaper than tracking recency.
 _MAX_UNMATCHED_REGION_WARNINGS = 10_000
 _warned_unmatched_regions: set[tuple[str, str | None]] = set()
 
