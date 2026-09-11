@@ -299,9 +299,9 @@ class TestEnsureAtomicUnconfiguredAlias:
 
         assert ctx is not None  # nullcontext(); still usable as a context manager
         records = [r for r in caplog.records if r.name == "boundary.context"]
-        assert any(
-            r.levelname == "DEBUG" and getattr(r, "using", None) == "nonexistent_alias" for r in records
-        ), "expected a DEBUG record naming the unconfigured alias"
+        assert any(r.levelname == "DEBUG" and getattr(r, "using", None) == "nonexistent_alias" for r in records), (
+            "expected a DEBUG record naming the unconfigured alias"
+        )
 
 
 @pytest.mark.django_db(transaction=True)
@@ -320,6 +320,15 @@ class TestSetClearDbSessionUnopenedConnection:
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
 
+        # DATABASES is in Django's COMPLEX_OVERRIDE_SETTINGS: the settings
+        # fixture updates django.conf.settings but ConnectionHandler.settings
+        # is a cached_property with no setting_changed receiver resetting it
+        # for this key. configure_settings() also short-circuits on the
+        # already-populated _settings ivar, so both must be cleared before
+        # the new alias becomes visible.
+        connections._settings = None
+        del connections.settings
+
         assert connections["unopened"].connection is None  # sanity: genuinely unopened
 
         with caplog.at_level("WARNING", logger="boundary.context"):
@@ -337,15 +346,20 @@ class TestSetClearDbSessionUnopenedConnection:
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
 
+        # See test_set_db_session_warns_naming_alias_and_tenant: DATABASES
+        # needs the ConnectionHandler cache cleared by hand.
+        connections._settings = None
+        del connections.settings
+
         assert connections["unopened"].connection is None  # sanity: genuinely unopened
 
         with caplog.at_level("WARNING", logger="boundary.context"):
             TenantContext._clear_db_session(using="unopened")
 
         records = [r for r in caplog.records if r.name == "boundary.context"]
-        assert any(
-            r.levelname == "WARNING" and getattr(r, "using", None) == "unopened" for r in records
-        ), "expected a WARNING record naming the unopened alias"
+        assert any(r.levelname == "WARNING" and getattr(r, "using", None) == "unopened" for r in records), (
+            "expected a WARNING record naming the unopened alias"
+        )
 
 
 class TestTenantContextAtomicRollback:
@@ -695,21 +709,23 @@ class TestAdminBypassCleanupExceptionSafety:
 
         assert connection.in_atomic_block is False  # genuinely autocommit
 
-        with caplog.at_level("WARNING", logger="boundary.context"):
-            with pytest.raises(ProgrammingError):
-                with admin_bypass():
-                    assert _get_admin_flag() == "true"
-                    with connection.cursor() as cursor:
-                        # Deliberately invalid SQL: raises ProgrammingError
-                        # and aborts the real transaction, so the finally
-                        # block's own cursor.execute genuinely fails against
-                        # an aborted transaction below.
-                        cursor.execute("SELECT boundary_nonexistent_function()")
+        with (
+            caplog.at_level("WARNING", logger="boundary.context"),
+            pytest.raises(ProgrammingError),
+            admin_bypass(),
+        ):
+            assert _get_admin_flag() == "true"
+            with connection.cursor() as cursor:
+                # Deliberately invalid SQL: raises ProgrammingError
+                # and aborts the real transaction, so the finally
+                # block's own cursor.execute genuinely fails against
+                # an aborted transaction below.
+                cursor.execute("SELECT boundary_nonexistent_function()")
 
         records = [r for r in caplog.records if r.name == "boundary.context"]
-        assert any(
-            r.levelname == "WARNING" and "Failed to clear admin bypass flag" in r.message for r in records
-        ), "expected a WARNING record naming the failed cleanup"
+        assert any(r.levelname == "WARNING" and "Failed to clear admin bypass flag" in r.message for r in records), (
+            "expected a WARNING record naming the failed cleanup"
+        )
 
 
 @pytest.mark.django_db(transaction=True)
