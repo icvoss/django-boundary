@@ -34,6 +34,22 @@ All notable changes to django-boundary are documented here.
 
 ### Fixed
 
+- **`boundary_provision --region` now writes the tenant row to its regional
+  database** (issue #62). The command previously called
+  `TenantModel.objects.create(**kwargs)` with no `using=`. During
+  provisioning no tenant is yet active in `TenantContext`, so
+  `RegionalRouter._route()` always falls back to `default`, meaning a
+  tenant created with `--region` landed on the default database regardless
+  of the region requested. The command now resolves the alias with
+  `require_region()`, the same helper already documented for this purpose,
+  and saves the tenant with `using=<alias>` when `BOUNDARY_REGIONS` is
+  configured and a region is given; behaviour is unchanged when regions are
+  unconfigured or no region is passed. A region that is not in
+  `BOUNDARY_REGIONS` now fails the command with a `CommandError` naming the
+  region and the configured keys, instead of silently writing to `default`.
+  The post-provision hook still fires exactly once, after the row is
+  written, with the same argument as before.
+
 - **`boundary.E004` no longer contradicts icv-identity deployments, and now
   recognises a `TenantMiddleware` subclass** (issues #52 and #54).
   `_check_middleware` previously tested `MIDDLEWARE` for the literal string

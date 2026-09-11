@@ -38,6 +38,7 @@ class TestRegionalRouterWithConfig:
         monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
         monkeypatch.setattr(TenantContext, "_clear_db_session", staticmethod(lambda *a, **k: None))
 
+    @pytest.mark.django_db(databases=["default", "eu-west"])
     def test_routes_to_tenant_region(self, tenant_a):
         from boundary_testapp.models import Booking
 
@@ -49,6 +50,7 @@ class TestRegionalRouterWithConfig:
             assert router.db_for_read(Booking) == "eu-west"
             assert router.db_for_write(Booking) == "eu-west"
 
+    @pytest.mark.django_db(databases=["default", "eu-west"])
     def test_non_tenant_model_uses_default(self, tenant_a):
         from django.contrib.auth.models import User
 
@@ -152,6 +154,7 @@ class TestRequireRegion:
 
         monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
 
+    @pytest.mark.django_db(databases=["default", "eu-west"])
     def test_returns_region_for_routable_tenant(self, tenant_a, settings):
         settings.BOUNDARY_REGIONS = {"eu-west": {}, "us": {}}
         tenant_a.region = "eu-west"
