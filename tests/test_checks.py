@@ -968,3 +968,73 @@ class TestE006QualifiesTableLookupByOid:
             cursor.execute("SELECT to_regclass(%s)", ["definitely_does_not_exist_xyz"])
             resolved = cursor.fetchone()[0]
         assert resolved is None
+
+
+@pytest.mark.django_db
+class TestW009SetDbSessionVarDisabledWithRlsEnabled:
+    """Issue #53: boundary.W009 fires only for the opt-out-plus-RLS-enabled
+    combination, not for either condition alone.
+
+    Reuses _apply_rls_to_booking()/_remove_rls_from_booking() (the same
+    real EnableRLS/CreateTenantPolicy migration operations
+    TestE006FiresOnMissingRls uses) so RLS state is genuinely constructed,
+    not assumed.
+    """
+
+    def test_fires_when_opt_out_is_on_and_rls_is_enabled(self, settings):
+        from boundary.checks import _check_db_session_var_disabled_with_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        _apply_rls_to_booking()
+        try:
+            errors = _check_db_session_var_disabled_with_rls_enabled()
+            w009 = [e for e in errors if e.id == "boundary.W009"]
+            assert any("boundary_testapp_booking" in e.msg for e in w009), (
+                f"expected boundary.W009 to name the RLS-protected Booking table; got {[e.msg for e in errors]}"
+            )
+        finally:
+            _remove_rls_from_booking()
+
+    def test_absent_when_opt_out_is_on_but_rls_is_not_enabled(self, settings):
+        """Opt-out alone, with no RLS, is exactly the deployment #53 exists
+        to serve: it must not be warned about."""
+        from boundary.checks import _check_db_session_var_disabled_with_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        errors = _check_db_session_var_disabled_with_rls_enabled()
+        assert not any(e.id == "boundary.W009" for e in errors)
+
+    def test_absent_when_rls_is_enabled_but_opt_out_is_off(self, settings):
+        """RLS enabled at the BOUNDARY_SET_DB_SESSION_VAR default (True) is
+        today's ordinary, correctly-functioning configuration."""
+        from boundary.checks import _check_db_session_var_disabled_with_rls_enabled
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+
+        _apply_rls_to_booking()
+        try:
+            errors = _check_db_session_var_disabled_with_rls_enabled()
+            assert not any(e.id == "boundary.W009" for e in errors)
+        finally:
+            _remove_rls_from_booking()
+
+    def test_reachable_through_the_registered_check_registry(self, settings):
+        from django.core.checks import registry
+
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        _apply_rls_to_booking()
+        try:
+            errors = registry.run_checks()
+            assert any(e.id == "boundary.W009" for e in errors), (
+                f"expected boundary.W009 reachable via the registered check "
+                f"pipeline, not just the private function; got {[e.id for e in errors]}"
+            )
+        finally:
+            _remove_rls_from_booking()

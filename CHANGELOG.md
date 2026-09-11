@@ -4,6 +4,34 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`BOUNDARY_SET_DB_SESSION_VAR` setting and `boundary.W009` check** (issue
+  #53). `TenantContext._set_db_session`/`_clear_db_session` previously
+  issued `SELECT set_config(...)` unconditionally on every context entry
+  and exit, with no way for a deployment using boundary for ORM-layer
+  scoping only, with no RLS policies enabled, to skip the round trip.
+  `BOUNDARY_SET_DB_SESSION_VAR` (default `True`) gates both methods: set it
+  to `False` and they return before issuing any SQL.
+  `BOUNDARY_DB_SESSION_VAR` itself stays a pure name, so
+  `migrations_ops.py`, which reads the same name for RLS policy
+  definitions, is unaffected by this opt-out. Because RLS enforcement
+  depends entirely on the session variable, a new `boundary.W009` system
+  check warns when the opt-out is on and Row Level Security is actually
+  enabled and forced on a tenant-scoped table, the combination that would
+  otherwise silently stop enforcing isolation on that table.
+
+### Docs
+
+- **README now mirrors the umbrella spec's "What it does not do" section**
+  (issue #58). The package README previously listed three reasons to pick
+  a different tool ("When NOT to use boundary") but had no equivalent of
+  the spec's six stated exclusions (authentication, membership/RBAC, the
+  tenant domain model, non-PostgreSQL RLS, cross-region migration,
+  frontend/API/admin components). Added a "What boundary does not do"
+  section stating all six, adjacent to the existing "When NOT to use"
+  section, per `docs/STANDARDS.md:36`.
+
 ### Fixed
 
 - **`boundary_provision --region` now writes the tenant row to its regional
