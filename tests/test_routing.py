@@ -87,6 +87,96 @@ class TestRegionalRouterWithConfig:
 
 
 @pytest.mark.django_db
+class TestUnmatchedRegionWarnsOnce:
+    """Issue #59: an unmatched tenant region must be operator-visible without
+    flooding on every query.
+
+    _route() runs on every ORM query, so an unconditional warning would
+    flood; the fix warns at most once per (tenant, region) pair through a
+    small bounded cache, while _route() itself must still always return
+    "default" (a Django router cannot raise).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, settings, monkeypatch):
+        from boundary.context import TenantContext
+        from boundary.routing import _warned_unmatched_regions
+
+        settings.BOUNDARY_REGIONS = {"eu-west": {}, "us": {}}
+        monkeypatch.setattr(TenantContext, "_set_db_session", staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(TenantContext, "_clear_db_session", staticmethod(lambda *a, **k: None))
+        # Isolate the module-level warn-once cache per test.
+        _warned_unmatched_regions.clear()
+        yield
+        _warned_unmatched_regions.clear()
+
+    def test_repeated_query_warns_exactly_once(self, tenant_a, caplog):
+        from boundary_testapp.models import Booking
+
+        tenant_a.region = "ap-southeast"  # Not in BOUNDARY_REGIONS
+        tenant_a.save()
+        router = RegionalRouter()
+
+        with caplog.at_level("WARNING", logger="boundary.routing"), set_tenant(tenant_a):
+            for _ in range(5):
+                assert router.db_for_read(Booking) == "default"
+                assert router.db_for_write(Booking) == "default"
+
+        records = [r for r in caplog.records if r.name == "boundary.routing"]
+        assert len(records) == 1, f"expected exactly one warning, got {len(records)}"
+        assert records[0].tenant_id == str(tenant_a.pk)
+        assert records[0].region == "ap-southeast"
+
+    def test_second_tenant_produces_its_own_warning(self, tenant_a, tenant_b, caplog):
+        from boundary_testapp.models import Booking
+
+        tenant_a.region = "ap-southeast"
+        tenant_a.save()
+        tenant_b.region = "ap-southeast"
+        tenant_b.save()
+        router = RegionalRouter()
+
+        with caplog.at_level("WARNING", logger="boundary.routing"):
+            with set_tenant(tenant_a):
+                router.db_for_read(Booking)
+            with set_tenant(tenant_b):
+                router.db_for_read(Booking)
+
+        records = [r for r in caplog.records if r.name == "boundary.routing"]
+        tenant_ids = {r.tenant_id for r in records}
+        assert tenant_ids == {str(tenant_a.pk), str(tenant_b.pk)}
+
+    def test_second_region_for_same_tenant_produces_its_own_warning(self, tenant_a, caplog):
+        from boundary_testapp.models import Booking
+
+        router = RegionalRouter()
+
+        with caplog.at_level("WARNING", logger="boundary.routing"), set_tenant(tenant_a):
+            tenant_a.region = "ap-southeast"
+            tenant_a.save()
+            router.db_for_read(Booking)
+            tenant_a.region = "sa-east"
+            tenant_a.save()
+            router.db_for_read(Booking)
+
+        records = [r for r in caplog.records if r.name == "boundary.routing"]
+        regions = {r.region for r in records}
+        assert regions == {"ap-southeast", "sa-east"}
+
+    def test_route_always_returns_default_for_unmatched_region(self, tenant_a):
+        """The contract requires _route() to always return an alias."""
+        from boundary_testapp.models import Booking
+
+        tenant_a.region = "nonexistent"
+        tenant_a.save()
+        router = RegionalRouter()
+
+        with set_tenant(tenant_a):
+            assert router.db_for_read(Booking) == "default"
+            assert router.db_for_write(Booking) == "default"
+
+
+@pytest.mark.django_db
 class TestAllRegions:
     """AC-REG-004: all_regions iteration."""
 

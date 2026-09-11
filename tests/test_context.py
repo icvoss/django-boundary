@@ -321,6 +321,147 @@ class TestTenantContextAutocommit:
         assert any("outside an active transaction" in record.message for record in caplog.records)
 
 
+class TestEnsureAtomicUnconfiguredAlias:
+    """Issue #56: _ensure_atomic()'s ConnectionDoesNotExist swallow must log.
+
+    Before the fix, the except ConnectionDoesNotExist branch returned
+    nullcontext() with no log line at all, so a caller could not tell "the
+    alias does not exist, atomicity was skipped" from "no transaction was
+    needed". Debug, not warning: the contract classifies this branch as
+    deliberate tolerance (a regional alias configured in BOUNDARY_REGIONS but
+    absent from DATABASES, typically in routing-only tests).
+    """
+
+    def test_unconfigured_alias_logs_debug_naming_alias(self, caplog):
+        from boundary.context import _ensure_atomic
+
+        with caplog.at_level("DEBUG", logger="boundary.context"):
+            ctx = _ensure_atomic(using="nonexistent_alias")
+
+        assert ctx is not None  # nullcontext(); still usable as a context manager
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert any(r.levelname == "DEBUG" and getattr(r, "using", None) == "nonexistent_alias" for r in records), (
+            "expected a DEBUG record naming the unconfigured alias"
+        )
+
+
+@pytest.mark.django_db(transaction=True)
+class TestSetClearDbSessionUnopenedConnection:
+    """Issue #56: _set_db_session/_clear_db_session must warn, not no-op
+    silently, when the connection has never been opened.
+
+    This is a real RLS risk: the ContextVar is set correctly, but no
+    database state changes, so RLS on that connection sees no tenant if it
+    is later opened without going through this call again. Driven by
+    calling the methods directly against an alias whose connection is
+    guaranteed unopened, rather than mocking the logger.
+    """
+
+    def test_set_db_session_warns_naming_alias_and_tenant(self, caplog, settings):
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        # DATABASES is in Django's COMPLEX_OVERRIDE_SETTINGS: the settings
+        # fixture updates django.conf.settings but ConnectionHandler.settings
+        # is a cached_property with no setting_changed receiver resetting it
+        # for this key. configure_settings() also short-circuits on the
+        # already-populated _settings ivar, so both must be cleared before
+        # the new alias becomes visible.
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._set_db_session("some-tenant-id", using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert any(
+            r.levelname == "WARNING"
+            and getattr(r, "using", None) == "unopened"
+            and getattr(r, "tenant_id", None) == "some-tenant-id"
+            for r in records
+        ), "expected a WARNING record naming the unopened alias and tenant id"
+
+    def test_clear_db_session_warns_naming_alias(self, caplog, settings):
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        # See test_set_db_session_warns_naming_alias_and_tenant: DATABASES
+        # needs the ConnectionHandler cache cleared by hand.
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._clear_db_session(using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert any(r.levelname == "WARNING" and getattr(r, "using", None) == "unopened" for r in records), (
+            "expected a WARNING record naming the unopened alias"
+        )
+
+    def test_opt_out_silences_the_unopened_connection_warning(self, caplog, settings):
+        """Merge interaction (#53 opt-out x #56 warning): BOUNDARY_SET_DB_SESSION_VAR=False
+        must return before the connection-open check runs at all, so an
+        explicit opt-out on an unopened alias is silent, not a WARNING.
+
+        Both _set_db_session and _clear_db_session gained code from two
+        different branches that touch the same function: #53 added an early
+        `if not boundary_settings.SET_DB_SESSION_VAR: return` and #56 added
+        an `else` branch warning when the connection is unopened. Git merged
+        them without a conflict; this proves the opt-out's early return
+        actually precedes the connection check in the merged source, not
+        just that both branches exist. If the order were reversed (the
+        warning check running before the opt-out's return), this assertion
+        would fail because the warning would fire regardless of the setting.
+        """
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        # See test_set_db_session_warns_naming_alias_and_tenant: DATABASES
+        # needs the ConnectionHandler cache cleared by hand.
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._set_db_session("some-tenant-id", using="unopened")
+            TenantContext._clear_db_session(using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert records == [], f"expected no WARNING records with the opt-out set, got: {[r.message for r in records]}"
+
+    def test_default_still_warns_on_the_same_unopened_alias(self, caplog, settings):
+        """Companion to test_opt_out_silences_the_unopened_connection_warning:
+        with BOUNDARY_SET_DB_SESSION_VAR at its True default, the same
+        unopened alias DOES produce the #56 warning on both methods. Paired
+        with the opt-out test, this pins the merged ordering: the opt-out
+        return is unconditional and precedes the connection check, and the
+        connection check itself is unchanged from #56 at the default.
+        """
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._set_db_session("some-tenant-id", using="unopened")
+            TenantContext._clear_db_session(using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context" and r.levelname == "WARNING"]
+        assert len(records) == 2, (
+            f"expected a WARNING from both _set_db_session and _clear_db_session, got: {[r.message for r in records]}"
+        )
+
+
 class TestTenantContextAtomicRollback:
     """BR-CTX-008: ContextVar rolled back if _set_db_session fails."""
 
@@ -638,6 +779,53 @@ class TestAdminBypassWrapAtomicFalse:
 
         with transaction.atomic(), admin_bypass():
             assert _get_admin_flag() == "true"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdminBypassCleanupExceptionSafety:
+    """Issue #60: admin_bypass()'s finally cleanup must not mask the
+    caller's original exception.
+
+    Before the fix, if the block raised while the surrounding transaction
+    was already aborted (e.g. a real PostgreSQL error), the finally block's
+    own unguarded cursor.execute(set_config...) raised
+    TransactionManagementError against the aborted transaction, and Python
+    propagated THAT as what the caller sees, not the original exception. A
+    caller's `except IntegrityError:` (or any other specific type) around
+    the `with admin_bypass():` block would never fire.
+
+    The fault is driven end-to-end: a deliberately invalid statement run
+    inside the block raises a real DB error and aborts the actual
+    transaction (not a mock), so the finally block's own cursor.execute
+    genuinely fails against that aborted transaction, exactly as issue #60
+    describes. On the unfixed code, the assertion on the exception TYPE
+    (pytest.raises(ProgrammingError), not TransactionManagementError) is
+    what fails: the caller sees TransactionManagementError instead.
+    """
+
+    def test_original_exception_propagates_when_cleanup_also_fails(self, caplog):
+        from django.db import connection
+        from django.db.utils import ProgrammingError
+
+        assert connection.in_atomic_block is False  # genuinely autocommit
+
+        with (
+            caplog.at_level("WARNING", logger="boundary.context"),
+            pytest.raises(ProgrammingError),
+            admin_bypass(),
+        ):
+            assert _get_admin_flag() == "true"
+            with connection.cursor() as cursor:
+                # Deliberately invalid SQL: raises ProgrammingError
+                # and aborts the real transaction, so the finally
+                # block's own cursor.execute genuinely fails against
+                # an aborted transaction below.
+                cursor.execute("SELECT boundary_nonexistent_function()")
+
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert any(r.levelname == "WARNING" and "Failed to clear admin bypass flag" in r.message for r in records), (
+            "expected a WARNING record naming the failed cleanup"
+        )
 
 
 @pytest.mark.django_db(transaction=True)

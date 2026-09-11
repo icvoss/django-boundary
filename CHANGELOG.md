@@ -50,6 +50,46 @@ All notable changes to django-boundary are documented here.
   The post-provision hook still fires exactly once, after the row is
   written, with the same argument as before.
 
+- **`_ensure_atomic()` and the DB session variable helpers no longer swallow
+  their degraded paths silently** (issue #56, ADR-101). `_ensure_atomic()`'s
+  `except ConnectionDoesNotExist` branch now logs a `logger.debug` naming the
+  alias before returning `nullcontext()`, so a caller can distinguish "the
+  alias does not exist, atomicity was skipped" from "no transaction was
+  needed"; debug, not warning, because this branch is deliberate tolerance
+  (typically a regional alias configured for routing tests only).
+  `_set_db_session()`/`_clear_db_session()` now log a `logger.warning` naming
+  the alias (and, for set, the tenant id) when `connection.connection is
+  None`, since a no-op here is a real RLS risk: the `ContextVar` is set
+  correctly, but no database state changes, so RLS on that connection sees
+  no tenant if it is later opened without going through this call again. No
+  new logger: both emit through the existing `boundary.context` logger.
+
+- **`admin_bypass()`'s cleanup no longer masks the caller's original
+  exception when clearing the flag itself fails** (issue #60, ADR-101). If
+  the block inside `with admin_bypass():` raised while the transaction was
+  already aborted, the `finally` block's own unguarded `cursor.execute` to
+  clear the flag previously raised `TransactionManagementError`, which
+  replaced the original exception as what propagated to the caller: a
+  caller's `except IntegrityError:` (or any other specific type) around the
+  block would never fire. The cleanup is now wrapped in `try/except
+  Exception`, logging a `logger.warning` with `exc_info=True` on the
+  `boundary.context` logger and letting the original exception propagate
+  unmodified, mirroring the existing pattern at `TenantContext.using()` and
+  `TenantContext.clear()`. A failed clear can leave the bypass flag set on
+  that connection until it next recycles.
+
+- **`RegionalRouter._route()`'s unmatched-region fallback is now
+  operator-visible without flooding** (issue #59, ADR-101). When a tenant's
+  region is set but not present in `BOUNDARY_REGIONS`, usually configuration
+  drift (a decommissioned region, a bad write) rather than an expected
+  routing case, `_route()` previously logged only at `logger.debug`, off by
+  default in production. It now also logs a `logger.warning` on the
+  `boundary.routing` logger, once per distinct `(tenant, region)` pair via a
+  small bounded cache, since `_route()` runs on every ORM query and an
+  unconditional warning would flood. The existing `logger.debug` line is
+  unchanged. `_route()` still always returns `"default"`, as a Django
+  database router must.
+
 - **`boundary.E004` no longer contradicts icv-identity deployments, and now
   recognises a `TenantMiddleware` subclass** (issues #52 and #54).
   `_check_middleware` previously tested `MIDDLEWARE` for the literal string
