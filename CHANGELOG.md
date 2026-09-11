@@ -6,6 +6,24 @@ All notable changes to django-boundary are documented here.
 
 ### Added
 
+- **`boundary.testing.provision_rls_test_role()` and `assert_rls_enforced()`
+  / `rls_enforced()`** (issue #55). `boundary.W003` diagnoses a test/CI
+  database role that bypasses Row Level Security, but only under
+  `manage.py check`, never under a plain `pytest` run: a suite run as the
+  bootstrap superuser most PostgreSQL docker images ship with passes every
+  RLS-isolation test having enforced nothing. `provision_rls_test_role()`
+  packages the `NOSUPERUSER NOBYPASSRLS` role provisioning
+  `.github/workflows/ci.yml` already runs by hand, idempotently, and is a
+  no-op on a non-PostgreSQL backend; it returns connection parameters
+  rather than repointing `DATABASES["default"]` itself, since pytest-django
+  creates the test database before a fixture could do that safely.
+  `assert_rls_enforced()` is the fail-closed half: it raises
+  `RLSNotEnforcedError`, naming the cause, unless the connecting role is
+  neither superuser nor BYPASSRLS and at least one registered tenant table
+  has RLS enabled and forced. `rls_enforced()` wraps it in `pytest.exit()`
+  for use as a session-scoped autouse fixture, so a misconfigured run stops
+  before any test executes. Documented in the README's Testing section.
+
 - **`BOUNDARY_SET_DB_SESSION_VAR` setting and `boundary.W009` check** (issue
   #53). `TenantContext._set_db_session`/`_clear_db_session` previously
   issued `SELECT set_config(...)` unconditionally on every context entry

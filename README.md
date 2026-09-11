@@ -862,6 +862,61 @@ all_bookings = Booking.unscoped.all()
 Booking.unscoped.create(court=1, tenant=specific_tenant)
 ```
 
+### RLS test role and fail-closed assertion
+
+`boundary.W003` (above) diagnoses a test/CI database role that bypasses Row
+Level Security, but only under `manage.py check`, never under a plain
+`pytest` run. A suite run as the bootstrap superuser that most PostgreSQL
+docker images ship with passes every RLS-isolation test having enforced
+nothing.
+
+`boundary.testing` ships the fix as two pieces:
+
+`provision_rls_test_role()` provisions a plain `NOSUPERUSER NOBYPASSRLS`
+role (idempotent: safe to call against a role that already exists), mirroring
+the shell `.github/workflows/ci.yml` already runs by hand. It is a no-op on
+a non-PostgreSQL backend. **It does not, and cannot, repoint
+`DATABASES["default"]` for you**: pytest-django creates the test database
+during `django_db_setup`, before any fixture in a test module has run, so a
+fixture cannot swap the role early enough to affect that. Instead it returns
+the provisioned role's connection parameters, and you either build your own
+connection from them (as this package's own `app_conn` test fixture does)
+or set `DATABASES["default"]` to point at the role's credentials in your
+`settings.py` yourself, before pytest starts.
+
+`assert_rls_enforced(connection_params)` is the load-bearing half: it
+connects with the given parameters and raises `RLSNotEnforcedError`, naming
+what it found, unless BOTH `current_user` is neither a superuser nor
+BYPASSRLS, AND at least one registered tenant model's table has RLS enabled
+and forced. Wire it as a session-scoped autouse fixture so a misconfigured
+run stops before any test runs, rather than passing every isolation test
+vacuously:
+
+```python
+# conftest.py
+import pytest
+from boundary.testing import provision_rls_test_role, rls_enforced
+
+@pytest.fixture(scope="session", autouse=True)
+def _rls_enforced(django_db_setup, django_db_blocker):
+    with django_db_blocker.unblock():
+        params = provision_rls_test_role(
+            bootstrap_connection_params={
+                "host": "localhost",
+                "port": 5432,
+                "dbname": "myproject_test",
+                "user": "postgres",
+                "password": "postgres",
+            },
+        )
+        if params:  # empty on a non-PostgreSQL backend
+            rls_enforced(params)
+```
+
+`rls_enforced()` calls `pytest.exit()` on failure, so the whole run stops
+immediately with the cause on stderr, rather than reporting as one failed
+fixture among a wall of now-meaningless downstream test results.
+
 ---
 
 ## Signals
