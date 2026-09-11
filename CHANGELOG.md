@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-11
+
 ### Added
 
 - **`boundary.testing.provision_rls_test_role()` and `assert_rls_enforced()`
