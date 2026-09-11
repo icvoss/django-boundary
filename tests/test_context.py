@@ -402,6 +402,65 @@ class TestSetClearDbSessionUnopenedConnection:
             "expected a WARNING record naming the unopened alias"
         )
 
+    def test_opt_out_silences_the_unopened_connection_warning(self, caplog, settings):
+        """Merge interaction (#53 opt-out x #56 warning): BOUNDARY_SET_DB_SESSION_VAR=False
+        must return before the connection-open check runs at all, so an
+        explicit opt-out on an unopened alias is silent, not a WARNING.
+
+        Both _set_db_session and _clear_db_session gained code from two
+        different branches that touch the same function: #53 added an early
+        `if not boundary_settings.SET_DB_SESSION_VAR: return` and #56 added
+        an `else` branch warning when the connection is unopened. Git merged
+        them without a conflict; this proves the opt-out's early return
+        actually precedes the connection check in the merged source, not
+        just that both branches exist. If the order were reversed (the
+        warning check running before the opt-out's return), this assertion
+        would fail because the warning would fire regardless of the setting.
+        """
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        # See test_set_db_session_warns_naming_alias_and_tenant: DATABASES
+        # needs the ConnectionHandler cache cleared by hand.
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._set_db_session("some-tenant-id", using="unopened")
+            TenantContext._clear_db_session(using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context"]
+        assert records == [], f"expected no WARNING records with the opt-out set, got: {[r.message for r in records]}"
+
+    def test_default_still_warns_on_the_same_unopened_alias(self, caplog, settings):
+        """Companion to test_opt_out_silences_the_unopened_connection_warning:
+        with BOUNDARY_SET_DB_SESSION_VAR at its True default, the same
+        unopened alias DOES produce the #56 warning on both methods. Paired
+        with the opt-out test, this pins the merged ordering: the opt-out
+        return is unconditional and precedes the connection check, and the
+        connection check itself is unchanged from #56 at the default.
+        """
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+        settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
+        from django.db import connections
+
+        connections._settings = None
+        del connections.settings
+
+        assert connections["unopened"].connection is None  # sanity: genuinely unopened
+
+        with caplog.at_level("WARNING", logger="boundary.context"):
+            TenantContext._set_db_session("some-tenant-id", using="unopened")
+            TenantContext._clear_db_session(using="unopened")
+
+        records = [r for r in caplog.records if r.name == "boundary.context" and r.levelname == "WARNING"]
+        assert len(records) == 2, (
+            f"expected a WARNING from both _set_db_session and _clear_db_session, got: {[r.message for r in records]}"
+        )
+
 
 class TestTenantContextAtomicRollback:
     """BR-CTX-008: ContextVar rolled back if _set_db_session fails."""
