@@ -2,6 +2,33 @@
 
 All notable changes to django-boundary are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **`boundary.E004` no longer contradicts icv-identity deployments, and now
+  recognises a `TenantMiddleware` subclass** (issues #52 and #54).
+  `_check_middleware` previously tested `MIDDLEWARE` for the literal string
+  `boundary.middleware.TenantMiddleware`, which produced two false errors.
+  First, a deployment where icv-identity owns tenant resolution (per ADR-025
+  T1, its `TenantContextMiddleware` resolves the tenant and bridges into
+  boundary's `TenantContext`) mounts no boundary middleware at all, which is
+  the documented, intended shape, yet the literal-string test raised E004
+  regardless; the same deployment's `SILENCED_SYSTEM_CHECKS` workaround for
+  E004 also silenced `boundary.W002`'s genuine double-resolution warning, so
+  no configuration satisfied both checks. Second, a consumer that mounts a
+  subclass of `TenantMiddleware` (for example to gate resolution by host)
+  still resolves the tenant on every request, but the literal-string test
+  could not see past the dotted path. `boundary.E004` now stays silent when a
+  `MIDDLEWARE` entry ends with icv-identity's
+  `icv_identity.tenants.middleware.TenantContextMiddleware` (matched the same
+  way `boundary.W002` already does, importing nothing from icv_identity), or
+  resolves via `import_string` to a subclass of `TenantMiddleware` (matched
+  the same way `boundary.W006` already does); an entry that fails to import
+  is left for Django's own middleware loading to report and no longer raises
+  from the check itself. A boundary-only deployment with no tenant-resolving
+  middleware at all still fires E004 exactly as before.
+
 ## [0.7.0] - 2026-09-03
 
 ### Added

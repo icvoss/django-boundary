@@ -105,19 +105,70 @@ def _check_resolvers():
 
 
 def _check_middleware():
-    """E004: TenantMiddleware must be in MIDDLEWARE."""
+    """E004: TenantMiddleware (or an equivalent) must be in MIDDLEWARE.
+
+    Satisfied three ways:
+
+    1. A MIDDLEWARE entry is the literal string
+       ``boundary.middleware.TenantMiddleware``.
+    2. A MIDDLEWARE entry resolves (via ``import_string``) to a subclass of
+       ``TenantMiddleware`` (issue #52). A consumer that wraps
+       ``TenantMiddleware`` to add its own gating (Magmify's host-scoped
+       ``SiteTenantBoundaryMiddleware`` is the documented-in-the-wild case)
+       still performs tenant resolution on every request; a literal-string
+       test cannot see the subclass. Matched by ``issubclass``, following
+       the same pattern ``boundary.W006`` already established for this
+       module. An entry that fails to import (``ImportError`` or
+       ``AttributeError``, e.g. a dotted path with no such attribute) is
+       treated as not satisfying the check rather than raising: Django's own
+       middleware loading reports an unimportable entry separately, and this
+       check has nothing useful to add for a broken path.
+    3. A MIDDLEWARE entry ends with icv-identity's
+       ``icv_identity.tenants.middleware.TenantContextMiddleware`` (issue
+       #54). Per ADR-025 T1, when icv-identity is installed it owns
+       request-to-tenant resolution and bridges into boundary's
+       TenantContext; boundary's own TenantMiddleware is for boundary-only
+       deployments. A deployment where icv-identity resolves the tenant and
+       boundary mounts no middleware of its own is the documented, intended
+       shape, not a misconfiguration, so it must not fire E004. Detected by
+       the same string suffix match ``boundary.W002`` already uses; boundary
+       must never import icv_identity (ADR-002, ADR-025 T1).
+
+    Otherwise E004 fires: no MIDDLEWARE entry resolves tenant context, which
+    is a genuine boundary-only misconfiguration.
+    """
     from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from boundary.middleware import TenantMiddleware
 
     middleware = getattr(settings, "MIDDLEWARE", [])
-    if "boundary.middleware.TenantMiddleware" not in middleware:
-        return [
-            Error(
-                "boundary.middleware.TenantMiddleware is not in MIDDLEWARE.",
-                hint="Add 'boundary.middleware.TenantMiddleware' to MIDDLEWARE before SessionMiddleware.",
-                id="boundary.E004",
-            )
-        ]
-    return []
+
+    if any(entry.endswith("icv_identity.tenants.middleware.TenantContextMiddleware") for entry in middleware):
+        return []
+
+    for entry in middleware:
+        if entry == "boundary.middleware.TenantMiddleware":
+            return []
+        try:
+            middleware_class = import_string(entry)
+        except (ImportError, AttributeError):
+            continue  # not this check's concern; Django reports a broken path itself
+        if isinstance(middleware_class, type) and issubclass(middleware_class, TenantMiddleware):
+            return []
+
+    return [
+        Error(
+            "boundary.middleware.TenantMiddleware is not in MIDDLEWARE.",
+            hint=(
+                "Add 'boundary.middleware.TenantMiddleware' (or a subclass of it) to "
+                "MIDDLEWARE before SessionMiddleware. If icv-identity is installed and "
+                "its TenantContextMiddleware is mounted, it already owns tenant "
+                "resolution (ADR-025 T1) and boundary needs no middleware of its own."
+            ),
+            id="boundary.E004",
+        )
+    ]
 
 
 def _check_strict_mode():
