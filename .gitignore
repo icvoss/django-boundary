@@ -14,8 +14,11 @@ coverage.xml
 .coverage
 *.so
 .env
+# Suffixed venv forms: icvoss/icv-oss-umbrella#675
 .venv/
+.venv*/
 venv/
+venv*/
 .DS_Store
 .idea/
 
