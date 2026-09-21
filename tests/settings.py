@@ -41,6 +41,16 @@ DATABASES = {
     "eu-west": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": ":memory:",
+        # thirdparty and boundary_consumer are the only apps with a real
+        # migration graph (see MIGRATION_MODULES below), and the consumer's
+        # adoption migration emits PostgreSQL DDL that SQLite cannot parse.
+        # A real project keeps a non-PostgreSQL alias off that graph with a
+        # router's allow_migrate(); a global DATABASE_ROUTERS is not usable
+        # here because test_checks.py sets that setting per-test and would
+        # override it. The alias only ever needs boundary_testapp.Tenant,
+        # which is unmigrated and is created by the test runner regardless
+        # of this flag, so skipping the graph costs the alias nothing.
+        "TEST": {"MIGRATE": False},
     },
 }
 

@@ -173,6 +173,56 @@ def unadopted(db):
     _executor().migrate([ADOPTION_MIGRATION])
 
 
+#: The adopted tables whose tenant_id column the E007 damage tests drop.
+_ADOPTED_TABLES = (
+    "thirdparty_widget",
+    "thirdparty_widget_tags",
+    "thirdparty_tag",
+    "thirdparty_gadget",
+)
+
+
+def _restore_after_dropped_column():
+    """Restore the baseline adopted state after a DROP COLUMN tenant_id.
+
+    Reversing and re-applying the migration is not enough on its own.
+    ``AdoptTenantApp._unadopt_table`` skips a table with no tenant_id column,
+    and that early return is correct: from the operation's side a
+    column-less table was never adopted, so there is nothing to reverse.
+    Dropping the column by hand therefore puts the table in a state no
+    forward path produces, and the reversal steps straight over it. Two
+    things are left stranded, and both cascade into every later test in the
+    module:
+
+    * the RLS flags and both policies survive, so the re-apply dies on
+      ``policy "boundary_admin_bypass" ... already exists``;
+    * ``DROP COLUMN ... CASCADE`` took the composite unique constraints with
+      it, and since ``_restore_unique_constraints`` is behind the same early
+      return, the originals are never rebuilt. The re-apply then finds no
+      unique constraint to rewrite and creates none, leaving the table
+      permanently without them.
+
+    Putting the column back before reversing is what avoids both. The
+    reversal then takes its full real path over a table it recognises as
+    adopted: it drops the policies, clears the flags, and rebuilds the
+    original unique constraints through the operation's own code, so the
+    re-apply rewrites them exactly as the baseline has them. The restore
+    leans on the production path rather than reimplementing it.
+    """
+    with connection.cursor() as cursor:
+        for table in _ADOPTED_TABLES:
+            if column_type(cursor, table, "tenant_id") is not None:
+                continue
+            # Nullable and defaultless: this column exists only so the
+            # reversal recognises the table, and the reversal drops it again
+            # a moment later. The forward re-apply is what builds the real
+            # NOT NULL column with its boundary_current_tenant_id() default.
+            cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN tenant_id bigint')
+
+    _executor().migrate([PRE_ADOPTION_MIGRATION])
+    _executor().migrate([ADOPTION_MIGRATION])
+
+
 def _recorded_migrations():
     """Return the set of applied (app_label, name) pairs from django_migrations."""
     from django.db.migrations.recorder import MigrationRecorder
@@ -451,10 +501,25 @@ class TestAcRls010UniqueConstraintsBecomePerTenant:
         unique=True field is an inline UNIQUE PostgreSQL named
         thirdparty_widget_code_key, while unique_together is a constraint the
         schema editor hashed. Only catalogue introspection finds both.
+
+        The unique=True field is matched by prefix and suffix rather than by
+        the one literal ``thirdparty_widget_code_key_tenant``, because either
+        of two original names is legitimate here and which one is present
+        depends on whether this table has been through a reversal. Reversal
+        re-derives the original through the schema editor's own naming
+        (BR-RLS-020), so PostgreSQL's inline
+        ``thirdparty_widget_code_key`` becomes Django's hashed
+        ``thirdparty_widget_code_<hash>_uniq`` and never reverts; a later
+        re-application derives its composite from that. Both satisfy the rule
+        this test states, which is that the composite carries the original's
+        name plus ``_tenant``, so pinning one spelling pins reversal history
+        rather than the naming derivation.
         """
         names = unique_constraints_by_name("thirdparty_widget")
 
-        assert names["thirdparty_widget_code_key_tenant"] == ["tenant_id", "code"]
+        code = [name for name in names if name.startswith("thirdparty_widget_code_") and name.endswith("_tenant")]
+        assert len(code) == 1, names
+        assert names[code[0]] == ["tenant_id", "code"]
 
         together = [
             name
@@ -1003,8 +1068,7 @@ class TestAcRls012E007ReportsAdoptedTableDrift:
             assert "thirdparty_widget" in missing[0].msg
             assert "AdoptTenantApp('thirdparty')" in missing[0].hint
         finally:
-            _executor().migrate([PRE_ADOPTION_MIGRATION])
-            _executor().migrate([ADOPTION_MIGRATION])
+            _restore_after_dropped_column()
 
     def test_ac_rls_012_an_unforced_table_is_reported(self):
         """When NO FORCE ROW LEVEL SECURITY is applied, then the run reports
@@ -1179,8 +1243,7 @@ class TestAcRls012E007ReportsAdoptedTableDrift:
                 "table, or the silence about Booking proves nothing"
             )
         finally:
-            _executor().migrate([PRE_ADOPTION_MIGRATION])
-            _executor().migrate([ADOPTION_MIGRATION])
+            _restore_after_dropped_column()
 
     def test_ac_rls_012_an_excluded_model_is_not_reported(self, settings):
         """And a model listed in BOUNDARY_ADOPT_EXCLUDE is not reported.
@@ -1201,8 +1264,7 @@ class TestAcRls012E007ReportsAdoptedTableDrift:
             settings.BOUNDARY_ADOPT_EXCLUDE = [*E007_ADOPT_EXCLUDE, "thirdparty.Widget"]
             assert not _e007_for("thirdparty.Widget"), "an excluded model must not be reported"
         finally:
-            _executor().migrate([PRE_ADOPTION_MIGRATION])
-            _executor().migrate([ADOPTION_MIGRATION])
+            _restore_after_dropped_column()
 
     def test_ac_rls_012_the_auto_created_through_model_is_reported(self):
         """And the auto-created many-to-many through model of a
@@ -1224,8 +1286,7 @@ class TestAcRls012E007ReportsAdoptedTableDrift:
             assert missing, f"expected E007 for the through table; got {[e.msg for e in _e007_errors()]}"
             assert "thirdparty_widget_tags" in missing[0].msg
         finally:
-            _executor().migrate([PRE_ADOPTION_MIGRATION])
-            _executor().migrate([ADOPTION_MIGRATION])
+            _restore_after_dropped_column()
 
     def test_ac_rls_012_a_model_added_after_the_adoption_migration_is_reported(self):
         """And a model added to the live thirdparty app registry after the
@@ -1255,8 +1316,7 @@ class TestAcRls012E007ReportsAdoptedTableDrift:
             assert missing, f"expected E007 for the new model's table; got {[e.msg for e in _e007_errors()]}"
             assert "thirdparty_gadget" in missing[0].msg
         finally:
-            _executor().migrate([PRE_ADOPTION_MIGRATION])
-            _executor().migrate([ADOPTION_MIGRATION])
+            _restore_after_dropped_column()
 
     def test_ac_rls_012_the_expected_set_comes_from_the_live_registry(self, settings):
         """The derivation itself, asserted directly rather than only through

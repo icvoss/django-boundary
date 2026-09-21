@@ -261,6 +261,26 @@ class TestBoundaryRun:
             call_command("boundary_run", "--tenant=nonexistent", "showmigrations")
 
 
+def _run_all_results(output):
+    """Return boundary_run_all's own NDJSON result lines from mixed stdout.
+
+    --json emits one JSON object per tenant, but the inner command writes to
+    the same stdout, so the stream is interleaved. ``showmigrations`` prints
+    an app header and a line per migration for every app that has a real
+    migration graph, and tests/settings.py gives thirdparty and
+    boundary_consumer exactly that. Selecting the JSON lines is therefore
+    the assertion these tests always meant; treating every line as JSON only
+    passed while no installed app had migrations to show.
+    """
+    results = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        results.append(json.loads(line))
+    return results
+
+
 @pytest.mark.django_db
 class TestBoundaryRunAll:
     """AC-CMD-006/007: boundary_run_all with parallel and region filter."""
@@ -271,11 +291,11 @@ class TestBoundaryRunAll:
     def test_json_output(self, tenant_a, capsys):
         call_command("boundary_run_all", "showmigrations", json_output=True)
         output = capsys.readouterr().out.strip()
-        for line in output.split("\n"):
-            if line:
-                data = json.loads(line)
-                assert "tenant" in data
-                assert "status" in data
+        results = _run_all_results(output)
+        assert results
+        for data in results:
+            assert "tenant" in data
+            assert "status" in data
 
     def test_region_filter(self, tenant_a, tenant_b, capsys):
         tenant_a.region = "eu-west"
@@ -285,7 +305,7 @@ class TestBoundaryRunAll:
 
         call_command("boundary_run_all", "showmigrations", region="eu-west", json_output=True)
         output = capsys.readouterr().out.strip()
-        results = [json.loads(line) for line in output.split("\n") if line]
+        results = _run_all_results(output)
         slugs = [r["tenant"] for r in results]
         assert tenant_a.slug in slugs
         assert tenant_b.slug not in slugs
@@ -298,7 +318,7 @@ class TestBoundaryRunAll:
             json_output=True,
         )
         output = capsys.readouterr().out.strip()
-        results = [json.loads(line) for line in output.split("\n") if line]
+        results = _run_all_results(output)
         slugs = [r["tenant"] for r in results]
         assert tenant_a.slug in slugs
         assert tenant_b.slug not in slugs
