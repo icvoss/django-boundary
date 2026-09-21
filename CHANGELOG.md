@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-21
+
 ### Added
 
 - **`BOUNDARY_TENANT_APPS` and `BOUNDARY_ADOPT_EXCLUDE` settings, and the
