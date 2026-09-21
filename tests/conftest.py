@@ -92,6 +92,18 @@ def app_conn():
         "boundary_testapp_tenant",
         "boundary_testapp_brand",
         "boundary_testapp_brandasset",
+        # Adopted third-party tables (BR-RLS-011). The isolation assertions in
+        # AC-RLS-009 and AC-RLS-016 must run as a non-superuser, since
+        # PostgreSQL exempts superuser and BYPASSRLS roles from every policy
+        # even on a FORCE ROW LEVEL SECURITY table, and would therefore pass
+        # against a broken policy as readily as a correct one.
+        "thirdparty_widget",
+        "thirdparty_widget_tags",
+        "thirdparty_tag",
+        "thirdparty_gadget",
+        "thirdparty_seat",
+        "thirdparty_seatbooking",
+        "thirdparty_coupon",
     )
     with connection.cursor() as cur:
         for table in tables:
