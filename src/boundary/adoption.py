@@ -268,6 +268,65 @@ def _tenant_through_labels(apps, tenant_label: str) -> set[str]:
     return labels
 
 
+# ── The expected-adopted set, from the live registry ─────────
+
+
+def expected_adopted_apps() -> list[tuple[str, str | None]]:
+    """Return ``(app_label, refusal_reason_or_None)`` per BOUNDARY_TENANT_APPS entry.
+
+    The settings-only half of ``boundary.E007``'s condition 6 (BR-RLS-017):
+    a deny-listed app label and an app label naming nothing installed are
+    both errors, and neither needs a database connection to establish.
+    Order follows the setting, so an operator reading the check output sees
+    their own list back.
+
+    Separated from :func:`expected_adopted_models` so the caller can report
+    a refused app once, by name, rather than silently deriving an empty set
+    for it and reporting nothing at all.
+    """
+    return [(app_label, refusal_reason(app_label)) for app_label in boundary_settings.TENANT_APPS]
+
+
+def expected_adopted_models():
+    """Return every model ``BOUNDARY_TENANT_APPS`` expects to be adopted.
+
+    The live-registry counterpart to :func:`adopted_models`, and the shared
+    derivation behind ``boundary.E007`` (BR-RLS-017), the adopted-table half
+    of ``boundary.E006`` and ``boundary.W009``, ``boundary_deprovision``
+    (BR-PRV-009) and ``assert_rls_enforced`` (BR-PRV-010). One home for it
+    means those five cannot drift apart on which tables count as adopted.
+
+    Derived from the LIVE app registry, never from a migration state. That
+    is the deliberate asymmetry BR-RLS-017 names: ``AdoptTenantApp`` derived
+    its set from the historical state, so a model an upstream package added
+    after the adoption migration was written is in this set and not in that
+    one, and its table therefore has no ``tenant_id`` column. E007 reporting
+    it is the intended drift signal rather than a false positive.
+
+    A refused app label (deny-listed or not installed) contributes no
+    models; the refusal itself is reported by :func:`expected_adopted_apps`.
+    An app label appearing twice in the setting contributes its models once,
+    because a duplicate entry is a typo rather than a request to check the
+    same table twice.
+
+    Returns an empty list when ``BOUNDARY_TENANT_APPS`` is unset or empty,
+    which is every deployment that has adopted nothing, so each caller's
+    adopted branch costs nothing at all there.
+    """
+    models = []
+    seen = set()
+    for app_label, refusal in expected_adopted_apps():
+        if refusal is not None:
+            continue
+        for model in adopted_models(app_label):
+            label = model_label(model)
+            if label in seen:
+                continue
+            seen.add(label)
+            models.append(model)
+    return models
+
+
 # ── PostgreSQL catalogue introspection ───────────────────────
 #
 # Every helper below takes a cursor rather than opening one, so the caller
@@ -439,3 +498,19 @@ def unique_indexes(cursor, table: str) -> list[dict]:
         }
         for name, columns, primary, partial, expression, constraint in cursor.fetchall()
     ]
+
+
+def policy_names(cursor, table: str) -> set[str]:
+    """Return the names of every RLS policy on *table*.
+
+    ``boundary.E007``'s conditions 3 and 4 (BR-RLS-017) each ask whether one
+    named policy is present, and asking for the whole set once costs a
+    single query rather than two existence probes per table. An empty set
+    means either no policy or no such table; the caller distinguishes the
+    two from the ``pg_class`` probe it has already run.
+    """
+    cursor.execute(
+        "SELECT polname FROM pg_policy WHERE polrelid = to_regclass(%s)::oid",
+        [table],
+    )
+    return {row[0] for row in cursor.fetchall()}
