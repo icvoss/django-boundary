@@ -187,6 +187,28 @@ class _Settings:
         return _setting("BOUNDARY_REQUEST_ATTR", self.TENANT_FK_FIELD)
 
     @property
+    def TENANT_APPS(self):  # noqa: N802
+        """App labels whose concrete models are adopted (BR-RLS-010).
+
+        Each entry is a Django app label. The adopted set for an app is
+        derived, never hand-listed, so a model an upstream package adds
+        later is detectable as drift by boundary.E007 rather than silently
+        left global.
+        """
+        return _setting("BOUNDARY_TENANT_APPS", [])
+
+    @property
+    def ADOPT_EXCLUDE(self):  # noqa: N802
+        """ "app_label.ModelName" strings exempted from adoption (BR-RLS-010).
+
+        Matched case-sensitively against
+        ``f"{model._meta.app_label}.{model.__name__}"``. An entry matching no
+        model is inert rather than an error, because a package upgrade may
+        legitimately remove a model the consumer had excluded.
+        """
+        return _setting("BOUNDARY_ADOPT_EXCLUDE", [])
+
+    @property
     def POST_PROVISION_HOOK(self):  # noqa: N802
         return _setting("BOUNDARY_POST_PROVISION_HOOK")
 
