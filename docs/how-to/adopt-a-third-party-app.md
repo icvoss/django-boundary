@@ -288,6 +288,14 @@ it. Re-applying the migration forwards against the now-populated table is refuse
 unless you supply a `backfill_tenant`, and no single backfill value can recover
 the per-row assignment the reversal discarded.
 
+**Reversing strips every adopted table of that app it can see, not only the
+ones this migration adopted.** The operation carries no record of which
+migration adopted which table, so if a second `AdoptTenantApp("account")`
+migration was added after a package upgrade to pick up new models, reversing
+that second migration also un-adopts the tables the first one adopted. Reverse
+the later migration only when you mean to un-adopt the app, and re-apply both
+if you did not.
+
 Restoration re-derives rather than replays: the operation reads each model's
 historical `_meta` from the migration state and recreates the original unique
 constraints through the schema editor's own naming, so what comes back is what
