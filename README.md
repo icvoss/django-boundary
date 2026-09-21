@@ -995,15 +995,6 @@ Claims about django-tenants below are taken from its own documentation
 | Regional routing | Not supported | First-class |
 | Outside a tenant | Public schema: missing-relation error | `TenantNotSetError` under `STRICT_MODE` |
 
----------------|-----------------|
-| Isolation | PostgreSQL schemas | Row-level + RLS |
-| Scale ceiling | ~500 tenants | No architectural ceiling |
-| Migration cost | O(n tenants) | O(1) |
-| Async support | Thread-local (breaks async) | contextvars (native async) |
-| Celery | Manual | Automatic via headers |
-| Regional routing | Not supported | First-class |
-| Dev enforcement | None | STRICT_MODE |
-
 ---
 
 ## Licence

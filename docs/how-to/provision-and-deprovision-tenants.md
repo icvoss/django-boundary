@@ -202,7 +202,7 @@ An adopted row's export line differs from a scoped model's:
 | every other key | one per database column, keyed by **column name**, `tenant_id` included |
 
 ```json
-{"_model": "account.EmailAddress", "_pk": "9", "_adopted": true, "id": "9", "email": "a@example.com", "tenant_id": "7"}
+{"_model": "account.EmailAddress", "_pk": "9", "_adopted": true, "id": 9, "email": "a@example.com", "tenant_id": 7}
 ```
 
 Keying by column name rather than Django field name is what tells you, on
