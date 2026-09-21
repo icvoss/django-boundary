@@ -171,7 +171,61 @@ Only models with at least one matching row produce lines, so an empty export fil
 means the tenant had no scoped data. The file is written before the tenant and
 its rows are deleted.
 
-### 7. Delete the tenant
+### 7. Adopted tables in the export and the delete
+
+If you have adopted a third-party app (`BOUNDARY_TENANT_APPS` plus the
+`AdoptTenantApp` migration operation), its tables carry a `tenant_id` column
+that no Django field models, so they have no scoped manager and no ORM lookup
+for the command to use. `boundary_deprovision` reaches them by raw SQL against
+that column, in all three steps, so that "all tenant-scoped rows" stays true
+once an app is adopted:
+
+| Step | Mixin-scoped model | Adopted table |
+|---|---|---|
+| Collect | `model.unscoped.filter(...).count()` | `SELECT count(*) FROM <table> WHERE tenant_id = %s` |
+| Export | `.iterator(chunk_size=...)`, serialised per field | `SELECT * FROM <table> WHERE tenant_id = %s`, streamed server-side in `--batch-size` chunks, serialised per column |
+| Delete | `model.unscoped.filter(...).delete()` | `DELETE FROM <table> WHERE tenant_id = %s` |
+
+Those statements run inside `admin_bypass()`: the command has no tenant context
+of its own, and deprovisioning a tenant other than the active one is exactly the
+cross-tenant operation that flag exists for. This is one of the two cases where
+`admin_bypass()` is the correct tool on an adopted table, because the statements
+are raw SQL naming `tenant_id` explicitly.
+
+An adopted row's export line differs from a scoped model's:
+
+| Key | Value |
+|---|---|
+| `_model` | `"app_label.ModelName"` for the adopted model |
+| `_pk` | the row's primary key, rendered as text |
+| `_adopted` | `true`, distinguishing the line from a scoped model's |
+| every other key | one per database column, keyed by **column name**, `tenant_id` included |
+
+```json
+{"_model": "account.EmailAddress", "_pk": "9", "_adopted": true, "id": 9, "email": "a@example.com", "tenant_id": 7}
+```
+
+Keying by column name rather than Django field name is what tells you, on
+re-import, that `tenant_id` is not a Django field and must be written back as a
+raw column, and that every other value is in its raw database form rather than
+passed through a field's `to_python()`. `_adopted` makes that distinction
+machine-readable instead of something you must infer from the model name.
+
+Adopted rows are deleted before the tenant row itself, in the same order the
+command already uses for scoped models. Deletion is by `tenant_id` value only:
+the adopted column is not a Django `ForeignKey`, so it has no database-level
+cascade, which is why the explicit delete is required rather than relying on
+`ON DELETE`.
+
+A `--dry-run` reports adopted-table counts alongside model counts, naming each
+adopted table by `app_label.ModelName` so you can tell an adopted table from a
+scoped model in the output.
+
+**An adopted table whose app is missing from `BOUNDARY_TENANT_APPS` is invisible
+to deprovision**, and its rows survive the tenant. The command reads the same
+setting the adoption operation and `boundary.E007` read, so keep it accurate.
+
+### 8. Delete the tenant
 
 Without `--export`, deprovision counts, confirms, then deletes. Each scoped
 model's rows are removed via `model.unscoped.filter(tenant=tenant).delete()`,
@@ -246,11 +300,14 @@ python manage.py shell -c "from boundary.conf import get_tenant_model; print(get
 - **Expecting `--dry-run` to be fully read-only.** The pre-deprovision hook runs
   before the dry-run check, so a hook with side effects executes even on a dry
   run. Make the hook idempotent or side-effect-free.
-- **Assuming export captures non-scoped data.** Only models subclassing
-  `TenantMixin` (and not abstract) are walked. Plain models, m2m through-rows
-  that are not scoped, and the tenant row's own attributes (beyond the model
-  scan) are not in the NDJSON. The tenant record itself is deleted but not
-  exported as a row.
+- **Assuming export captures non-scoped data.** Beyond the adopted tables
+  covered in step 7, only models subclassing `TenantMixin` (and not abstract)
+  are walked. Plain models, m2m through-rows that are not scoped, and the tenant
+  row's own attributes (beyond the model scan) are not in the NDJSON. The tenant
+  record itself is deleted but not exported as a row.
+- **Adopting an app but leaving it out of `BOUNDARY_TENANT_APPS`.** The DDL
+  applies and the table is isolated, but deprovision never sees it, so its rows
+  outlive the tenant they belonged to.
 - **Forgetting `--yes` in automation.** Without it the command blocks on
   `input()` waiting for you to type `yes`; in a non-interactive pipeline this
   hangs or fails.
@@ -269,6 +326,8 @@ python manage.py shell -c "from boundary.conf import get_tenant_model; print(get
   including `BOUNDARY_POST_PROVISION_HOOK` and `BOUNDARY_PRE_DEPROVISION_HOOK`.
 - [Set up a tenant model](./set-up-a-tenant-model.md): define and register the
   model these commands operate on.
+- [Adopt a third-party app into your tenancy](./adopt-a-third-party-app.md):
+  how the adopted tables covered in step 7 come to exist.
 - [Run Celery tasks with tenant context](./run-celery-tasks-with-tenant-context.md):
   for activating tenant context inside provisioning hooks that write scoped
   rows.

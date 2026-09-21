@@ -484,3 +484,93 @@ class TestPathScopedModelHasNoOwnRls:
             )
         finally:
             _remove_rls_from_brand()
+
+
+class TestAcRls017AppLabelOverride:
+    """AC-RLS-017 (BR-RLS-019): an RLS operation with app_label targets
+    another app's table, and deconstruct()/describe() reflect the override.
+
+    The applied-DDL half of the acceptance criterion (a migration in the
+    consumer's app enabling RLS on ``thirdparty_widget``) lives in
+    tests/test_adoption.py, where the third-party test app exists; this
+    class pins the serialisation and description halves plus the resolution
+    itself, which is what makes that migration target another app's table.
+    """
+
+    def test_ac_rls_017_enable_rls_deconstruct_is_byte_identical_without_the_override(self):
+        """And EnableRLS("Booking").deconstruct() emits exactly
+        {"model_name": "Booking"}, byte-identical to its output before the
+        keyword existed.
+        """
+        name, args, kwargs = EnableRLS("Booking").deconstruct()
+        assert name == "EnableRLS"
+        assert args == []
+        assert kwargs == {"model_name": "Booking"}
+
+    def test_ac_rls_017_deconstruct_includes_app_label_when_set(self):
+        """While EnableRLS("Widget", app_label="thirdparty").deconstruct()
+        includes app_label.
+        """
+        _, _, kwargs = EnableRLS("Widget", app_label="thirdparty").deconstruct()
+        assert kwargs == {"model_name": "Widget", "app_label": "thirdparty"}
+
+    def test_ac_rls_017_policy_operations_deconstruct_the_override_the_same_way(self):
+        """CreateTenantPolicy and DropTenantPolicy carry the same keyword on
+        the same terms: absent when unset, present when set, alongside any
+        tenant_column already in play.
+        """
+        for op_class in (CreateTenantPolicy, DropTenantPolicy):
+            _, _, plain = op_class("Booking").deconstruct()
+            assert plain == {"model_name": "Booking"}, op_class.__name__
+
+            _, _, overridden = op_class("Widget", app_label="thirdparty").deconstruct()
+            assert overridden == {"model_name": "Widget", "app_label": "thirdparty"}, op_class.__name__
+
+            _, _, both = op_class("Widget", tenant_column="org_id", app_label="thirdparty").deconstruct()
+            assert both == {
+                "model_name": "Widget",
+                "tenant_column": "org_id",
+                "app_label": "thirdparty",
+            }, op_class.__name__
+
+    def test_ac_rls_017_describe_names_the_app_label_when_the_override_is_set(self):
+        """And describe() returns a string naming thirdparty.Widget when the
+        override is set and Widget when it is not.
+        """
+        for op_class in (EnableRLS, CreateTenantPolicy, DropTenantPolicy):
+            assert "thirdparty.Widget" in op_class("Widget", app_label="thirdparty").describe(), op_class.__name__
+            plain = op_class("Widget").describe()
+            assert "Widget" in plain, op_class.__name__
+            assert "thirdparty.Widget" not in plain, op_class.__name__
+
+    @pytest.mark.django_db
+    def test_ac_rls_017_the_override_resolves_the_model_from_the_named_app(self, tenant_a):
+        """Given a migration in the consumer's app containing
+        EnableRLS(..., app_label=...) followed by CreateTenantPolicy(...,
+        app_label=...), when the migration is applied, then the target table
+        has RLS enabled and forced and both policies present.
+
+        The owning app label passed to database_forwards() is deliberately
+        one that holds no such model, so the assertion fails with LookupError
+        rather than passing vacuously if the override were ignored.
+        """
+        state = _get_fake_state()
+        owning_app = "boundary"  # the consumer's own app: it has no Booking
+        try:
+            with connection.schema_editor() as editor:
+                EnableRLS("Booking", app_label="boundary_testapp").database_forwards(owning_app, editor, state, state)
+                CreateTenantPolicy("Booking", app_label="boundary_testapp").database_forwards(
+                    owning_app, editor, state, state
+                )
+
+            enabled, forced = _has_rls("boundary_testapp_booking")
+            assert enabled is True
+            assert forced is True
+
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT polname FROM pg_policy WHERE polrelid = 'boundary_testapp_booking'::regclass")
+                policies = {row[0] for row in cursor.fetchall()}
+            assert policies == {"boundary_tenant_isolation", "boundary_admin_bypass"}
+        finally:
+            with connection.schema_editor() as editor:
+                EnableRLS("Booking", app_label="boundary_testapp").database_backwards(owning_app, editor, state, state)

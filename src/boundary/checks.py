@@ -37,6 +37,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_regional_router_configured())
     errors.extend(_check_subdomain_resolver_without_parent_domain())
     errors.extend(_check_db_session_var_disabled_with_rls_enabled())
+    errors.extend(_check_adopted_tables())
 
     return errors
 
@@ -472,11 +473,66 @@ def _check_subdomain_resolver_without_parent_domain():
     ]
 
 
+def _rls_probe_targets(apps):
+    """Yield ``(model, table, adopted)`` for every table RLS must protect.
+
+    The shared table selection behind ``boundary.E006`` and
+    ``boundary.W009``, so the two cannot disagree about which tables RLS is
+    expected on. Two sources, in this order:
+
+    - Column-bearing models, recognised through ``is_tenant_model()`` and
+      ``has_tenant_column()``. Path-scoped models (``make_tenant_path_mixin``)
+      have no local tenant column to put a policy on, and this exemption is
+      intentional, not a gap: relation-scoped isolation is an
+      application-layer-only contract (issue #14). The parent's policy
+      protects the parent table (and therefore ORM queries that join through
+      the path), but never the child table itself, so there is deliberately
+      nothing to check for one. See
+      docs/how-to/scope-models-through-a-relation.md.
+    - Adopted tables, derived from the live registry against
+      ``BOUNDARY_TENANT_APPS`` (BR-RLS-010). An adopted table is exactly the
+      case where RLS is load-bearing on its own: there is no manager, no
+      field and no ORM filtering behind it, so a table whose RLS was never
+      enabled or was later disabled isolates nothing and nothing else in the
+      system notices.
+
+    ``adopted`` is what lets the caller word its message and hint for the
+    right remedy: ``EnableRLS`` for a column-bearing model, a re-applied
+    ``AdoptTenantApp`` for an adopted table, which are different migrations
+    in different apps.
+
+    An adopted model that somehow also carries a mixin is yielded once, from
+    the column-bearing pass, since the two categories are meant to be
+    mutually exclusive and reporting one table twice would read as two
+    separate defects.
+    """
+    from boundary.models import has_tenant_column, is_tenant_model
+
+    seen = set()
+    for model in apps.get_models():
+        if not is_tenant_model(model):
+            continue
+        if model._meta.abstract:
+            continue
+        if not has_tenant_column(model):
+            continue
+        seen.add(model._meta.db_table)
+        yield model, model._meta.db_table, False
+
+    for model, table in _expected_adopted_tables():
+        if table in seen:
+            continue
+        seen.add(table)
+        yield model, table, True
+
+
 def _check_rls_enabled():
     """E006: Verify RLS is enabled on all tenant-scoped tables (PostgreSQL only).
 
     Recognises models using TenantMixin, make_tenant_mixin(), or any model
-    with a ``_boundary_fk_field`` attribute (custom tenant base classes).
+    with a ``_boundary_fk_field`` attribute (custom tenant base classes),
+    and every table ``BOUNDARY_TENANT_APPS`` expects to be adopted
+    (BR-RLS-010), which carries RLS but no Django field at all.
     """
     from django.apps import apps
     from django.conf import settings
@@ -492,25 +548,8 @@ def _check_rls_enabled():
     if not model_string:
         return []  # E001 will catch this
 
-    from boundary.models import has_tenant_column, is_tenant_model
-
     errors = []
-    for model in apps.get_models():
-        if not is_tenant_model(model):
-            continue
-        if model._meta.abstract:
-            continue
-        # Path-scoped models (make_tenant_path_mixin) have no local tenant
-        # column to put an RLS policy on, and this exemption is intentional,
-        # not a gap: relation-scoped isolation is an application-layer-only
-        # contract (issue #14). The parent's policy protects the parent
-        # table (and therefore ORM queries that join through the path), but
-        # never the child table itself, so there is deliberately nothing to
-        # check here. See docs/how-to/scope-models-through-a-relation.md.
-        if not has_tenant_column(model):
-            continue
-
-        table = model._meta.db_table
+    for model, table, adopted in _rls_probe_targets(apps):
         try:
             with connection.cursor() as cursor:
                 # to_regclass() resolves *table* through the connection's own
@@ -537,14 +576,28 @@ def _check_rls_enabled():
                     continue
                 rls_enabled, rls_forced = row
                 if not rls_enabled or not rls_forced:
-                    errors.append(
-                        Error(
+                    if adopted:
+                        message = (
+                            f"Table '{table}' (model {model.__name__}) is an "
+                            f"adopted table that does not have Row Level "
+                            f"Security enabled and forced."
+                        )
+                        hint = (
+                            f"Re-apply the "
+                            f"AdoptTenantApp('{model._meta.app_label}') "
+                            f"migration, which enables and forces RLS as part "
+                            f"of adopting the table. An adopted table has no "
+                            f"ORM layer behind it, so RLS is the only thing "
+                            f"isolating it. See BR-RLS-011."
+                        )
+                    else:
+                        message = (
                             f"Table '{table}' (model {model.__name__}) does "
                             f"not have Row Level Security enabled and forced. "
-                            f"Run EnableRLS migration operation.",
-                            id="boundary.E006",
+                            f"Run EnableRLS migration operation."
                         )
-                    )
+                        hint = None
+                    errors.append(Error(message, hint=hint, id="boundary.E006"))
         except _CONNECTION_UNAVAILABLE_ERRORS:
             # The database itself is not reachable (connection refused,
             # auth failure, closed connection): the legitimate skip this
@@ -590,13 +643,18 @@ def _check_db_session_var_disabled_with_rls_enabled():
     check closes that footgun by firing only when both conditions hold at
     once.
 
-    Reuses the same pg_class probe as ``_check_rls_enabled`` (boundary.E006):
-    ``to_regclass()`` resolves the table through the connection's own
-    search_path exactly as an ordinary query would, avoiding the
-    unqualified ``WHERE relname = %s`` ambiguity issue #34 identified.
-    PostgreSQL-only and skipped when the database is unavailable, matching
-    E006's own gates; a table that does not exist yet (pre-migration) has
-    nothing for this check to warn about either.
+    Reuses the same pg_class probe and the same table selection as
+    ``_check_rls_enabled`` (boundary.E006): ``to_regclass()`` resolves the
+    table through the connection's own search_path exactly as an ordinary
+    query would, avoiding the unqualified ``WHERE relname = %s`` ambiguity
+    issue #34 identified. PostgreSQL-only and skipped when the database is
+    unavailable, matching E006's own gates; a table that does not exist yet
+    (pre-migration) has nothing for this check to warn about either.
+
+    Adopted tables (BR-RLS-010) are included, and are the sharper case: a
+    column-bearing model still has its ``TenantManager`` filtering rows when
+    the session variable stops being written, while an adopted table has no
+    ORM layer at all and is left with no isolation whatsoever.
     """
     from django.apps import apps
     from django.conf import settings
@@ -612,18 +670,8 @@ def _check_db_session_var_disabled_with_rls_enabled():
     if not model_string:
         return []  # E001 will catch this
 
-    from boundary.models import has_tenant_column, is_tenant_model
-
     errors = []
-    for model in apps.get_models():
-        if not is_tenant_model(model):
-            continue
-        if model._meta.abstract:
-            continue
-        if not has_tenant_column(model):
-            continue
-
-        table = model._meta.db_table
+    for model, table, adopted in _rls_probe_targets(apps):
         try:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -635,22 +683,39 @@ def _check_db_session_var_disabled_with_rls_enabled():
                     continue
                 rls_enabled, rls_forced = row
                 if rls_enabled and rls_forced:
-                    errors.append(
-                        Warning(
+                    if adopted:
+                        message = (
+                            f"BOUNDARY_SET_DB_SESSION_VAR is False but adopted table "
+                            f"'{table}' (model {model.__name__}) has Row Level Security "
+                            f"enabled and forced. RLS depends on the session variable "
+                            f"this setting disables writing, so tenant isolation on this "
+                            f"table is not actually enforced."
+                        )
+                        hint = (
+                            f"Set BOUNDARY_SET_DB_SESSION_VAR = True (the default). "
+                            f"An adopted table has no ORM filtering behind it, so "
+                            f"disabling the session variable leaves it with no "
+                            f"isolation at all. Reverse the "
+                            f"AdoptTenantApp('{model._meta.app_label}') migration, or "
+                            f"remove '{model._meta.app_label}' from "
+                            f"BOUNDARY_TENANT_APPS, if the opt-out is intentional. "
+                            f"See the BOUNDARY_SET_DB_SESSION_VAR entry in README.md."
+                        )
+                    else:
+                        message = (
                             f"BOUNDARY_SET_DB_SESSION_VAR is False but table '{table}' "
                             f"(model {model.__name__}) has Row Level Security enabled "
                             f"and forced. RLS depends on the session variable this "
                             f"setting disables writing, so tenant isolation on this "
-                            f"table is not actually enforced.",
-                            hint=(
-                                "Set BOUNDARY_SET_DB_SESSION_VAR = True (the default), "
-                                "or remove RLS from this table if the opt-out is "
-                                "intentional. See the BOUNDARY_SET_DB_SESSION_VAR entry "
-                                "in README.md."
-                            ),
-                            id="boundary.W009",
+                            f"table is not actually enforced."
                         )
-                    )
+                        hint = (
+                            "Set BOUNDARY_SET_DB_SESSION_VAR = True (the default), "
+                            "or remove RLS from this table if the opt-out is "
+                            "intentional. See the BOUNDARY_SET_DB_SESSION_VAR entry "
+                            "in README.md."
+                        )
+                    errors.append(Warning(message, hint=hint, id="boundary.W009"))
         except _CONNECTION_UNAVAILABLE_ERRORS:
             continue
         except Exception as exc:
@@ -667,6 +732,404 @@ def _check_db_session_var_disabled_with_rls_enabled():
                     id="boundary.W007",
                 )
             )
+
+    return errors
+
+
+def _expected_adopted_tables():
+    """Return ``(model, table)`` for every table BOUNDARY_TENANT_APPS adopts.
+
+    The shared selection behind ``boundary.E007``'s per-table conditions and
+    the adopted half of ``boundary.E006`` and ``boundary.W009``. Derived from
+    the LIVE app registry via ``adoption.expected_adopted_models()``
+    (BR-RLS-017), so a model an upstream package added after the adoption
+    migration was written is included and its missing column is reported.
+
+    Returns an empty list when nothing is configured for adoption, which is
+    every deployment that has not set ``BOUNDARY_TENANT_APPS``, so the
+    adopted branch of each check costs one settings read there.
+
+    ``ImproperlyConfigured`` from an unset tenant model is swallowed: E001
+    already reports that, and the adopted-set derivation needs the tenant
+    model only to skip it, so re-raising here would turn one configuration
+    error into a check-framework crash.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+
+    from boundary import adoption
+
+    try:
+        models = adoption.expected_adopted_models()
+    except ImproperlyConfigured:
+        return []
+    return [(model, model._meta.db_table) for model in models]
+
+
+def _check_adopted_tables():
+    """E007: report drift on a table BOUNDARY_TENANT_APPS expects to be adopted.
+
+    BR-RLS-017. An adopted table has no Django field, no manager and no ORM
+    layer behind it, so nothing else in the system notices when its schema
+    stops matching what adoption established. The load-bearing case is an
+    upstream package upgrade whose migration drops and recreates an index:
+    the composite ``(tenant_id, ...)`` unique index becomes a global one
+    again, restoring cross-tenant uniqueness with no other signal anywhere.
+    This check is the only defence against that, which is why every
+    condition is an ``Error`` rather than a ``Warning``.
+
+    Reports, one ``Error`` per failing condition per table, each naming
+    ``app_label.ModelName``, the table and the condition:
+
+    1. ``tenant_id`` absent, or present with a type other than the one the
+       configured tenant model's primary key derives.
+    2. Row Level Security not both enabled and forced.
+    3. ``boundary_tenant_isolation`` absent.
+    4. ``boundary_admin_bypass`` absent.
+    5. A unique constraint or unique index other than the primary key whose
+       leading column is not ``tenant_id``.
+    6. An app label that is deny-listed (BR-RLS-016) or not installed, and a
+       ``BOUNDARY_ADOPT_EXCLUDE`` entry naming the configured tenant model or
+       a model in no listed app.
+
+    Condition 6 is settings-only: it reads ``BOUNDARY_TENANT_APPS`` and
+    ``BOUNDARY_ADOPT_EXCLUDE`` against the app registry and the deny-list,
+    and is therefore reported on a non-PostgreSQL backend and with no
+    database reachable at all. Every other condition, condition 1 included,
+    is a fact about the table that can only be read from the catalogue, so
+    the per-table half skips under exactly the gates ``boundary.E006`` uses:
+    a non-PostgreSQL vendor, and a connection that is unavailable.
+
+    A probe that fails for any other reason reports ``boundary.W007`` naming
+    E007, the same could-not-determine pattern E006 and W003 use, so the
+    absence of E007 cannot be misread as a pass when the query never ran.
+    """
+    from django.conf import settings
+    from django.core.exceptions import ImproperlyConfigured
+    from django.db import connection
+
+    from boundary import adoption
+
+    errors = []
+
+    # Condition 6, the settings-only half. Runs before any vendor or
+    # connection gate, because a deny-listed app label in the setting is a
+    # misconfiguration on SQLite and against an unreachable database just as
+    # much as it is on a live PostgreSQL connection.
+    errors.extend(_check_adopted_settings())
+
+    if connection.vendor != "postgresql":
+        return errors
+
+    model_string = getattr(settings, "BOUNDARY_TENANT_MODEL", None) or getattr(settings, "ICV_TENANT_MODEL", None)
+    if not model_string:
+        return errors  # E001 will catch this
+
+    expected = _expected_adopted_tables()
+    if not expected:
+        return errors
+
+    try:
+        expected_type = _expected_tenant_column_type()
+    except (ImproperlyConfigured, LookupError):
+        # The tenant model is unset or points nowhere: E001 reports that,
+        # and without it there is no type to compare a column against.
+        return errors
+
+    for model, table in expected:
+        label = adoption.model_label(model)
+        try:
+            with connection.cursor() as cursor:
+                errors.extend(_check_one_adopted_table(cursor, model, table, label, expected_type))
+        except _CONNECTION_UNAVAILABLE_ERRORS:
+            # The database itself is unreachable: the same legitimate
+            # pre-migrate skip boundary.E006 has always made.
+            continue
+        except Exception as exc:
+            errors.append(
+                Warning(
+                    f"Could not determine the adopted-table state for table '{table}' (model {label}): {exc}",
+                    hint=(
+                        "The database connection is available but a query "
+                        "against the PostgreSQL catalogue failed, so "
+                        "boundary.E007 could not verify this adopted table. "
+                        "Check the connecting role has SELECT on pg_class, "
+                        "pg_attribute, pg_policy, pg_constraint and pg_index, "
+                        "and investigate the underlying error before treating "
+                        "the absence of boundary.E007 as a pass."
+                    ),
+                    id="boundary.W007",
+                )
+            )
+
+    return errors
+
+
+def _check_adopted_settings():
+    """Condition 6 of boundary.E007: what the settings alone can be wrong about.
+
+    Needs no database connection, by BR-RLS-017's own division: a deny-listed
+    or uninstalled app label in ``BOUNDARY_TENANT_APPS`` is wrong on its face,
+    and reporting it at startup is what stops the consumer discovering it at
+    the next ``migrate`` instead.
+
+    ``BOUNDARY_ADOPT_EXCLUDE`` is validated on the same terms. An entry
+    naming a model that simply no longer exists stays inert on purpose (an
+    upstream upgrade may legitimately have removed a model the consumer had
+    excluded, per the setting's own contract), but two entries are reported:
+    one naming the configured tenant model, which was never in an adopted set
+    to be excluded from and therefore signals a misunderstanding of what
+    adoption covers, and one naming a model in no listed app, which excludes
+    nothing and most often means the app label was left out of
+    ``BOUNDARY_TENANT_APPS``.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+
+    from boundary import adoption
+    from boundary.conf import boundary_settings
+
+    errors = []
+    listed_apps = []
+    for app_label, refusal in adoption.expected_adopted_apps():
+        if refusal is None:
+            listed_apps.append(app_label)
+            continue
+        errors.append(
+            Error(
+                f"BOUNDARY_TENANT_APPS lists '{app_label}', which cannot be adopted: {refusal}.",
+                hint=(
+                    "Remove the app label from BOUNDARY_TENANT_APPS. An app "
+                    "that is global by construction cannot be tenant-scoped, "
+                    "and an app label that is not installed adopts nothing. "
+                    "See BR-RLS-016."
+                ),
+                id="boundary.E007",
+            )
+        )
+
+    excluded = list(boundary_settings.ADOPT_EXCLUDE)
+    if not excluded:
+        return errors
+
+    try:
+        tenant_label = adoption.tenant_model_label()
+    except (ImproperlyConfigured, LookupError):
+        tenant_label = None
+
+    listed_app_set = set(listed_apps)
+    for entry in excluded:
+        if tenant_label is not None and entry == tenant_label:
+            errors.append(
+                Error(
+                    f"BOUNDARY_ADOPT_EXCLUDE names '{entry}', which is the configured tenant model.",
+                    hint=(
+                        "The tenant model is never in an adopted set, so "
+                        "excluding it changes nothing. Remove the entry. If "
+                        "the intent was to leave the tenant model's app "
+                        "unadopted, remove that app label from "
+                        "BOUNDARY_TENANT_APPS instead. See BR-RLS-016."
+                    ),
+                    id="boundary.E007",
+                )
+            )
+            continue
+        entry_app = entry.split(".", 1)[0]
+        if entry_app not in listed_app_set:
+            errors.append(
+                Error(
+                    f"BOUNDARY_ADOPT_EXCLUDE names '{entry}', whose app '{entry_app}' "
+                    f"is not in BOUNDARY_TENANT_APPS, so the entry excludes nothing.",
+                    hint=(
+                        f"Add '{entry_app}' to BOUNDARY_TENANT_APPS if that app "
+                        f"was meant to be adopted, or remove the entry from "
+                        f"BOUNDARY_ADOPT_EXCLUDE. An exclusion only has an "
+                        f"effect on an app that is being adopted."
+                    ),
+                    id="boundary.E007",
+                )
+            )
+
+    return errors
+
+
+def _expected_tenant_column_type():
+    """Return the PostgreSQL type an adopted ``tenant_id`` column must have.
+
+    The same derivation ``AdoptTenantApp`` applied when it added the column
+    (BR-RLS-011 condition 1), reused rather than re-implemented so the check
+    cannot disagree with the operation about what "the wrong type" means.
+    """
+    from boundary.conf import get_tenant_model
+    from boundary.migrations_ops import detect_tenant_pg_type
+
+    return detect_tenant_pg_type(get_tenant_model()._meta.pk)
+
+
+def _check_one_adopted_table(cursor, model, table, label, expected_type):
+    """Return every boundary.E007 error for one expected-adopted table.
+
+    Conditions 1 to 5 of BR-RLS-017, each reported separately so an operator
+    sees all of what is wrong with a table rather than only the first thing.
+    A table that does not exist at all is skipped in silence, the same
+    pre-migrate state ``boundary.E006`` skips: the adopted app's own
+    migrations have not run yet, and there is nothing to report against.
+    """
+    from boundary import adoption
+
+    errors = []
+
+    cursor.execute(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
+        [table],
+    )
+    row = cursor.fetchone()
+    if row is None:
+        # The table does not resolve on this search_path: the adopted app's
+        # own migrations have not run yet. Nothing to check.
+        return errors
+    rls_enabled, rls_forced = row
+
+    # Condition 1: the column, and its type.
+    found_type = adoption.column_type(cursor, table, "tenant_id")
+    if found_type is None:
+        errors.append(
+            Error(
+                f"Table '{table}' (model {label}) is expected to be adopted but has no tenant_id column.",
+                hint=(
+                    f"Add a migration in your own app applying "
+                    f"AdoptTenantApp('{model._meta.app_label}'). An adoption "
+                    f"migration skips a table that is already adopted, so a "
+                    f"second one adopts only what is new. See BR-RLS-017."
+                ),
+                id="boundary.E007",
+            )
+        )
+    elif found_type.strip().lower() != expected_type.strip().lower():
+        errors.append(
+            Error(
+                f"Table '{table}' (model {label}) has a tenant_id column of type "
+                f"'{found_type}', but the configured tenant model's primary key derives "
+                f"type '{expected_type}'.",
+                hint=(
+                    "A tenant_id column of the wrong type cannot hold the "
+                    "tenant primary keys the isolation policy compares "
+                    "against. Reverse and re-apply the AdoptTenantApp "
+                    "migration for this app, or reconcile the tenant model's "
+                    "primary key type. See BR-RLS-011."
+                ),
+                id="boundary.E007",
+            )
+        )
+
+    # Condition 2: RLS enabled and forced.
+    if not rls_enabled or not rls_forced:
+        errors.append(
+            Error(
+                f"Table '{table}' (model {label}) is an adopted table without Row Level "
+                f"Security enabled and forced (relrowsecurity={rls_enabled}, "
+                f"relforcerowsecurity={rls_forced}).",
+                hint=(
+                    f"Re-apply the AdoptTenantApp('{model._meta.app_label}') "
+                    f"migration, which enables and forces RLS as part of "
+                    f"adopting the table. Without FORCE, the table owner is "
+                    f"exempt from every policy on it. See BR-RLS-002."
+                ),
+                id="boundary.E007",
+            )
+        )
+
+    # Conditions 3 and 4: both policies.
+    found_policies = adoption.policy_names(cursor, table)
+    for policy, rule in (
+        ("boundary_tenant_isolation", "BR-RLS-008"),
+        ("boundary_admin_bypass", "BR-RLS-003"),
+    ):
+        if policy not in found_policies:
+            errors.append(
+                Error(
+                    f"Table '{table}' (model {label}) is an adopted table missing the '{policy}' policy.",
+                    hint=(
+                        f"Re-apply the AdoptTenantApp('{model._meta.app_label}') "
+                        f"migration, which creates both boundary policies as "
+                        f"part of adopting the table. See {rule}."
+                    ),
+                    id="boundary.E007",
+                )
+            )
+
+    # Condition 5: every unique form leads with tenant_id.
+    errors.extend(_check_adopted_unique_forms(cursor, model, table, label))
+
+    return errors
+
+
+def _check_adopted_unique_forms(cursor, model, table, label):
+    """Return boundary.E007 condition 5 errors for one adopted table.
+
+    Both catalogue forms are inspected, because Django emits the four unique
+    sources into two of them under two naming schemes: a ``unique=True``
+    field becomes an inline UNIQUE constraint, while a bare
+    ``models.Index(unique=...)`` or an upstream hand-written index is a plain
+    unique index backing no constraint. A check reading only one form would
+    miss exactly the upgrade that recreated the other.
+
+    A unique index that backs a constraint is reported through its
+    constraint rather than twice, since the two are one object to
+    PostgreSQL and reporting both would make one defect look like two. The
+    primary key is excluded by BR-RLS-017's own wording: adoption leaves it
+    alone, so a primary key that does not lead with ``tenant_id`` is the
+    expected state rather than drift.
+    """
+    from boundary import adoption
+
+    errors = []
+    constraint_backed = set()
+
+    for constraint in adoption.unique_constraints(cursor, table):
+        constraint_backed.add(constraint["name"])
+        columns = constraint["columns"]
+        if columns and columns[0] == "tenant_id":
+            continue
+        errors.append(
+            Error(
+                f"Table '{table}' (model {label}) is an adopted table whose unique "
+                f"constraint '{constraint['name']}' on ({', '.join(columns) or 'an expression'}) "
+                f"does not lead with tenant_id, so the value it constrains is unique "
+                f"across every tenant rather than within one.",
+                hint=(
+                    f"Re-apply the AdoptTenantApp('{model._meta.app_label}') "
+                    f"migration, which rewrites each unique form to lead with "
+                    f"tenant_id. An upstream migration that dropped and "
+                    f"recreated this constraint restored cross-tenant "
+                    f"uniqueness with no other signal. See BR-RLS-012."
+                ),
+                id="boundary.E007",
+            )
+        )
+
+    for index in adoption.unique_indexes(cursor, table):
+        if index["primary"]:
+            continue  # BR-RLS-017 excludes the primary key by name
+        if index["constraint"] is not None and index["constraint"] in constraint_backed:
+            continue  # already reported through its constraint
+        columns = index["columns"]
+        if columns and columns[0] == "tenant_id":
+            continue
+        errors.append(
+            Error(
+                f"Table '{table}' (model {label}) is an adopted table whose unique "
+                f"index '{index['name']}' on ({', '.join(columns) or 'an expression'}) "
+                f"does not lead with tenant_id, so the value it constrains is unique "
+                f"across every tenant rather than within one.",
+                hint=(
+                    f"Re-apply the AdoptTenantApp('{model._meta.app_label}') "
+                    f"migration, which rewrites each unique form to lead with "
+                    f"tenant_id. An upstream migration that dropped and "
+                    f"recreated this index restored cross-tenant uniqueness "
+                    f"with no other signal. See BR-RLS-012."
+                ),
+                id="boundary.E007",
+            )
+        )
 
     return errors
 

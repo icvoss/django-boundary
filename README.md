@@ -529,6 +529,45 @@ validate explicitly. See
 [Isolation layers](docs/explanation/isolation-layers.md) for the full
 threat model.
 
+### Adopting a third-party app
+
+The models above are ones you declare. A third-party app that ships concrete
+models and owns its migrations (allauth, taggit, wagtail) gives you nothing to
+compose a mixin onto. Those apps are scoped at the database layer instead: list
+the app label in `BOUNDARY_TENANT_APPS` and apply one `AdoptTenantApp` operation
+from a migration in your own app.
+
+```python
+# settings.py
+BOUNDARY_TENANT_APPS = ["account"]
+
+# myapp/migrations/0007_adopt_allauth_account.py
+from boundary.migrations_ops import AdoptTenantApp
+
+operations = [AdoptTenantApp("account")]
+```
+
+Each adopted table gains a `tenant_id` column that **no Django field models**,
+declared `NOT NULL DEFAULT boundary_current_tenant_id()`, with RLS enabled and
+forced, both boundary policies, and every non-primary-key unique constraint
+rewritten to a composite leading with `tenant_id`. The adopted package is not
+modified, forked, or made aware of any of this.
+
+The trade is explicit and permanent: adopted tables are **RLS-only**. No ORM
+filtering, no `BOUNDARY_STRICT_MODE`, no `TenantNotSetError`, and no isolation at
+all on a non-PostgreSQL backend. `boundary.E007` and a real-PostgreSQL test suite
+carry the whole burden. A populated table is refused without an explicit
+`backfill_tenant`, and reversing an adoption destroys the tenant assignment of
+every row.
+
+See
+[Adopt a third-party app into your tenancy](docs/how-to/adopt-a-third-party-app.md)
+for the full procedure, the deny-list, the bootstrap paths that need a tenant
+context, and the limits in full. Where the package **does** ship a swappable
+abstract base, prefer
+[Scope a package's models into your tenancy](docs/how-to/scope-a-packages-models.md),
+which gives you both isolation layers.
+
 ---
 
 ## Context
@@ -801,6 +840,8 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `BOUNDARY_DB_SESSION_VAR` | `"app.current_tenant_id"` | PostgreSQL session variable |
 | `BOUNDARY_SET_DB_SESSION_VAR` | `True` | Whether to write the PostgreSQL session variable at all. Set to `False` to skip the `set_config()` round trip on every context entry and exit for a deployment using boundary for ORM-layer scoping only, with no RLS policies enabled. Disabling this while RLS is actually enabled on a tenant table is a genuine isolation failure, not a performance choice; `boundary.W009` warns when both are true at once |
 | `BOUNDARY_WRAP_ATOMIC` | `True` | Wrap requests in `transaction.atomic()` |
+| `BOUNDARY_TENANT_APPS` | `[]` | App labels (not dotted module paths) whose concrete models are adopted into tenancy at the database layer: a `tenant_id` column no Django field models, plus RLS and both policies. Declares intent and drives `boundary.E007`, `boundary_deprovision` and `assert_rls_enforced()`; the DDL itself is applied by the `AdoptTenantApp` operation from a migration in your own app. Listing your own app is supported, and is how a model that forgot its mixin gets reported |
+| `BOUNDARY_ADOPT_EXCLUDE` | `[]` | `"app_label.ModelName"` strings exempted from adoption, for a genuinely global reference table inside an otherwise adopted app. Applies to both `AdoptTenantApp` and `boundary.E007`. An entry matching no model is inert, not an error |
 | `BOUNDARY_RESOLVER_CACHE_SIZE` | `1000` | LRU cache max entries |
 | `BOUNDARY_RESOLVER_CACHE_TTL` | `60` | Cache TTL in seconds |
 | `BOUNDARY_POST_PROVISION_HOOK` | `None` | Callable after tenant provisioning |
@@ -816,14 +857,15 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E003` | Error | Resolver class cannot be imported |
 | `boundary.E004` | Error | TenantMiddleware not in MIDDLEWARE |
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
-| `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models |
+| `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models, and adopted tables |
+| `boundary.E007` | Error | An expected-adopted table (a concrete model of an app in `BOUNDARY_TENANT_APPS`, not excluded, not already mixin- or path-scoped, and not the tenant model) is missing its `tenant_id` column, carries one of an unexpected type, lacks enabled-and-forced RLS, is missing either policy, or carries a unique constraint that is not composite leading with `tenant_id`. Also reports a deny-listed or uninstalled app label in the setting, the one condition needing no database connection. The expected set is derived from the live app registry, so a model added by an upstream upgrade is reported; the remedy is a second `AdoptTenantApp` migration (issues #69, #71) |
 | `boundary.W001` | Warning | STRICT_MODE is False |
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
 | `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
 | `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |
 | `boundary.W008` | Warning | `SubdomainResolver` (or a subclass) is in `BOUNDARY_RESOLVERS` without `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` set: it resolves the first label of any three-plus-label host, including a foreign host outside the deployment's own domain (issue #22) |
-| `boundary.W009` | Warning | `BOUNDARY_SET_DB_SESSION_VAR` is `False` but Row Level Security is enabled and forced on a tenant-scoped table: RLS depends on the session variable the opt-out stops writing, so isolation on that table is not enforced (issue #53) |
+| `boundary.W009` | Warning | `BOUNDARY_SET_DB_SESSION_VAR` is `False` but Row Level Security is enabled and forced on a tenant-scoped table, or on an adopted table: RLS depends on the session variable the opt-out stops writing, so isolation on that table is not enforced. An adopted table has no ORM layer to fall back on, so the combination leaves it with no isolation at all (issue #53) |
 
 ---
 
@@ -940,15 +982,18 @@ fixture among a wall of now-meaningless downstream test results.
 
 ## Comparison with django-tenants
 
+Claims about django-tenants below are taken from its own documentation
+(https://django-tenants.readthedocs.io/) at 3.14.0.
+
 | | django-tenants | django-boundary |
 |-|---------------|-----------------|
-| Isolation | PostgreSQL schemas | Row-level + RLS |
-| Scale ceiling | ~500 tenants | No architectural ceiling |
-| Migration cost | O(n tenants) | O(1) |
-| Async support | Thread-local (breaks async) | contextvars (native async) |
-| Celery | Manual | Automatic via headers |
+| Isolation | PostgreSQL schemas (Postgres only) | ORM filter on any backend, plus RLS on Postgres |
+| Migration cost | Once per tenant schema (`migrate_schemas`) | Once, for models using boundary's mixins |
+| Third-party apps | Any app, by listing it in `TENANT_APPS`; whole app only | Own models and swappable-base packages; concrete third-party models need adoption (icvoss/django-boundary#69) |
+| Tenant context | Held on the database connection; async not documented | contextvars; async supported |
+| Celery | Separate `tenant-schemas-celery` package | boundary's Celery signals, once wired (see how-to) |
 | Regional routing | Not supported | First-class |
-| Dev enforcement | None | STRICT_MODE |
+| Outside a tenant | Public schema: missing-relation error | `TenantNotSetError` under `STRICT_MODE` |
 
 ---
 

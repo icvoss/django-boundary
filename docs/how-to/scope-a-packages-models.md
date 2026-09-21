@@ -27,6 +27,17 @@ something you add when you swap in your own concrete model.
   does, you need its class (for example `ArticleManager`) importable from the
   package.
 
+**If the package ships no swappable abstract base, this page does not apply.**
+Most third-party apps (allauth, taggit, wagtail) ship concrete models and own
+their migrations, so there is nothing to compose a mixin onto and no way to add
+a field without forking the package or taking over its migration history. The
+route for those is
+[Adopt a third-party app into your tenancy](adopt-a-third-party-app.md), which
+adds the tenant column and its Row Level Security policies in the database,
+below the ORM. It gives you the database isolation layer only, and that page
+states what the missing ORM layer costs. Prefer this page wherever a swappable
+base exists, because composing the mixin gives you both layers.
+
 ## Steps
 
 ### 1. Compose `TenantMixin` onto the package's abstract base
@@ -169,6 +180,8 @@ with pytest.raises(ArticleContextError):
 - [Add boundary to an existing app](add-boundary-to-an-existing-app.md): the
   full retrofit sequence, including the `from_queryset()` example referenced
   above.
+- [Adopt a third-party app into your tenancy](adopt-a-third-party-app.md): the
+  database-layer route for a package with no swappable abstract base.
 - [Scope a model through a relation](scope-models-through-a-relation.md): the
   mixin to use when the model reaches the tenant through a relation instead
   of owning its own FK.

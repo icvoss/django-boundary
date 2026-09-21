@@ -146,6 +146,40 @@ If you must set the flag with a hand-written `set_config` call (there is no supp
 
 > Safety: the admin flag disables the database's last line of defence. Use `admin_bypass()` for trusted maintenance only, never on a connection that serves tenant traffic, and never assume it is still active outside the `with` block: `admin_bypass()` clears it explicitly, but a hand-rolled session-scoped `set_config` would not.
 
+### 6. Bootstrap writes to an adopted table need a tenant context, not `admin_bypass()`
+
+If you have adopted a third-party app (`BOUNDARY_TENANT_APPS` plus the `AdoptTenantApp` migration operation), its tables carry a `tenant_id` column declared `NOT NULL DEFAULT boundary_current_tenant_id()`. Any write to one of those tables with no active tenant fails closed: the default evaluates to `NULL`, the `NOT NULL` constraint rejects the row, and the caller sees an `IntegrityError`. That is correct behaviour, and it must not be softened by making the column nullable or relaxing the isolation policy.
+
+**`admin_bypass()` is not the remedy for that failure, and `TenantContext.using()` is.** The failure is a `NOT NULL` constraint rejecting a `NULL` the column default produced, and a constraint is evaluated before any policy is consulted. The bypass flag only changes which rows the `boundary_admin_bypass` policy admits; it has no bearing on what `boundary_current_tenant_id()` returns. An ORM write inside `admin_bypass()` with no tenant active still raises `IntegrityError`.
+
+```python
+from boundary.context import TenantContext
+
+# Wrong: the flag does not give the column default a tenant to stamp.
+with admin_bypass():
+    EmailAddress.objects.create(user=user, email="a@example.com")  # IntegrityError
+
+# Right: the session variable is set, the default stamps that tenant, and
+# the isolation policy's WITH CHECK is satisfied with no bypass at all.
+with TenantContext.using(tenant):
+    EmailAddress.objects.create(user=user, email="a@example.com")
+```
+
+These are the paths that run with no tenant, and therefore need attention once an app is adopted:
+
+| Path | Why it runs without a tenant | Remedy |
+|---|---|---|
+| `createsuperuser` | An interactive management command, no request and no resolved tenant | Run it inside `TenantContext.using(tenant)`, or wrap it, if `auth` is adopted |
+| `loaddata` | Fixtures load outside any request cycle | Run it inside `TenantContext.using(tenant)` for the tenant the fixture belongs to |
+| `post_migrate` handlers | Run at the end of `migrate`, before any request or resolver, with no call site to wrap | None |
+| An adopted app's own data migrations | Run inside `migrate`, in the same no-tenant state | None |
+
+The last two have no clean remedy. An adopted app whose data migration inserts seed rows cannot be adopted as it stands: exclude that model via `BOUNDARY_ADOPT_EXCLUDE`, leaving its table global, or seed the rows per tenant from your own code inside `TenantContext.using(tenant)`. Django's own two shipped `post_migrate` handlers write only `auth.Permission` and `contenttypes.ContentType`, both refused by adoption, so neither is affected unless you adopt `auth` itself.
+
+`admin_bypass()` stays the right tool for exactly two cases on an adopted table: a cross-tenant **read**, and **raw SQL that supplies `tenant_id` explicitly**, which is how `boundary_deprovision` reaches these tables.
+
+See [Adopt a third-party app into your tenancy](adopt-a-third-party-app.md) for the full adoption procedure.
+
 ## Verify it worked
 
 - `unscoped`: with two tenants each owning one row, assert `Model.unscoped.count() == 2` while a single tenant is active, and `Model.objects.count() == 1`.
@@ -162,6 +196,7 @@ If you must set the flag with a hand-written `set_config` call (there is no supp
 - Forgetting that `boundary_run_all` only targets `is_active=True` tenants. Inactive tenants are skipped silently.
 - Passing inner-command flags before the inner command name in `boundary_run`. The inner command name comes first, then its arguments.
 - Setting `app.boundary_admin` by hand instead of via `admin_bypass()`. A hand-written `set_config` call with the third argument `false` (or a `SET` statement, which is always session-scoped) leaves the flag active on the connection indefinitely, and under `CONN_MAX_AGE` or an external pooler that connection is handed to a later, unrelated request. `admin_bypass()` makes this failure mode unreachable by hardcoding the transaction-local form; there is no supported way to opt into the session-scoped form through it.
+- Reaching for `admin_bypass()` when a write to an adopted table raises `IntegrityError` on `tenant_id`. The flag cannot help: the `NOT NULL` constraint is evaluated before any policy, and the flag does not change what the column default produces. Use `TenantContext.using(tenant)` instead (step 6).
 - Assuming `admin_bypass()` only widens what is visible. It also lifts the write check (no `WITH CHECK` on the bypass policy, permissive policies OR together), so code inside the block can INSERT or UPDATE rows for any tenant, not only read them.
 
 ## Related

@@ -60,3 +60,24 @@ class RLSNotEnforcedError(BoundaryError):
     ``manage.py check`` time, but that check never runs under a plain
     ``pytest`` invocation).
     """
+
+
+class AdoptionRefusedError(BoundaryError):
+    """AdoptTenantApp refused to adopt a table, naming the table and the reason.
+
+    A single exception class covers every refusal the operation makes
+    (BR-RLS-012, BR-RLS-013, BR-RLS-014, BR-RLS-016), because each one has
+    the same consequence for the caller: the migration stops, and nothing
+    the operation had already altered in that call survives, since the
+    operation runs inside the migration's own transaction and PostgreSQL's
+    DDL is transactional.
+
+    Refusing rather than skipping is deliberate. A silently skipped unique
+    constraint stays globally unique, which is exactly the cross-tenant
+    collapse adoption exists to prevent, and a silently skipped populated
+    table would be stamped by whichever tenant happened to be current at
+    migration time, which during `migrate` is normally no tenant at all.
+    The message always names the table and states why, so the consumer can
+    decide between excluding that model, splitting the operation, or
+    supplying a backfill tenant.
+    """

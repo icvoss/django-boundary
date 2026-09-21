@@ -14,6 +14,13 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "boundary",
     "boundary_testapp",
+    # A stand-in for a third-party package, plus the consuming project's own
+    # app that adopts it. The adoption tests need a genuinely passive app
+    # (no boundary import, no mixin, no tenant field) and a separate app to
+    # put the adoption migration in, because BR-RLS-013 requires the DDL to
+    # be applied from the consumer's migration, never the adopted app's.
+    "thirdparty",
+    "boundary_consumer",
 ]
 
 # PostgreSQL required — RLS tests use raw SQL against pg_class.
@@ -34,6 +41,16 @@ DATABASES = {
     "eu-west": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": ":memory:",
+        # thirdparty and boundary_consumer are the only apps with a real
+        # migration graph (see MIGRATION_MODULES below), and the consumer's
+        # adoption migration emits PostgreSQL DDL that SQLite cannot parse.
+        # A real project keeps a non-PostgreSQL alias off that graph with a
+        # router's allow_migrate(); a global DATABASE_ROUTERS is not usable
+        # here because test_checks.py sets that setting per-test and would
+        # override it. The alias only ever needs boundary_testapp.Tenant,
+        # which is unmigrated and is created by the test runner regardless
+        # of this flag, so skipping the graph costs the alias nothing.
+        "TEST": {"MIGRATE": False},
     },
 }
 
@@ -42,6 +59,14 @@ MIGRATION_MODULES = {
     "boundary_testapp": None,
     "contenttypes": None,
     "auth": None,
+    # thirdparty and boundary_consumer deliberately KEEP their real migration
+    # modules. AC-RLS-011 and AC-RLS-013 drive AdoptTenantApp through
+    # MigrationExecutor so real historical state is exercised, and an app
+    # mapped to None here has no migration graph to drive at all. It also
+    # fixes the ordering: an unmigrated app's tables are created by the test
+    # runner in post_migrate, which is after every migration, so the
+    # consumer's adoption migration would otherwise run before the tables it
+    # adopts exist.
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

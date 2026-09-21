@@ -296,3 +296,195 @@ class TestAssertRLSEnforced:
 
         message = str(exc_info.value)
         assert "No registered tenant-scoped table has Row Level Security" in message
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAcTest005AssertRlsEnforcedCoversAnAdoptedTable:
+    """AC-TEST-005 (BR-PRV-010): assert_rls_enforced covers an adopted table.
+
+    An adopted table is the case where this assertion matters most: it has
+    no ORM layer to fall back on, so a suite running as a BYPASSRLS role, or
+    against a database where the adoption DDL never applied, would exercise
+    no isolation at all and still pass every test.
+
+    The criterion's "a database in which the only tenant-scoped table is an
+    adopted thirdparty_widget, with no column-bearing tenant model migrated"
+    is reproduced without tearing the schema down: BOUNDARY_TENANT_APPS is
+    set to thirdparty (so the adopted table enters the selection) while
+    every column-bearing model is confirmed to have no RLS enabled, which
+    leaves the adopted table as the only thing that could satisfy the
+    assertion. If it were skipped, the call would raise, so a pass here
+    cannot come from anywhere else.
+
+    transaction=True for the same reason the class above needs it:
+    assert_rls_enforced opens its own psycopg connection, which cannot see
+    an uncommitted DDL change made on Django's.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _adopted_settings(self, settings):
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_TENANT_APPS = ["thirdparty"]
+        settings.BOUNDARY_ADOPT_EXCLUDE = [
+            "thirdparty.Seat",
+            "thirdparty.SeatBooking",
+            "thirdparty.Coupon",
+        ]
+
+    def _assert_no_column_bearing_table_enforces(self):
+        """Confirm the precondition the criterion's "only" clause rests on.
+
+        Every column-bearing model's table must NOT have RLS enabled and
+        forced, or a pass below could come from one of them and would say
+        nothing about the adopted table at all.
+        """
+        from django.apps import apps
+        from django.db import connection
+
+        from boundary.models import has_tenant_column, is_tenant_model
+
+        with connection.cursor() as cursor:
+            for model in apps.get_models():
+                if not is_tenant_model(model) or model._meta.abstract or not has_tenant_column(model):
+                    continue
+                cursor.execute(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
+                    [model._meta.db_table],
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    continue
+                assert not (row[0] and row[1]), (
+                    f"this proof requires no column-bearing table to be enforcing "
+                    f"going in; {model._meta.db_table} is, so another test left it enabled"
+                )
+
+    def test_ac_test_005_an_adopted_table_satisfies_the_assertion(self):
+        """When assert_rls_enforced(connection_params) is called with a
+        plain NOSUPERUSER NOBYPASSRLS role, then it returns without raising,
+        having confirmed the adopted table's enabled and forced RLS.
+
+        The negative control is in the same test: with BOUNDARY_TENANT_APPS
+        emptied, the adopted table leaves the selection, nothing is left to
+        check, and the call returns for the entirely different reason that
+        there was nothing to inspect. That distinction is what makes the
+        positive half meaningful, so the enforcing state is asserted
+        directly from pg_class too rather than inferred from a silent
+        return.
+        """
+        from django.db import connection
+
+        from boundary.testing import assert_rls_enforced
+
+        params = _require_app_role()
+        self._assert_no_column_bearing_table_enforces()
+
+        # The adopted table really is enforcing going in: the test database
+        # is built with boundary_consumer/0002 applied.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
+                ["thirdparty_widget"],
+            )
+            rls_enabled, rls_forced = cursor.fetchone()
+        assert rls_enabled and rls_forced, (
+            "this proof requires the adopted table to be enforcing going in; another test left it un-forced"
+        )
+
+        assert_rls_enforced(params)  # must not raise
+
+    def test_ac_test_005_an_un_forced_adopted_table_raises(self, settings):
+        """When RLS is then un-forced on that table and the call is
+        repeated, then RLSNotEnforcedError is raised naming the condition
+        that failed.
+
+        Every other adopted table is un-forced too, not just Widget: the
+        assertion returns as soon as ONE inspected table is confirmed
+        enforcing, so leaving thirdparty_tag or the through table enforcing
+        would make it pass for a reason that has nothing to do with the
+        damage under test.
+        """
+        from django.db import connection
+
+        from boundary.testing import assert_rls_enforced
+
+        params = _require_app_role()
+        self._assert_no_column_bearing_table_enforces()
+
+        tables = (
+            "thirdparty_widget",
+            "thirdparty_widget_tags",
+            "thirdparty_tag",
+            "thirdparty_gadget",
+        )
+        with connection.cursor() as cursor:
+            for table in tables:
+                cursor.execute(f'ALTER TABLE "{table}" NO FORCE ROW LEVEL SECURITY')
+        try:
+            with pytest.raises(RLSNotEnforcedError) as exc_info:
+                assert_rls_enforced(params)
+
+            message = str(exc_info.value)
+            assert "Row Level Security both" in message
+            assert "relrowsecurity and relforcerowsecurity" in message
+            assert "adopted tables" in message, f"the message must name the adopted tables it counted; got {message}"
+        finally:
+            with connection.cursor() as cursor:
+                for table in tables:
+                    cursor.execute(f'ALTER TABLE "{table}" FORCE ROW LEVEL SECURITY')
+
+    def test_ac_test_005_a_bypassing_role_still_raises_against_an_adopted_table(self):
+        """And a BYPASSRLS role still raises, even with the adopted table
+        correctly enforcing.
+
+        The role check fires before any table is inspected, and must keep
+        doing so once adopted tables are in the selection: a correctly
+        adopted table is exactly the state that would otherwise make a
+        bypassing suite look fully protected while PostgreSQL exempts it
+        from every policy on that table.
+        """
+        from django.db import connection
+
+        from boundary.testing import assert_rls_enforced
+
+        params = _default_connection_params()
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            rolsuper, rolbypassrls = cursor.fetchone()
+        assert rolsuper or rolbypassrls, (
+            "this proof requires the default test connection to be a "
+            "superuser/BYPASSRLS role; if it is not, re-verify this test "
+            "against the current environment"
+        )
+
+        with pytest.raises(RLSNotEnforcedError) as exc_info:
+            assert_rls_enforced(params)
+
+        message = str(exc_info.value)
+        assert "rolsuper" in message
+        assert "rolbypassrls" in message
+
+    def test_ac_test_005_the_adopted_table_is_why_it_passes(self):
+        """The discriminator: with BOUNDARY_TENANT_APPS emptied, the same
+        database state has nothing for the assertion to inspect.
+
+        Without this, the passing test above is consistent with the adopted
+        table never having entered the selection at all, because "returns
+        without raising" is also what the helper does when it finds nothing
+        to check. Here the selection itself is asserted: thirdparty_widget
+        is in it with the setting on, and absent from it with the setting
+        off.
+        """
+        from django.apps import apps
+        from django.test import override_settings
+
+        from boundary.checks import _rls_probe_targets
+
+        with override_settings(BOUNDARY_TENANT_APPS=["thirdparty"]):
+            tables = {table for _model, table, _adopted in _rls_probe_targets(apps)}
+        assert "thirdparty_widget" in tables
+
+        with override_settings(BOUNDARY_TENANT_APPS=[]):
+            tables = {table for _model, table, _adopted in _rls_probe_targets(apps)}
+        assert "thirdparty_widget" not in tables

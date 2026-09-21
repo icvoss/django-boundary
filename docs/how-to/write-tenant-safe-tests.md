@@ -242,6 +242,60 @@ detail = call_view(
 Prefer `call_view` over the Django test client when you want to exercise the view
 class directly without routing through URLconf and middleware.
 
+### 8. Run adopted-app tests against real PostgreSQL
+
+If you have adopted a third-party app (`BOUNDARY_TENANT_APPS` plus the
+`AdoptTenantApp` migration operation), the steps above do not apply to its
+tables. An adopted table carries a `tenant_id` column that no Django field
+models, so it has no manager to filter it, no strict-mode branch, and no
+`TenantNotSetError`. Its only isolation is PostgreSQL Row Level Security.
+
+**A suite that exercises adopted-app tenancy must therefore run against real
+PostgreSQL.** SQLite has no RLS, and unlike a mixin-scoped model there is no ORM
+layer underneath to compensate, so an adopted table on SQLite is completely
+unisolated and every isolation assertion you write against it passes vacuously.
+
+`assert_rls_enforced()` (see the [README's RLS test role
+section](../../README.md#rls-test-role-and-fail-closed-assertion)) now includes
+adopted tables in the tables it inspects, alongside the registered tenant
+models it already covered. Adopted tables are the case where it matters most: a
+suite running as a `BYPASSRLS` role, or against a database where the adoption
+DDL never applied, exercises no isolation at all and still passes. Wire it as a
+session-scoped autouse fixture so a misconfigured run stops before any test
+executes.
+
+Its contract is otherwise unchanged: it raises `RLSNotEnforcedError` naming the
+failed condition, returns without raising on a non-PostgreSQL backend or when
+nothing is yet migrated, and returns as soon as one inspected table is confirmed
+enforcing.
+
+Inside a test, adopted-table isolation is exercised through an ordinary tenant
+context, because the filtering is done by the database rather than by any
+manager:
+
+```python
+@pytest.mark.django_db
+def test_adopted_table_is_isolated():
+    tenant_a = tenant_factory()
+    tenant_b = tenant_factory()
+
+    with set_tenant(tenant_a):
+        EmailAddress.objects.create(user=user_a, email="a@example.com")
+    with set_tenant(tenant_b):
+        EmailAddress.objects.create(user=user_b, email="b@example.com")
+
+    with set_tenant(tenant_a):
+        assert EmailAddress.objects.count() == 1
+```
+
+Two differences from a mixin-scoped model will catch you out. A read with no
+active tenant returns **zero rows silently** rather than raising
+`TenantNotSetError`, so `pytest.raises(TenantNotSetError)` is the wrong
+assertion here. A write with no active tenant raises `IntegrityError` on the
+`NOT NULL` column, and `admin_bypass()` does not change that; assert on
+`IntegrityError` and establish a context with `set_tenant` where you need the
+write to succeed.
+
 ## Verify it worked
 
 Run the suite and confirm both the isolation and strict-mode tests pass:
@@ -279,6 +333,13 @@ raises `TenantNotSetError` when no tenant is active.
   the querysets the real (auto-filtered) manager returns, or use `set_tenant` /
   `call_view` to establish context. A mock pinned to a method that does not
   exist gives a false sense of coverage and breaks silently.
+- **Testing an adopted table on SQLite.** There is no RLS there and no ORM layer
+  beneath it, so the table is unisolated and every isolation assertion passes
+  without enforcing anything. Run those tests against real PostgreSQL and gate
+  the run with `assert_rls_enforced()`.
+- **Expecting `TenantNotSetError` from an adopted table.** It never raises one.
+  A read with no tenant returns zero rows silently; a write raises
+  `IntegrityError` on the `NOT NULL` tenant column.
 - **Calling a CBV without context.** A view called via a bare `RequestFactory`
   raises `TenantNotSetError` under strict mode. Use `call_view` (above), which
   wraps the call in an active tenant context.
@@ -289,5 +350,8 @@ raises `TenantNotSetError` when no tenant is active.
   configuring `BOUNDARY_TENANT_MODEL`.
 - [README: Features](../../README.md#features) for the full settings reference,
   including `BOUNDARY_STRICT_MODE`.
+- [Adopt a third-party app into your tenancy](./adopt-a-third-party-app.md): the
+  full adoption procedure, and the limits that make real PostgreSQL mandatory
+  for these tests.
 - Source of truth for the helpers: `src/boundary/testing.py`. Context API:
   `src/boundary/context.py`. Manager behaviour: `src/boundary/models.py`.

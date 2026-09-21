@@ -234,13 +234,23 @@ def assert_rls_enforced(connection_params: dict) -> None:
        ``boundary.W003`` (``checks.py``'s ``_check_rls_bypassable``) already
        probes, since PostgreSQL exempts a superuser or BYPASSRLS role from
        every policy regardless of what the table declares.
-    2. At least one registered tenant model's table has both
-       ``relrowsecurity`` and ``relforcerowsecurity`` set, using the same
+    2. At least one tenant-scoped table has both ``relrowsecurity`` and
+       ``relforcerowsecurity`` set, using the same
        ``to_regclass()``-qualified query ``boundary.E006``
-       (``_check_rls_enabled``) already uses, and the same
-       ``is_tenant_model()`` / ``has_tenant_column()`` registry
-       ``checks.py`` uses to pick which tables count, rather than a
-       hardcoded table name a consumer's schema might not have.
+       (``_check_rls_enabled``) already uses, and literally the same table
+       selection, ``checks._rls_probe_targets()``, rather than a hardcoded
+       table name a consumer's schema might not have.
+
+       That selection covers registered column-bearing models AND every
+       table ``BOUNDARY_TENANT_APPS`` expects to be adopted (BR-PRV-010).
+       An adopted table is the case where this assertion matters most: it
+       has no ORM layer to fall back on, so a suite running as a
+       ``BYPASSRLS`` role, or against a database where the adoption DDL
+       never applied, would exercise no isolation at all and still pass
+       every test. A consumer whose only tenant-scoped tables are adopted
+       ones (no column-bearing model migrated at all) previously had this
+       assertion find nothing to check and return silently, which is the
+       exact vacuous pass it exists to prevent.
 
     Raises ``RLSNotEnforcedError``, naming which condition failed and the
     value observed, rather than returning a bool: a caller that only checks
@@ -251,14 +261,14 @@ def assert_rls_enforced(connection_params: dict) -> None:
     downstream failures.
 
     A backend other than PostgreSQL, or a Django deployment with no
-    registered tenant model or tenant table yet migrated, has nothing for
-    this assertion to check: it returns without raising rather than
-    treating "nothing to enforce" as a failure.
+    tenant-scoped table yet migrated (column-bearing or adopted), has
+    nothing for this assertion to check: it returns without raising rather
+    than treating "nothing to enforce" as a failure.
     """
     import psycopg
     from django.apps import apps
 
-    from boundary.models import has_tenant_column, is_tenant_model
+    from boundary.checks import _rls_probe_targets
 
     with psycopg.connect(**connection_params) as conn, conn.cursor() as cursor:
         cursor.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
@@ -276,15 +286,7 @@ def assert_rls_enforced(connection_params: dict) -> None:
                 )
 
         checked_any_table = False
-        for model in apps.get_models():
-            if not is_tenant_model(model):
-                continue
-            if model._meta.abstract:
-                continue
-            if not has_tenant_column(model):
-                continue
-
-            table = model._meta.db_table
+        for _model, table, _adopted in _rls_probe_targets(apps):
             cursor.execute(
                 "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass(%s)::oid",
                 [table],
@@ -301,13 +303,16 @@ def assert_rls_enforced(connection_params: dict) -> None:
         if checked_any_table:
             raise RLSNotEnforcedError(
                 "No registered tenant-scoped table has Row Level Security both "
-                "enabled and forced (relrowsecurity and relforcerowsecurity). "
+                "enabled and forced (relrowsecurity and relforcerowsecurity), "
+                "counting adopted tables as well as column-bearing models. "
                 "RLS-isolation tests would pass without any policy actually "
                 "restricting rows. Run the EnableRLS/CreateTenantPolicy migration "
-                "operations, or see boundary.E006."
+                "operations, re-apply the AdoptTenantApp migration for an adopted "
+                "app, or see boundary.E006 and boundary.E007."
             )
-        # No tenant table exists yet on this connection (nothing migrated): nothing to
-        # check, consistent with boundary.E006's own pre-migrate skip.
+        # No tenant-scoped table exists yet on this connection (nothing migrated,
+        # and nothing adopted): nothing to check, consistent with boundary.E006's
+        # own pre-migrate skip.
 
 
 def rls_enforced(connection_params: dict) -> None:
