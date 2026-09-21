@@ -882,11 +882,22 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         other tables' policies may still depend on it, matching
         ``DropTenantPolicy``.
 
+        The derived set the reverse iterates is not the set of tables this
+        call actually altered: the forward skips a table an earlier migration
+        had already adopted, and a reverse that has already run has left none
+        of them adopted. So the reverse removes only what it can see, per
+        table, and does nothing at all where there is nothing to see
+        (BR-RLS-020).
+
         **This destroys the tenant assignment of every row on these tables**,
         because the assignment lives only in the dropped column and boundary
         snapshots nothing before dropping it.
         """
         from boundary import adoption
+
+        if not self._router_allows(schema_editor, app_label):
+            return
+        self._require_postgresql(schema_editor)
 
         models = adoption.adopted_models(self.app_label, apps=from_state.apps, exclude=self.exclude)
         for model in models:
@@ -946,6 +957,17 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         the wrong constraint: a composite unique on
         ``(tenant_id, <historical columns>)`` exists only because the forward
         created it.
+
+        **An original is recreated only where a composite was actually found
+        and dropped.** Recreating unconditionally would add a constraint the
+        table never lost, which is a real defect rather than a cosmetic one:
+        the forward refuses a unique form it cannot rewrite, so a model
+        reaching the reverse may legitimately have had no composite for one of
+        its historical column sets, and an unconditional CREATE would then
+        either duplicate a constraint that is already there or invent one the
+        schema never had. It also keeps the no-composite table untouched,
+        which is what makes a second reverse a genuine no-op rather than a
+        pass that quietly adds constraints (BR-RLS-020).
         """
         from boundary import adoption
 
@@ -954,10 +976,14 @@ class AdoptTenantApp(migrations.operations.base.Operation):
 
         for columns in _historical_unique_column_sets(model):
             wanted = ["tenant_id", *[field.column for field in columns]]
+            dropped = False
             for constraint in live:
                 if constraint["columns"] == wanted:
                     schema_editor.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{constraint["name"]}"')
+                    dropped = True
                     break
+            if not dropped:
+                continue
             statement = schema_editor._create_unique_sql(model, columns)
             if statement is not None:
                 schema_editor.execute(statement)
