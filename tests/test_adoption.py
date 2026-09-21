@@ -673,6 +673,29 @@ class TestAcRls010UniqueConstraintsBecomePerTenant:
             ):
                 assert column_type(cursor, table, "tenant_id") is None, table
 
+    def test_ac_rls_010_the_through_tables_implicit_unique_pair_leads_with_tenant_id(self, adopted):
+        """And the auto-created Widget_tags through table's implicit unique
+        pair was rewritten to a composite whose leading column is tenant_id.
+
+        The through table is the fourth of BR-RLS-012's unique sources, and
+        the only one no model declares: Django creates the ``(widget_id,
+        tag_id)`` unique constraint itself. It is asserted separately from the
+        declared forms because a rewrite keyed on ``_meta`` rather than on the
+        catalogue would miss exactly this one, and the table-wide
+        leading-column assertion above covers only thirdparty_widget.
+        """
+        names = unique_constraints_by_name("thirdparty_widget_tags")
+
+        composites = {name: columns for name, columns in names.items() if columns[0] == "tenant_id"}
+        assert len(composites) == 1, names
+        name, columns = next(iter(composites.items()))
+        assert name.endswith("_tenant"), name
+        assert sorted(columns[1:]) == ["tag_id", "widget_id"], columns
+
+        # Nothing global survives beside it: a decomposed pair would let two
+        # tenants' rows collide on the same (widget_id, tag_id).
+        assert len(names) == 1, names
+
 
 @pytest.mark.django_db(transaction=True)
 class TestAcRls011PopulatedTableIsRefusedWithoutBackfill:
