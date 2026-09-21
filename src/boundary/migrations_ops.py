@@ -4,6 +4,8 @@ These operations are included in auto-generated migrations for TenantModel
 subclasses, or can be added manually by developers.
 """
 
+from dataclasses import dataclass
+
 from django.db import migrations
 
 from boundary.conf import boundary_settings
@@ -27,9 +29,10 @@ def create_tenant_id_helper(schema_editor, pg_type: str) -> None:
     Shared by :class:`CreateTenantPolicy` and :class:`AdoptTenantApp` so both
     emit byte-identical SQL for the function every boundary policy and every
     adopted column default references (BR-RLS-011 step 1). ``CREATE OR
-    REPLACE FUNCTION`` is idempotent, so emitting it repeatedly (once per
-    adopted table) is safe and removes any ordering dependency between the
-    operations.
+    REPLACE FUNCTION`` is idempotent, so emitting it repeatedly is safe and
+    removes any ordering dependency between the operations;
+    :class:`AdoptTenantApp` emits it once per call, ahead of the first
+    table's DDL.
 
     *pg_type* is the PostgreSQL type the configured tenant model's primary
     key derives, as :func:`detect_tenant_pg_type` maps it.
@@ -368,6 +371,25 @@ class DropTenantPolicy(migrations.operations.base.Operation):
         )
 
 
+@dataclass(frozen=True)
+class _AdoptionPlan:
+    """What ``AdoptTenantApp`` will do to one table, decided before any DDL.
+
+    Produced by the read-only validation pass and consumed by the DDL pass, so
+    every refusal for every table in the derived set is raised while the
+    database is still untouched. The catalogue reads the plan carries
+    (``existing_rows``, ``rewrites``) are the same ones the DDL would
+    otherwise have made mid-flight.
+    """
+
+    model: object
+    table: str
+    label: str
+    pg_type: str
+    existing_rows: int
+    rewrites: list
+
+
 class AdoptTenantApp(migrations.operations.base.Operation):
     """Tenant-scope every concrete table of a third-party app (BR-RLS-013).
 
@@ -433,16 +455,31 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         applying an old migration to a new database produces the schema that
         migration described rather than the schema today's installed package
         version would describe (BR-RLS-013).
+
+        **Every refusal is evaluated for every table before any DDL is
+        issued.** The operation is atomic, so a refusal on the last table
+        rolls back the DDL the earlier ones had already taken; but a rollback
+        is not the same thing as never having issued the statements. A
+        migration run against a role or a database where the ALTER succeeds
+        and the rollback does not (a non-transactional backend, an
+        autocommitting wrapper, a connection dropped mid-migration) would
+        leave a table part-adopted that the refusal says was never adopted at
+        all. Validating the whole set first also makes the refusal message
+        the FIRST thing a consumer sees, rather than the tail of a stack of
+        statements they now have to reason about.
         """
         from boundary import adoption
-        from boundary.conf import get_tenant_model
         from boundary.exceptions import AdoptionRefusedError
+
+        if not self._router_allows(schema_editor, app_label):
+            return
+        self._require_postgresql(schema_editor)
 
         refusal = adoption.refusal_reason(self.app_label, apps=to_state.apps)
         if refusal is not None:
             raise AdoptionRefusedError(f"AdoptTenantApp cannot adopt: {refusal}")
 
-        pg_type = detect_tenant_pg_type(get_tenant_model()._meta.pk)
+        pg_type = self._tenant_pg_type()
         models = adoption.adopted_models(self.app_label, apps=to_state.apps, exclude=self.exclude)
 
         # A single-model app whose only model is the tenant model derives an
@@ -453,8 +490,115 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         if not models:
             self._refuse_empty_set(to_state.apps)
 
-        for model in models:
-            self._adopt_table(schema_editor, model, pg_type)
+        # Pass one: read-only. Every per-table refusal for every table in the
+        # derived set, with nothing written. A plan of None means the table is
+        # already adopted and is skipped unchanged (BR-RLS-013's per-table
+        # idempotency).
+        plans = []
+        with schema_editor.connection.cursor() as cursor:
+            for model in models:
+                plan = self._validate_table(cursor, model, pg_type)
+                if plan is not None:
+                    plans.append(plan)
+
+        # Pass two: the DDL. The helper both the column DEFAULT and both
+        # policies reference is created once for the whole operation rather
+        # than per table; CREATE OR REPLACE FUNCTION is idempotent either way,
+        # and emitting it once keeps it out of the per-table step order
+        # without changing what any table ends up referencing.
+        if plans:
+            create_tenant_id_helper(schema_editor, pg_type)
+        for plan in plans:
+            self._adopt_table(schema_editor, plan)
+
+    def _router_allows(self, schema_editor, app_label) -> bool:
+        """Return whether the router permits this operation on this alias.
+
+        Mirrors ``RunSQL.database_forwards``: an operation emitting raw SQL
+        asks ``router.allow_migrate()`` for the migration's own app label and
+        does nothing at all when the answer is no. Without this a project
+        whose router keeps a non-PostgreSQL alias off the graph still has the
+        adoption DDL pushed at that alias, because ``reduces_to_sql``
+        operations are not covered by the model-level ``allow_migrate_model``
+        the schema-altering operations use.
+
+        ``model_name`` is passed as the hint, naming the app being adopted
+        rather than a single model, because the operation acts on every
+        concrete table of that app and a router answering per model has no
+        one model to answer for. A router that keys only on the app label
+        (which is the ordinary form) is unaffected by the hint.
+        """
+        from django.db import router
+
+        return router.allow_migrate(
+            schema_editor.connection.alias,
+            app_label,
+            model_name=self.app_label,
+        )
+
+    def _require_postgresql(self, schema_editor) -> None:
+        """Refuse a non-PostgreSQL connection the router did allow.
+
+        Adoption is Row Level Security, and only PostgreSQL has it. On SQLite
+        or MySQL the ``CREATE POLICY`` statements are a syntax error, so the
+        migration fails either way; what differs is the message. A vendor
+        refusal names the backend and the rule, where the backend's own
+        parser error names a fragment of generated SQL and leaves the
+        consumer to work out that adoption is PostgreSQL-only
+        (BR-RLS-015: an adopted table on a non-PostgreSQL backend is
+        unisolated and has no ORM layer underneath it to compensate).
+
+        Checked only after the router has allowed the alias, so the
+        documented way to keep a non-PostgreSQL alias off the adoption graph
+        (a router's ``allow_migrate``) stays a silent no-op rather than
+        becoming a refusal.
+        """
+        from boundary.exceptions import AdoptionRefusedError
+
+        vendor = schema_editor.connection.vendor
+        if vendor == "postgresql":
+            return
+        raise AdoptionRefusedError(
+            f"AdoptTenantApp cannot adopt app '{self.app_label}' on database alias "
+            f"'{schema_editor.connection.alias}': its backend vendor is '{vendor}', and adoption "
+            f"is PostgreSQL Row Level Security, which no other backend has. Keep this alias off "
+            f"the adoption migration's graph with a router's allow_migrate(), or run the migration "
+            f"against PostgreSQL."
+        )
+
+    def _tenant_pg_type(self) -> str:
+        """Return the adopted column's type, refusing an unmappable tenant key.
+
+        ``detect_tenant_pg_type`` falls back to ``bigint`` for a type its map
+        does not cover, which is correct for ``CreateTenantPolicy`` (that
+        operation acts on a column a Django field already declares, so the
+        type is not boundary's to get wrong) and wrong here: adoption CREATES
+        the column, and a silent ``bigint`` for, say, a ``CharField``
+        primary key puts a column of the wrong type on every adopted table.
+        Because the column is invisible to the ORM, the mismatch first
+        surfaces as a cast failure inside ``boundary_current_tenant_id()``,
+        which returns NULL on any exception, so it reads as empty results and
+        NOT NULL violations with nothing naming the cause (BR-RLS-011 step 1).
+        """
+        from django.db import connection
+
+        from boundary.conf import get_tenant_model, resolve_tenant_model_setting
+        from boundary.exceptions import AdoptionRefusedError
+
+        pk_field = get_tenant_model()._meta.pk
+        db_type = pk_field.db_type(connection)
+        pg_type = _PG_TYPE_MAP.get(db_type)
+        if pg_type is None:
+            raise AdoptionRefusedError(
+                f"AdoptTenantApp cannot adopt app '{self.app_label}': the configured tenant model "
+                f"'{resolve_tenant_model_setting()}' has primary key '{pk_field.name}' of type "
+                f"'{type(pk_field).__name__}', whose database type '{db_type}' maps to neither "
+                f"uuid nor bigint. Adoption creates the tenant_id column itself, so it refuses "
+                f"rather than guess a type: a wrong one is invisible to the ORM and surfaces only "
+                f"as empty reads and NOT NULL violations. Give the tenant model a UUID or integer "
+                f"primary key, or scope these tables with a declared tenant field instead."
+            )
+        return pg_type
 
     def _refuse_empty_set(self, apps):
         """Raise naming why the derived set is empty, never return normally.
@@ -485,8 +629,92 @@ class AdoptTenantApp(migrations.operations.base.Operation):
             f"Every concrete model is excluded, already tenant-scoped, or the app has none."
         )
 
-    def _adopt_table(self, schema_editor, model, pg_type: str) -> None:
+    def _validate_table(self, cursor, model, pg_type: str):
+        """Evaluate every per-table refusal, writing nothing.
+
+        Returns an ``_AdoptionPlan`` for a table that will be adopted, or
+        None for one already carrying a ``tenant_id`` column of the expected
+        type, which is skipped unchanged (BR-RLS-013's per-table
+        idempotency). Raises ``AdoptionRefusedError`` for any of the four
+        per-table refusals BR-RLS-012, BR-RLS-014 and BR-RLS-016 define:
+        a column of the wrong type, a deny-listed model, a populated table
+        with no backfill tenant, and a unique form the rewrite cannot
+        express.
+
+        Everything here is a catalogue read, so calling it for the whole
+        derived set before any statement is issued costs one extra pass over
+        ``pg_attribute``, ``pg_constraint`` and ``pg_index`` and buys the
+        guarantee that a refusal leaves the database untouched rather than
+        rolled back.
+        """
+        from boundary import adoption
+        from boundary.exceptions import AdoptionRefusedError
+
+        table = model._meta.db_table
+        label = adoption.model_label(model)
+
+        # Per-table idempotency. A table already carrying a tenant_id column
+        # of the expected type is skipped unchanged, so a second
+        # AdoptTenantApp migration added after a package upgrade adopts only
+        # the newly added models. One of a DIFFERENT type is refused, since
+        # boundary cannot tell its own column from a column the adopted app
+        # genuinely declares.
+        existing = adoption.column_type(cursor, table, "tenant_id")
+        if existing is not None:
+            if _pg_types_match(existing, pg_type):
+                return None
+            raise AdoptionRefusedError(
+                f"AdoptTenantApp cannot adopt table '{table}' (model '{label}'): it already "
+                f"carries a tenant_id column of type '{existing}', but the configured tenant "
+                f"model's primary key derives type '{pg_type}'. Boundary cannot tell its own "
+                f"column from one the adopted app declares, so it refuses rather than guess."
+            )
+
+        # The per-model half of the deny-list. The app-level half already ran
+        # once for the whole operation.
+        model_refusal = adoption.refusal_reason_for_model(model)
+        if model_refusal is not None:
+            raise AdoptionRefusedError(f"AdoptTenantApp cannot adopt: {model_refusal}")
+
+        # Probe the row count, and refuse a populated table with no backfill
+        # tenant. PostgreSQL evaluates ADD COLUMN ... DEFAULT once for
+        # existing rows, so the one-shot form would stamp every pre-existing
+        # row with whichever tenant was current at migration time, which
+        # during `migrate` is normally no tenant at all.
+        existing_rows = adoption.row_count(cursor, table)
+        if existing_rows and self.backfill_tenant is None:
+            raise AdoptionRefusedError(
+                f"AdoptTenantApp refuses to adopt table '{table}' (model '{label}'): it holds "
+                f"{existing_rows} row(s) and no backfill_tenant was given. Adding the column "
+                f"with its default would stamp every existing row with whichever tenant was "
+                f"current at migration time, which during migrate is normally none. Pass "
+                f"backfill_tenant=<tenant pk> to assign them deliberately, or exclude this "
+                f"model."
+            )
+
+        # The unique forms the rewrite cannot express, refused before the
+        # column is added rather than after (BR-RLS-012). The introspection is
+        # unaffected by the pending ADD COLUMN: an added column carries no
+        # unique constraint and no unique index of its own.
+        rewrites = self._plan_unique_rewrites(cursor, table, label)
+
+        return _AdoptionPlan(
+            model=model,
+            table=table,
+            label=label,
+            pg_type=pg_type,
+            existing_rows=existing_rows,
+            rewrites=rewrites,
+        )
+
+    def _adopt_table(self, schema_editor, plan) -> None:
         """Adopt one table, in exactly the DDL order BR-RLS-011 fixes.
+
+        The helper function (step 1) is created once for the whole operation
+        by :meth:`database_forwards`, and every refusal (steps 2 to 4, and
+        the unique-form refusals inside step 6) has already been evaluated
+        for every table in the derived set by :meth:`_validate_table`, so
+        this method only writes.
 
         Step 6 (enabling RLS) must come after step 5 (the backfill). Under
         FORCE ROW LEVEL SECURITY with the isolation policy already in place,
@@ -495,63 +723,21 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         table that then fails SET NOT NULL or, worse, passes it on rows the
         migrating role cannot see.
         """
-        from boundary import adoption
-        from boundary.exceptions import AdoptionRefusedError
-
-        table = model._meta.db_table
-        label = adoption.model_label(model)
-
-        # Step 1: the helper the column DEFAULT and both policies reference.
-        # CREATE OR REPLACE FUNCTION is idempotent, so emitting it per table
-        # is safe and removes any ordering dependency on a CreateTenantPolicy
-        # having run first.
-        create_tenant_id_helper(schema_editor, pg_type)
+        table = plan.table
 
         with schema_editor.connection.cursor() as cursor:
-            # Step 2: per-table idempotency. A table already carrying a
-            # tenant_id column of the expected type is skipped unchanged, so
-            # a second AdoptTenantApp migration added after a package upgrade
-            # adopts only the newly added models. One of a DIFFERENT type is
-            # refused, since boundary cannot tell its own column from a
-            # column the adopted app genuinely declares.
-            existing = adoption.column_type(cursor, table, "tenant_id")
-            if existing is not None:
-                if _pg_types_match(existing, pg_type):
-                    return
-                raise AdoptionRefusedError(
-                    f"AdoptTenantApp cannot adopt table '{table}' (model '{label}'): it already "
-                    f"carries a tenant_id column of type '{existing}', but the configured tenant "
-                    f"model's primary key derives type '{pg_type}'. Boundary cannot tell its own "
-                    f"column from one the adopted app declares, so it refuses rather than guess."
-                )
-
-            # Step 3: the per-model half of the deny-list. The app-level half
-            # already ran once for the whole operation.
-            model_refusal = adoption.refusal_reason_for_model(model)
-            if model_refusal is not None:
-                raise AdoptionRefusedError(f"AdoptTenantApp cannot adopt: {model_refusal}")
-
-            # Step 4: probe the row count, and refuse a populated table with
-            # no backfill tenant. PostgreSQL evaluates ADD COLUMN ... DEFAULT
-            # once for existing rows, so the one-shot form would stamp every
-            # pre-existing row with whichever tenant was current at migration
-            # time, which during `migrate` is normally no tenant at all.
-            existing_rows = adoption.row_count(cursor, table)
-            if existing_rows and self.backfill_tenant is None:
-                raise AdoptionRefusedError(
-                    f"AdoptTenantApp refuses to adopt table '{table}' (model '{label}'): it holds "
-                    f"{existing_rows} row(s) and no backfill_tenant was given. Adding the column "
-                    f"with its default would stamp every existing row with whichever tenant was "
-                    f"current at migration time, which during migrate is normally none. Pass "
-                    f"backfill_tenant=<tenant pk> to assign them deliberately, or exclude this "
-                    f"model."
-                )
-
             # Step 5: add the column, backfilling when there are rows.
-            self._add_tenant_column(schema_editor, cursor, table, label, pg_type, existing_rows)
+            self._add_tenant_column(
+                schema_editor,
+                cursor,
+                table,
+                plan.label,
+                plan.pg_type,
+                plan.existing_rows,
+            )
 
-            # Step 6: rewrite unique constraints to lead with tenant_id.
-            self._rewrite_unique_constraints(schema_editor, cursor, model, table, label)
+        # Step 6: rewrite unique constraints to lead with tenant_id.
+        self._apply_unique_rewrites(schema_editor, table, plan.rewrites)
 
         # Step 7: enable and force RLS, strictly after the backfill.
         schema_editor.execute(f'ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY')
@@ -593,8 +779,8 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         schema_editor.execute(f'ALTER TABLE "{table}" ALTER COLUMN tenant_id SET NOT NULL')
         schema_editor.execute(f'ALTER TABLE "{table}" ALTER COLUMN tenant_id SET DEFAULT boundary_current_tenant_id()')
 
-    def _rewrite_unique_constraints(self, schema_editor, cursor, model, table, label):
-        """Replace every non-PK unique form with a composite on tenant_id (BR-RLS-012).
+    def _plan_unique_rewrites(self, cursor, table, label):
+        """Return the ``(old_name, new_columns)`` rewrites for *table* (BR-RLS-012).
 
         The catalogue is introspected rather than the names being
         constructed, because Django generates the four unique sources into
@@ -607,7 +793,9 @@ class AdoptTenantApp(migrations.operations.base.Operation):
 
         A form the operation cannot rewrite makes it refuse rather than skip.
         A silently skipped unique constraint stays globally unique, which is
-        the exact cross-tenant collapse adoption exists to prevent.
+        the exact cross-tenant collapse adoption exists to prevent. Every
+        such refusal is raised here, in the read-only validation pass, so it
+        reaches the consumer before any table has been altered.
         """
         from boundary import adoption
         from boundary.exceptions import AdoptionRefusedError
@@ -639,6 +827,7 @@ class AdoptTenantApp(migrations.operations.base.Operation):
                 f"Exclude this model, or write the rewrite by hand in your own migration."
             )
 
+        rewrites = []
         for constraint in adoption.unique_constraints(cursor, table):
             name = constraint["name"]
             if constraint["deferrable"]:
@@ -657,7 +846,20 @@ class AdoptTenantApp(migrations.operations.base.Operation):
                     f"model, or write the rewrite by hand in your own migration."
                 )
 
-            columns = ["tenant_id", *constraint["columns"]]
+            rewrites.append((name, ["tenant_id", *constraint["columns"]]))
+
+        return rewrites
+
+    def _apply_unique_rewrites(self, schema_editor, table, rewrites) -> None:
+        """Drop each planned original and add its composite replacement.
+
+        The replacement name is derived here rather than during planning
+        because :func:`composite_constraint_name` falls through to the schema
+        editor's own truncate-and-hash scheme, and the plan carries the
+        original name it derives from instead, so the two halves cannot
+        disagree about which constraint a name belongs to.
+        """
+        for name, columns in rewrites:
             new_name = composite_constraint_name(schema_editor, table, name, columns)
             quoted = ", ".join(f'"{column}"' for column in columns)
             schema_editor.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{name}"')
