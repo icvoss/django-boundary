@@ -622,6 +622,57 @@ class TestAcRls010UniqueConstraintsBecomePerTenant:
             ):
                 assert column_type(cursor, table, "tenant_id") is None, table
 
+    def test_ac_rls_010_a_refusal_in_the_set_issues_no_ddl_for_any_table(self, unadopted):
+        """And a derived set holding one refusable table and several clean
+        ones issues no DDL at all, rather than adopting the clean ones and
+        relying on the transaction to take them back.
+
+        The set here is Widget, Tag, the Widget_tags through table and Gadget,
+        all clean, plus Seat, whose unique constraint a ForeignKey targets and
+        which the operation refuses. The refusal must be reached before a
+        single statement is offered for any of them.
+
+        Two instruments, because either alone is weak. ``collect_sql=True``
+        makes the schema editor append every statement to a list instead of
+        executing it, so an empty list is direct evidence that no DDL was
+        EMITTED rather than evidence that it was emitted and rolled back;
+        introspection still runs, because it goes through a raw cursor. The
+        second run then goes through a real ``atomic=False`` schema editor
+        outside any atomic block, where each statement would commit as it ran,
+        so a clean table still carrying no column is evidence no rollback was
+        involved. The clean tables coming first is what makes the test
+        falsifiable: the derived set follows the app registry's own order, in
+        which Tag, Widget_tags, Widget and Gadget all precede Seat, so a
+        per-table validate-then-write loop would have adopted four tables
+        before reaching the refusal.
+        """
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=("thirdparty.Coupon",))
+
+        with connection.schema_editor(collect_sql=True) as editor:
+            with pytest.raises(AdoptionRefusedError) as caught:
+                operation.database_forwards("boundary_consumer", editor, state, state)
+            collected = list(editor.collected_sql)
+        assert "thirdparty.Seat" in str(caught.value)
+        assert collected == [], collected
+
+        # The same refusal through a schema editor that cannot roll back.
+        with (
+            pytest.raises(AdoptionRefusedError),
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+
+        with connection.cursor() as cursor:
+            for table in (
+                "thirdparty_widget",
+                "thirdparty_widget_tags",
+                "thirdparty_tag",
+                "thirdparty_gadget",
+                "thirdparty_seat",
+            ):
+                assert column_type(cursor, table, "tenant_id") is None, table
+
 
 @pytest.mark.django_db(transaction=True)
 class TestAcRls011PopulatedTableIsRefusedWithoutBackfill:
