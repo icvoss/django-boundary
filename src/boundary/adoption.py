@@ -165,9 +165,21 @@ def _is_already_scoped(model) -> bool:
     about the model's Python class rather than about the schema at a
     migration point: the class either declares the mixin today or it does
     not, and a class that has since gained one is exactly the case where
-    adopting it would be wrong. A model present in the historical state but
-    absent from the live registry (deleted upstream since) is treated as not
-    scoped, and is then excluded anyway by its table not existing.
+    adopting it would be wrong.
+
+    A live-registry MISS is treated as not scoped, which is deliberate and
+    has one visible consequence. A model present in the historical state but
+    gone from the live registry (removed by an upstream package upgrade since
+    the adoption migration was written) stays in the derived set, so applying
+    that migration to a fresh database adopts its table RLS-only: the table
+    exists, because the adopted app's own historical migrations created it,
+    and it gets a tenant_id column, the rewritten unique constraints and both
+    policies while no live model class refers to it at all. That is harmless.
+    An orphaned table is one nothing reads or writes, and adopting it leaves
+    it isolated rather than exposed; the alternative, guessing that a missing
+    class means a missing table, would skip a table that IS present and leave
+    it globally readable. The absence of a class is not evidence about the
+    schema, and this function does not treat it as any.
     """
     from django.apps import apps as live_apps
 
