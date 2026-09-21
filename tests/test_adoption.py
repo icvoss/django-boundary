@@ -2289,3 +2289,132 @@ class TestTheBackfillUpdateIsParameterised:
         assert "3 row" in message
         assert "5" in message
         assert scratch in message
+
+
+@pytest.mark.django_db(transaction=True)
+class TestE006AndW009WordThemselvesForAnAdoptedTable:
+    """BR-RLS-010: boundary.E006 and boundary.W009 word their message and
+    hint for an adopted table, not just select one.
+
+    ``_rls_probe_targets()`` yields an ``adopted`` flag alongside each table
+    precisely so the two checks can say something an adopted table's operator
+    can act on, and the branch is load-bearing: the column-bearing wording
+    tells the reader to run ``EnableRLS``, which is the wrong migration for an
+    adopted table and would not restore the policies adoption also creates.
+    Selection is already pinned elsewhere; what these tests pin is the branch
+    that selection feeds.
+
+    Each test pairs the assertion with a control that flips only
+    ``BOUNDARY_TENANT_APPS``. Without it a check reporting the table for some
+    unrelated reason would satisfy the positive arm, and the adopted branch
+    would never be proven to be the thing that fired.
+
+    transaction=True for the same reason the E007 class uses it: the E006 test
+    damages RLS state with DDL and restores it, and the check reads that state
+    back through its own cursor.
+    """
+
+    TABLE = "thirdparty_widget"
+
+    def _e006(self):
+        from boundary.checks import _check_rls_enabled
+
+        return [e for e in _check_rls_enabled() if e.id == "boundary.E006" and f"Table '{self.TABLE}'" in e.msg]
+
+    def _w009(self):
+        """W009 warnings naming this table, matched on the quoted form.
+
+        A bare substring would also match ``thirdparty_widget_tags``, the
+        auto-created through table, which is genuinely adopted and genuinely
+        warned about; quoting pins the assertion to the one table under test.
+        """
+        from boundary.checks import _check_db_session_var_disabled_with_rls_enabled
+
+        return [
+            e
+            for e in _check_db_session_var_disabled_with_rls_enabled()
+            if e.id == "boundary.W009" and f"'{self.TABLE}'" in e.msg
+        ]
+
+    def test_e006_on_an_adopted_table_names_adoption_not_enable_rls(self, settings, adopted):
+        """Given thirdparty is adopted and thirdparty_widget has been
+        un-forced, then exactly one boundary.E006 names it, says it is an
+        adopted table, and its hint points at AdoptTenantApp rather than
+        EnableRLS.
+        """
+        settings.BOUNDARY_TENANT_APPS = E007_TENANT_APPS
+        settings.BOUNDARY_ADOPT_EXCLUDE = E007_ADOPT_EXCLUDE
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'ALTER TABLE "{self.TABLE}" NO FORCE ROW LEVEL SECURITY')
+        try:
+            errors = self._e006()
+            assert len(errors) == 1, f"expected exactly one E006 for the adopted table; got {[e.msg for e in errors]}"
+
+            error = errors[0]
+            assert "adopted table" in error.msg
+            assert "Row Level Security enabled and forced" in error.msg
+            assert "AdoptTenantApp('thirdparty')" in error.hint
+            assert "no ORM layer behind it" in error.hint
+            # The column-bearing wording must not be what an adopted table
+            # gets: EnableRLS alone would leave the policies uncreated.
+            assert "Run EnableRLS migration operation" not in error.msg
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(f'ALTER TABLE "{self.TABLE}" FORCE ROW LEVEL SECURITY')
+
+    def test_e006_is_silent_for_the_same_damage_when_the_app_is_not_listed(self, settings):
+        """Control: the same un-forced table draws no E006 at all when
+        BOUNDARY_TENANT_APPS is unset.
+
+        thirdparty_widget carries no mixin and no tenant field, so the setting
+        is the only thing that puts it in E006's target set. This is what makes
+        the wording above attributable to the adopted branch.
+        """
+        settings.BOUNDARY_TENANT_APPS = []
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'ALTER TABLE "{self.TABLE}" NO FORCE ROW LEVEL SECURITY')
+        try:
+            assert self._e006() == []
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(f'ALTER TABLE "{self.TABLE}" FORCE ROW LEVEL SECURITY')
+
+    def test_w009_on_an_adopted_table_says_it_has_no_orm_filtering(self, settings, adopted):
+        """Given thirdparty is adopted and BOUNDARY_SET_DB_SESSION_VAR is
+        False, then boundary.W009 names thirdparty_widget, says the adopted
+        table is left with no isolation, and its hint offers reversing
+        AdoptTenantApp or dropping the app from BOUNDARY_TENANT_APPS.
+
+        No DDL here: the adopted baseline already has RLS enabled and forced,
+        which is the half of W009's condition the table supplies, and the
+        setting supplies the other half.
+        """
+        settings.BOUNDARY_TENANT_APPS = E007_TENANT_APPS
+        settings.BOUNDARY_ADOPT_EXCLUDE = E007_ADOPT_EXCLUDE
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        warnings = self._w009()
+        assert len(warnings) == 1, f"expected exactly one W009 for the adopted table; got {[w.msg for w in warnings]}"
+
+        warning = warnings[0]
+        assert "adopted table" in warning.msg
+        assert "not actually enforced" in warning.msg
+        assert "no ORM filtering behind it" in warning.hint
+        assert "AdoptTenantApp('thirdparty')" in warning.hint
+        assert "BOUNDARY_TENANT_APPS" in warning.hint
+
+    def test_w009_is_silent_for_the_same_table_when_the_app_is_not_listed(self, settings, adopted):
+        """Control: the same opt-out draws no W009 for thirdparty_widget when
+        BOUNDARY_TENANT_APPS is unset, even though the table still has RLS
+        enabled and forced.
+
+        The RLS state is identical in both arms, so only the setting differs,
+        which is what attributes the warning above to the adopted branch
+        rather than to the table's RLS state alone.
+        """
+        settings.BOUNDARY_TENANT_APPS = []
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        assert self._w009() == []
