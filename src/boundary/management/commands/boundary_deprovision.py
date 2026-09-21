@@ -5,6 +5,10 @@ and path-scoped models are reached through their scoped managers; adopted
 tables (BR-PRV-009) have no manager, no Django field and no ORM lookup at
 all, so each step reaches them by raw SQL against the ``tenant_id`` column
 that adoption added, inside ``admin_bypass()``.
+
+The scoped branch gets its database alias from the router because it goes
+through the ORM; the adopted branch asks the router itself, so both reach the
+same alias under ``BOUNDARY_REGIONS``.
 """
 
 import json
@@ -149,13 +153,17 @@ class Command(BaseCommand):
         return result
 
     def _count_adopted_rows(self, model, tenant):
-        """Return the adopted table's row count for *tenant* (BR-PRV-009)."""
-        from django.db import connection
+        """Return the adopted table's row count for *tenant* (BR-PRV-009).
 
+        On the alias the router writes the model to, so a ``BOUNDARY_REGIONS``
+        deployment counts the rows where they actually live; see
+        :meth:`_adopted_connection`.
+        """
         from boundary.context import admin_bypass
 
+        alias, connection = self._adopted_connection(model, write=True)
         table = connection.ops.quote_name(model._meta.db_table)
-        with admin_bypass(), connection.cursor() as cursor:
+        with admin_bypass(using=alias), connection.cursor() as cursor:
             cursor.execute(f"SELECT count(*) FROM {table} WHERE tenant_id = %s", [tenant.pk])
             return cursor.fetchone()[0]
 
@@ -166,14 +174,46 @@ class Command(BaseCommand):
         ``ForeignKey`` and has no ``ON DELETE`` behind it, so deleting the
         tenant row would otherwise leave every adopted row pointing at a
         primary key that no longer exists.
-        """
-        from django.db import connection
 
+        On the router's write alias, matching the count, so a regional
+        deployment deletes the rows it reported rather than none.
+        """
         from boundary.context import admin_bypass
 
+        alias, connection = self._adopted_connection(model, write=True)
         table = connection.ops.quote_name(model._meta.db_table)
-        with admin_bypass(), connection.cursor() as cursor:
+        with admin_bypass(using=alias), connection.cursor() as cursor:
             cursor.execute(f"DELETE FROM {table} WHERE tenant_id = %s", [tenant.pk])
+
+    def _adopted_connection(self, model, *, write):
+        """Return ``(alias, connection)`` for an adopted model's raw SQL.
+
+        The scoped branch of every step goes through the ORM, so the router
+        routes it; the adopted branch issues raw SQL and has to ask the router
+        itself. Hardcoding ``default`` here would make a ``BOUNDARY_REGIONS``
+        deployment count zero rows on the wrong database, report nothing to
+        delete, and leave every adopted row of the deprovisioned tenant behind
+        on the regional alias, isolated by RLS and therefore visible to nobody
+        and deleted by nothing.
+
+        The count and the delete both take the WRITE alias, not one each, so
+        the number the operator confirms is the number of rows the delete then
+        matches. The export takes the read alias, which is where a replica
+        deployment wants its bulk read.
+
+        ``using`` is passed on to ``admin_bypass()`` as well, because the
+        bypass flag is a session variable on one connection: set on
+        ``default`` while the statements run on a regional alias, the flag
+        would be inert there and RLS would match no rows at all.
+
+        No ``default`` fallback is needed: Django's ``ConnectionRouter``
+        returns ``DEFAULT_DB_ALIAS`` itself when no installed router answers,
+        which is every deployment that has configured none.
+        """
+        from django.db import connections, router
+
+        alias = router.db_for_write(model) if write else router.db_for_read(model)
+        return alias, connections[alias]
 
     def _print_dry_run(self, tenant, affected):
         adopted_tables = _adopted_table_set()
@@ -240,16 +280,20 @@ class Command(BaseCommand):
         round-trips as the ISO/string form Django itself writes, rather than
         raising ``TypeError`` mid-export and truncating the operator's only
         copy of the data.
-        """
-        from django.db import connection
 
+        Read on the router's READ alias (see :meth:`_adopted_connection`), so
+        a regional deployment exports the rows it is about to delete rather
+        than an empty file, and a replica deployment takes the bulk read off
+        the primary.
+        """
         from boundary.context import admin_bypass
 
+        alias, connection = self._adopted_connection(model, write=False)
         table = connection.ops.quote_name(model._meta.db_table)
         label = f"{model._meta.app_label}.{model.__name__}"
         pk_column = model._meta.pk.column
 
-        with admin_bypass():
+        with admin_bypass(using=alias):
             # connection.connection is None until Django has actually opened
             # the underlying connection; admin_bypass() has just issued
             # set_config on it, so it is open by here.

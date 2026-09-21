@@ -385,6 +385,44 @@ def _clear_widgets():
         cursor.execute('TRUNCATE "thirdparty_widget_tags", "thirdparty_widget" CASCADE')
 
 
+#: The alias name the regional-routing test routes the adopted model to. It is
+#: never opened: the ``alias_recorder`` fixture records the lookup and serves
+#: the real ``default`` connection, so the command's SQL genuinely executes
+#: while the alias it chose is still observable, and no third database is added
+#: to the suite.
+REGIONAL_ALIAS = "adopted-regional"
+
+
+class _AdoptedModelRegionalRouter:
+    """Route the adopted model to a named non-default alias.
+
+    Stands in for a ``BOUNDARY_REGIONS`` deployment's router without needing
+    regions configured: the only thing under test is whether the command's raw
+    SQL asks the router for an alias at all, or hardcodes ``default``.
+
+    Only ``thirdparty`` is routed, so every other model the command touches
+    (the tenant itself, the scoped models) keeps going to ``default`` and the
+    command's ordinary behaviour is unchanged around the branch being tested.
+    """
+
+    def _route(self, model):
+        if model._meta.app_label == "thirdparty":
+            return REGIONAL_ALIAS
+        return None
+
+    def db_for_read(self, model, **hints):
+        return self._route(model)
+
+    def db_for_write(self, model, **hints):
+        return self._route(model)
+
+    def allow_relation(self, obj1, obj2, **hints):
+        return None
+
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        return None
+
+
 @pytest.mark.django_db(transaction=True)
 class TestBoundaryDeprovisionAdoptedTables:
     """AC-CMD-008/009/010 (BR-PRV-003, BR-PRV-004, BR-PRV-009): the
@@ -570,3 +608,144 @@ class TestBoundaryDeprovisionAdoptedTables:
         call_command("boundary_deprovision", tenant=tenant_a.slug, yes=True)
         assert _widget_count(tenant_a) == 4, "with the setting off, the adopted rows must be left alone"
         assert _widget_count(tenant_b) == 2
+
+    @pytest.fixture
+    def alias_recorder(self, monkeypatch):
+        """Record every alias looked up in ``connections``, serving ``default``.
+
+        A recording proxy rather than a real second alias, because a real one
+        cannot be reached from here. Django's ``SimpleTestCase`` patches
+        ``BaseDatabaseWrapper.ensure_connection`` at ``setUpClass`` to refuse
+        any alias outside the test's own ``databases``, and validates that set
+        against ``settings.DATABASES`` before any fixture runs, so an alias
+        added later is refused on first use and an alias named in the mark
+        would have to exist in ``tests/settings.py``. Adding a third database
+        to the suite to prove a routing decision is the wrong trade.
+
+        Every lookup is forwarded to the real ``default`` connection, so the
+        command's SQL genuinely executes against the rows the fixtures
+        inserted and the end-state assertions below are real. What the proxy
+        adds is the record of WHICH alias was asked for, which is the decision
+        under test.
+
+        Both import sites are patched: the command resolves ``connections``
+        from ``django.db`` inside its method bodies, while ``boundary.context``
+        binds it at module import for ``admin_bypass()``. Patching only the
+        first would leave the bypass flag set on whatever alias
+        ``boundary.context`` reached, which is the exact bug this test exists
+        to catch.
+
+        What the record does NOT contain is the scoped branch, which is why the
+        assertions can require every entry to be the routed alias.
+        ``django.db.models.query`` and ``base`` bind ``connections`` at their
+        own module import, so the ORM never reads the patched attribute; and
+        the command enters no tenant context, so ``boundary.context``'s other
+        ``connections`` users (``_set_db_session`` and friends) are never
+        reached either.
+        """
+        from django.db import connections as real_connections
+
+        looked_up = []
+
+        class _RecordingConnections:
+            def __getitem__(self, alias):
+                looked_up.append(alias)
+                return real_connections["default"]
+
+            def __getattr__(self, name):
+                return getattr(real_connections, name)
+
+        proxy = _RecordingConnections()
+        monkeypatch.setattr("django.db.connections", proxy)
+        monkeypatch.setattr("boundary.context.connections", proxy)
+        return looked_up
+
+    def test_the_adopted_branch_runs_on_the_routers_alias_not_default(
+        self, four_and_two, settings, alias_recorder, tmp_path
+    ):
+        """BR-PRV-009: an adopted model's count, export and delete run on the
+        alias the router names, not on a hardcoded ``default``.
+
+        The scoped branch of every step goes through the ORM and is therefore
+        routed for free; the adopted branch issues raw SQL and has to ask the
+        router itself. Under ``BOUNDARY_REGIONS`` a hardcoded ``default``
+        counts zero rows on the wrong database, so the command reports nothing
+        to delete, writes an empty export, and leaves every adopted row of the
+        deprovisioned tenant behind on the regional alias, isolated by RLS and
+        therefore visible to nobody and deleted by nothing.
+
+        The router routes ``thirdparty`` and nothing else, so the aliases
+        recorded are exactly the adopted branch's own: a command that still
+        hardcoded ``default`` would record ``default`` and no occurrence of the
+        routed name at all.
+        """
+        tenant_a, tenant_b = four_and_two
+        settings.DATABASE_ROUTERS = [_AdoptedModelRegionalRouter()]
+        export_path = tmp_path / "data.ndjson"
+
+        call_command(
+            "boundary_deprovision",
+            tenant=tenant_a.slug,
+            export=str(export_path),
+            yes=True,
+        )
+
+        assert REGIONAL_ALIAS in alias_recorder, (
+            f"the adopted branch must reach the router's alias; it asked for {alias_recorder}"
+        )
+        assert "default" not in alias_recorder, (
+            f"no adopted statement may hardcode default when the router names an alias; it asked for {alias_recorder}"
+        )
+
+        # Three adopted steps run (count, export, delete), and each resolves a
+        # connection for its raw SQL and again for admin_bypass()'s own flag,
+        # so the routed alias is asked for several times over. Asserted as
+        # "every lookup, at least three of them" rather than an exact number,
+        # which would pin admin_bypass()'s internal call count rather than the
+        # routing decision under test.
+        #
+        # The bypass alias is not incidental: the flag is a session variable on
+        # ONE connection, so set on default while the statements run elsewhere
+        # it would be inert there and RLS would match no rows at all. That is
+        # why "default not in the record" above covers the bypass too.
+        assert set(alias_recorder) == {REGIONAL_ALIAS}, (
+            f"every adopted lookup must be the routed alias; got {alias_recorder}"
+        )
+        assert alias_recorder.count(REGIONAL_ALIAS) >= 3, (
+            f"expected the count, export and delete steps each to route; got {alias_recorder}"
+        )
+
+        # And the routing did not break what the command is for. These run
+        # against the real default connection the proxy forwarded to, which is
+        # where the fixture's rows actually are.
+        lines = [json.loads(line) for line in export_path.read_text().splitlines() if line]
+        widget_lines = [row for row in lines if row["_model"] == "thirdparty.Widget"]
+        assert len(widget_lines) == 4, (
+            f"the adopted export must still read the rows; got {[r['_model'] for r in lines]}"
+        )
+        assert _widget_count(tenant_a) == 0, "tenant A's adopted rows must be gone"
+        assert _widget_count(tenant_b) == 2, "tenant B's adopted rows must survive"
+
+    def test_the_adopted_branch_stays_on_default_without_a_router(self, four_and_two, alias_recorder, tmp_path):
+        """The positive control for the test above: with no router installed,
+        every adopted step asks for ``default``.
+
+        Without this, the routed test would pass against a command that sent
+        its adopted SQL to some fixed alias that merely happened to match the
+        router's name, and "default not in the record" would be proving the
+        wrong thing. This pins what the router is overriding.
+        """
+        tenant_a, _tenant_b = four_and_two
+        export_path = tmp_path / "data.ndjson"
+
+        call_command(
+            "boundary_deprovision",
+            tenant=tenant_a.slug,
+            export=str(export_path),
+            yes=True,
+        )
+
+        assert alias_recorder, "the adopted branch must resolve a connection at all"
+        assert set(alias_recorder) == {"default"}, (
+            f"with no router, every adopted step must ask for default; it asked for {alias_recorder}"
+        )
