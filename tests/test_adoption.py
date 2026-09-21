@@ -24,6 +24,7 @@ policy as readily as a correct one.
 
 import pytest
 from django.db import IntegrityError, connection, transaction
+from django.test import override_settings
 
 from boundary.adoption import column_type, unique_constraints, unique_indexes
 from boundary.exceptions import AdoptionRefusedError
@@ -1779,3 +1780,446 @@ class TestAcRls015AdoptionRefusesDeniedAppsButNotTheTenantModelsApp:
         assert not [e for e in errors if "boundary_testapp_tenant" in e.msg], (
             f"the tenant TABLE must never be reported either; got {[e.msg for e in errors]}"
         )
+
+
+# ── Unit-level rules, no database required ───────────────────
+#
+# Everything below reaches the operation directly rather than through the
+# migration machinery, because each rule it pins is decided before any
+# statement is issued: the tenant key's type, the router's verdict, the
+# connection's vendor, and the two SQL-building helpers. None of them needs a
+# table to exist, and two of them (the type refusal, the identifier
+# truncation) have no fixture that could produce them against the real test
+# schema at all.
+
+
+class _FakeTenantMeta:
+    """The minimum ``_meta`` ``_tenant_pg_type`` reads: a ``pk`` field."""
+
+    def __init__(self, pk):
+        self.pk = pk
+
+
+class _FakeTenantModel:
+    """A tenant model whose primary key maps to neither uuid nor bigint.
+
+    A real model class cannot serve here: the suite's tenant model is
+    ``boundary_testapp.Tenant`` with a BigAutoField primary key, and a second
+    installed tenant model with a CharField primary key would need its own app,
+    its own table, and its own place in every settings override that resolves
+    BOUNDARY_TENANT_MODEL. The operation reads exactly two things from the
+    model (``_meta.pk`` and, in the message, the setting string), so standing
+    in for it is a fair test rather than a mock of the behaviour under test.
+    """
+
+    __name__ = "FakeCharPkTenant"
+
+    def __init__(self, pk_field):
+        self._meta = _FakeTenantMeta(pk_field)
+
+
+def _char_pk_field():
+    """Return an unbound CharField primary key, named as a model would name it."""
+    from django.db import models
+
+    field = models.CharField(max_length=40, primary_key=True)
+    field.set_attributes_from_name("code")
+    return field
+
+
+class TestAdoptionRefusesAnUnmappableTenantKeyType:
+    """BR-RLS-011 step 1: a tenant primary key mapping to neither uuid nor
+    bigint makes the operation refuse, naming the model, the field and the
+    type, and MUST NOT fall back to bigint.
+
+    ``detect_tenant_pg_type``'s bigint fallback stays where it is for
+    ``CreateTenantPolicy``, which acts on a column a Django field already
+    declares and so cannot get the type wrong. Adoption CREATES the column, so
+    a silent fallback puts a varchar tenant's pk into a bigint column on every
+    adopted table, and because the column is invisible to the ORM the mismatch
+    first surfaces as a cast failure inside ``boundary_current_tenant_id()``,
+    which returns NULL on any exception: empty reads and NOT NULL violations
+    with nothing naming the cause.
+    """
+
+    def test_an_unmappable_tenant_pk_is_refused_naming_the_model_field_and_type(self, monkeypatch):
+        from boundary import conf
+        from boundary.migrations_ops import AdoptTenantApp
+
+        field = _char_pk_field()
+        monkeypatch.setattr(conf, "get_tenant_model", lambda: _FakeTenantModel(field))
+
+        with pytest.raises(AdoptionRefusedError) as caught:
+            AdoptTenantApp("thirdparty")._tenant_pg_type()
+
+        message = str(caught.value)
+        assert "boundary_testapp.Tenant" in message, message
+        assert "code" in message
+        assert "CharField" in message
+        assert "varchar(40)" in message
+        assert "uuid" in message
+        assert "bigint" in message
+
+    def test_a_uuid_and_an_integer_tenant_pk_are_both_accepted(self, monkeypatch):
+        """The positive control. Without it the refusal above would pass
+        against an implementation that refuses every tenant model.
+        """
+        import uuid as uuid_module
+
+        from django.db import models
+
+        from boundary import conf
+        from boundary.migrations_ops import AdoptTenantApp
+
+        operation = AdoptTenantApp("thirdparty")
+
+        uuid_field = models.UUIDField(primary_key=True, default=uuid_module.uuid4)
+        uuid_field.set_attributes_from_name("id")
+        monkeypatch.setattr(conf, "get_tenant_model", lambda: _FakeTenantModel(uuid_field))
+        assert operation._tenant_pg_type() == "uuid"
+
+        int_field = models.BigAutoField(primary_key=True)
+        int_field.set_attributes_from_name("id")
+        monkeypatch.setattr(conf, "get_tenant_model", lambda: _FakeTenantModel(int_field))
+        assert operation._tenant_pg_type() == "bigint"
+
+    def test_create_tenant_policys_own_fallback_is_unchanged(self):
+        """And ``detect_tenant_pg_type`` still falls back to bigint.
+
+        The refusal belongs to adoption, not to the shared mapper: changing
+        the mapper would change ``CreateTenantPolicy``'s documented behaviour
+        for a tenant column a Django field declares, which BR-RLS-009 and the
+        rls-policy.v1 composition row both still describe as a bigint
+        fallback.
+        """
+        from boundary.migrations_ops import detect_tenant_pg_type
+
+        assert detect_tenant_pg_type(_char_pk_field()) == "bigint"
+
+
+class _DenyingRouter:
+    """A router that refuses every migration on every alias."""
+
+    def allow_migrate(self, db, app_label, **hints):
+        return False
+
+
+class _RecordingRouter:
+    """A router that allows everything and records what it was asked."""
+
+    calls = []
+
+    def allow_migrate(self, db, app_label, **hints):
+        type(self).calls.append((db, app_label, hints))
+        return True
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
+    """A ``reduces_to_sql`` operation must ask the router before emitting, and
+    must name the vendor when a non-PostgreSQL alias gets through.
+
+    ``allow_migrate_model``, which the schema-altering operations go through,
+    does not cover an operation that emits raw SQL; Django's own ``RunSQL``
+    calls ``router.allow_migrate()`` itself for exactly this reason, and
+    adoption follows it. A project's documented way to keep a non-PostgreSQL
+    alias off the adoption graph is that router, so the vendor refusal is
+    checked only after the router has allowed the alias.
+    """
+
+    def test_a_denying_router_makes_the_forward_emit_nothing(self, unadopted):
+        """Given a router whose allow_migrate returns False, when the forward
+        runs, then no DDL is emitted and nothing is raised.
+
+        ``collect_sql=True`` is the instrument: the schema editor appends every
+        statement it is given to a list instead of executing it, so an empty
+        list is evidence the operation emitted nothing rather than evidence it
+        emitted something the transaction later took back.
+        """
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[_DenyingRouter()]),
+            connection.schema_editor(collect_sql=True) as editor,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+            assert list(editor.collected_sql) == []
+
+        with connection.cursor() as cursor:
+            assert column_type(cursor, "thirdparty_widget", "tenant_id") is None
+
+    def test_a_denying_router_makes_the_reverse_emit_nothing(self, adopted):
+        """And the reverse likewise emits nothing, leaving the adopted table
+        adopted.
+
+        The reverse needs its own assertion: a guard on the forward alone would
+        let a reverse run against an alias the router keeps off the graph, and
+        strip a column that alias never had adopted in the first place.
+        """
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[_DenyingRouter()]),
+            connection.schema_editor(collect_sql=True) as editor,
+        ):
+            operation.database_backwards("boundary_consumer", editor, state, state)
+            assert list(editor.collected_sql) == []
+
+        with connection.cursor() as cursor:
+            assert column_type(cursor, "thirdparty_widget", "tenant_id") == "bigint"
+        assert _policies("thirdparty_widget") == {
+            "boundary_tenant_isolation",
+            "boundary_admin_bypass",
+        }
+
+    def test_the_router_is_asked_for_the_migrations_own_app_label(self, unadopted):
+        """And the router is asked about the app the MIGRATION belongs to, not
+        the app being adopted, matching RunSQL.
+
+        The consumer's own app is what the migration lives in, and a router
+        keying on app labels routes by that; the adopted app is passed as the
+        model_name hint so a router that wants it can see it.
+        """
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+        _RecordingRouter.calls = []
+
+        with (
+            override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+            connection.schema_editor(collect_sql=True) as editor,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+
+        assert _RecordingRouter.calls, "the operation must ask the router at all"
+        alias, app_label, hints = _RecordingRouter.calls[0]
+        assert alias == connection.alias
+        assert app_label == "boundary_consumer"
+        assert hints == {"model_name": "thirdparty"}
+
+    def test_a_non_postgresql_alias_the_router_allowed_is_refused_naming_the_vendor(self):
+        """And an alias whose backend is not PostgreSQL, which the router did
+        allow, is refused with a message naming the vendor.
+
+        Asserted against the suite's real ``eu-west`` SQLite alias rather than
+        a stub connection, so the vendor string is the one a real backend
+        reports. With no DATABASE_ROUTERS set the router allows every alias, so
+        this is exactly the case the vendor check exists for: without it the
+        consumer meets a SQLite parser error on generated CREATE POLICY SQL and
+        is left to infer that adoption is PostgreSQL-only.
+        """
+        from django.db import connections
+
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[]),
+            connections["eu-west"].schema_editor() as editor,
+            pytest.raises(AdoptionRefusedError) as caught,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+
+        message = str(caught.value)
+        assert "sqlite" in message
+        assert "eu-west" in message
+        assert "Row Level Security" in message
+        assert "allow_migrate" in message
+
+    def test_the_reverse_refuses_the_same_non_postgresql_alias(self):
+        """And the reverse refuses it too, rather than emitting DROP POLICY at
+        a backend that has no policies.
+        """
+        from django.db import connections
+
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[]),
+            connections["eu-west"].schema_editor() as editor,
+            pytest.raises(AdoptionRefusedError) as caught,
+        ):
+            operation.database_backwards("boundary_consumer", editor, state, state)
+
+        assert "sqlite" in str(caught.value)
+
+    def test_a_denying_router_wins_over_the_vendor_refusal(self):
+        """And a router that keeps the non-PostgreSQL alias off the graph gets
+        a silent no-op, not a refusal.
+
+        This is the ordering the two guards must have. Keeping an alias off the
+        adoption migration with allow_migrate() is the documented remedy the
+        vendor refusal's own message points at, so it cannot itself raise.
+        """
+        from django.db import connections
+
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[_DenyingRouter()]),
+            connections["eu-west"].schema_editor(collect_sql=True) as editor,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+            operation.database_backwards("boundary_consumer", editor, state, state)
+            assert list(editor.collected_sql) == []
+
+
+@pytest.mark.django_db
+class TestCompositeConstraintNameTruncation:
+    """BR-RLS-012: a ``_tenant``-suffixed name over PostgreSQL's 63-character
+    identifier limit is regenerated through the schema editor's own
+    truncate-and-hash scheme, never cut off.
+
+    PostgreSQL truncates a long identifier silently, which would make the name
+    unreproducible and could collide with a sibling constraint sharing the
+    surviving prefix. No fixture model in this suite has a name long enough to
+    reach the limit, so the helper is called directly.
+    """
+
+    def test_a_name_within_the_limit_is_the_original_plus_tenant(self):
+        from boundary.migrations_ops import composite_constraint_name
+
+        with connection.schema_editor() as editor:
+            name = composite_constraint_name(
+                editor,
+                "thirdparty_widget",
+                "thirdparty_widget_code_key",
+                ["tenant_id", "code"],
+            )
+        assert name == "thirdparty_widget_code_key_tenant"
+
+    def test_a_name_over_the_limit_goes_through_create_index_name(self):
+        from boundary.migrations_ops import composite_constraint_name
+
+        table = "a" * 40
+        original = "b" * 60
+        columns = ["tenant_id", "code"]
+        assert len(f"{original}_tenant") > 63
+
+        with connection.schema_editor() as editor:
+            name = composite_constraint_name(editor, table, original, columns)
+            expected = editor._create_index_name(table, columns, suffix="_tenant")
+
+        assert name == expected
+        assert len(name) <= 63
+        assert name.endswith("_tenant")
+        # Not a truncation of the original: the derived name is the schema
+        # editor's hashed form, which is what makes it collision-resistant
+        # against a sibling constraint sharing the surviving prefix.
+        assert not name.startswith(original[:50])
+
+    def test_two_long_originals_on_the_same_columns_do_not_collide(self):
+        """And two different long originals over the same column set derive
+        different names.
+
+        A plain cut at 63 characters would give both the same name, and the
+        second ADD CONSTRAINT would fail with a duplicate-name error that says
+        nothing about why. The hash is keyed on the table as well as the
+        columns, so the two tables differ.
+        """
+        from boundary.migrations_ops import composite_constraint_name
+
+        original = "b" * 60
+        with connection.schema_editor() as editor:
+            first = composite_constraint_name(editor, "x" * 40, original, ["tenant_id", "code"])
+            second = composite_constraint_name(editor, "y" * 40, original, ["tenant_id", "code"])
+        assert first != second
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTheBackfillUpdateIsParameterised:
+    """BR-RLS-014: the backfill UPDATE binds its tenant value as a parameter,
+    so a value the driver must adapt (a ``uuid.UUID``) reaches the column
+    correctly rather than being interpolated into SQL.
+
+    Run against a scratch table with a uuid tenant_id column rather than a
+    second tenant model, because what is under test is the UPDATE's binding
+    and the affected-row equality check, neither of which reads the tenant
+    model at all. A second tenant model would need its own app and its own
+    place in every settings override that resolves BOUNDARY_TENANT_MODEL, and
+    would prove nothing extra.
+    """
+
+    TABLE = "boundary_uuid_backfill_scratch"
+
+    @pytest.fixture
+    def scratch(self, db):
+        """A three-row table with a nullable uuid tenant_id column.
+
+        Built through the schema editor's own DDL rather than a model, so no
+        migration state and no app registry entry is involved; the operation's
+        ``_add_tenant_column`` takes a table name and a cursor and needs
+        neither.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP TABLE IF EXISTS "{self.TABLE}"')
+            cursor.execute(f'CREATE TABLE "{self.TABLE}" (id serial PRIMARY KEY, name varchar(20) NOT NULL)')
+            for index in range(3):
+                cursor.execute(f'INSERT INTO "{self.TABLE}" (name) VALUES (%s)', [f"r{index}"])
+        yield self.TABLE
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP TABLE IF EXISTS "{self.TABLE}"')
+
+    def test_a_uuid_backfill_value_lands_on_every_row(self, scratch):
+        import uuid as uuid_module
+
+        value = uuid_module.uuid4()
+        operation = AdoptTenantApp("thirdparty", backfill_tenant=value)
+
+        with connection.schema_editor() as editor, connection.cursor() as cursor:
+            operation._add_tenant_column(editor, cursor, scratch, "scratch.Row", "uuid", 3)
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT DISTINCT tenant_id FROM "{scratch}"')
+            assert cursor.fetchall() == [(value,)]
+
+        default, not_null = _column_default(scratch, "tenant_id")
+        assert not_null is True
+        assert "boundary_current_tenant_id()" in default
+
+    def test_a_uuid_value_carrying_sql_punctuation_is_bound_not_interpolated(self, scratch):
+        """And a value whose string form contains a quote is bound as a
+        parameter rather than spliced into the statement.
+
+        A ``uuid.UUID`` cannot itself carry a quote, so the falsifiable case is
+        the string form of one: an implementation using an f-string would
+        either raise a syntax error here or silently write something else,
+        where the parameterised form rejects it as an invalid uuid. Either way
+        the value never reaches the column, which is what the assertion pins.
+        """
+        import psycopg
+
+        operation = AdoptTenantApp("thirdparty", backfill_tenant="'; DROP TABLE x; --")
+
+        with (
+            pytest.raises((psycopg.errors.InvalidTextRepresentation, psycopg.errors.DataError)),
+            connection.schema_editor() as editor,
+            connection.cursor() as cursor,
+        ):
+            operation._add_tenant_column(editor, cursor, scratch, "scratch.Row", "uuid", 3)
+
+    def test_a_row_count_mismatch_aborts_naming_both_counts(self, scratch):
+        """And the affected-row count must equal the probe's, so a probe that
+        read a different number aborts rather than proceeding.
+
+        Passing a deliberately wrong ``existing_rows`` is how the concurrent
+        write BR-RLS-014 describes is reached without racing a real one.
+        """
+        import uuid as uuid_module
+
+        operation = AdoptTenantApp("thirdparty", backfill_tenant=uuid_module.uuid4())
+
+        with (
+            pytest.raises(AdoptionRefusedError) as caught,
+            connection.schema_editor() as editor,
+            connection.cursor() as cursor,
+        ):
+            operation._add_tenant_column(editor, cursor, scratch, "scratch.Row", "uuid", 5)
+
+        message = str(caught.value)
+        assert "3 row" in message
+        assert "5" in message
+        assert scratch in message
