@@ -32,6 +32,36 @@ The database layer is built from the migration operations in `boundary.migration
 
 The session variables are set for you by `TenantContext`. When you set or enter a tenant scope, `TenantContext` issues `SELECT set_config('app.current_tenant_id', <pk>, true)` against the connection, scoped to the current transaction. So the same `TenantContext` that drives ORM filtering also drives RLS. See [`TenantContext`](../../README.md#context) and [Add RLS policies with migrations](../how-to/add-rls-policies-with-migrations.md).
 
+### Adopted tables: the database layer on its own
+
+The two layers above describe a model boundary knows about, one that declares a tenant foreign key (`TenantMixin`, `TenantModel`, `make_tenant_mixin()`) or reaches the tenant through a declared path (`make_tenant_path_mixin()`). There is a third category, and it has only one layer.
+
+An **adopted** table belongs to an app listed in `BOUNDARY_TENANT_APPS` whose tables have been given a `tenant_id` column by the `AdoptTenantApp` migration operation. The column is a real database column with a real `NOT NULL DEFAULT boundary_current_tenant_id()`, RLS enabled and forced, and the same two policies `CreateTenantPolicy` creates, but **no Django field models it**. That is the whole point: Django emits explicit column lists on `INSERT` and `SELECT`, so a column the model never declares is never named in any statement the ORM generates, which is what lets a third-party package be tenant-scoped while staying passive and entirely unaware. From PostgreSQL's side an adopted table is indistinguishable from a column-bearing one; from Django's side nothing has changed at all.
+
+The three categories differ as follows:
+
+| | Column-bearing | Path-scoped | Adopted |
+|---|---|---|---|
+| Declared by | `TenantMixin` / `TenantModel` / `make_tenant_mixin()` | `make_tenant_path_mixin()` | `BOUNDARY_TENANT_APPS` plus `AdoptTenantApp` |
+| Tenant discriminator | a Django `ForeignKey` field | none local; a lookup path | a `tenant_id` database column, invisible to the ORM |
+| `is_tenant_model()` | `True` | `True` | `False` |
+| `has_tenant_column()` | `True` | `False` | `False` |
+| ORM auto-filtering | Yes | Yes, on the path | No, ever |
+| `BOUNDARY_STRICT_MODE` applies | Yes | Yes | No |
+| RLS policy on its own table | Yes | No | Yes |
+| Non-PostgreSQL backend | ORM filtering only | ORM filtering only | No isolation at all |
+| `validate_cross_tenant_fks()` | Checks it | Skips it | Skips it |
+| Covered by `boundary.E006` | Yes | No | Yes |
+| Covered by `boundary.E007` | No | No | Yes |
+
+**The asymmetry is deliberate and permanent, not a gap scheduled to be closed.** An adopted model declares no tenant field, so no manager can filter on one; `is_tenant_model()` and `has_tenant_column()` keep returning `False` for it, and adoption is not a fourth answer from those helpers. Three consequences follow directly, and they are the price of scoping a package you do not own:
+
+- **Strict mode does not apply.** A missing tenant context surfaces as an `IntegrityError` on write (the column default evaluates to `NULL` and the `NOT NULL` constraint rejects the row) or as an empty result on read, never as `TenantNotSetError`, and no `strict_mode_violation` signal fires.
+- **A non-PostgreSQL backend has no isolation whatsoever.** For a column-bearing model, SQLite still gets ORM filtering. For an adopted table there is no ORM layer underneath to compensate, so a suite exercising adopted-app tenancy must run against real PostgreSQL, gated by `assert_rls_enforced()`.
+- **Cross-tenant foreign key validation skips it.** `validate_cross_tenant_fks()` walks declared `ForeignKey` fields and compares against a declared local tenant column. An adopted model has neither, so there is nothing for it to inspect.
+
+Because the database layer is the only layer an adopted table has, verifying that layer is not optional. `boundary.E007` reports, per expected-adopted table, a missing or wrongly typed column, RLS that is not both enabled and forced, either missing policy, and any non-primary-key unique constraint that is not composite leading with `tenant_id`. That last condition is the load-bearing one: an upstream migration that drops and recreates an index replaces the composite constraint with a global one, restoring cross-tenant uniqueness with no other signal anywhere in the system. `boundary.E007` is the only defence against that, which is why it is an Error. See [Adopt a third-party app into your tenancy](../how-to/adopt-a-third-party-app.md).
+
 ## Why you want both
 
 The two layers fail in different ways and protect against different mistakes. Running only one leaves a class of bugs uncovered.
@@ -115,5 +145,6 @@ Boundary surfaces gaps in this posture through system checks: `boundary.E006` fl
 - [Write tenant-safe tests](../how-to/write-tenant-safe-tests.md)
 - [Set up a tenant model](../how-to/set-up-a-tenant-model.md)
 - [Scope a package's models into your tenancy](../how-to/scope-a-packages-models.md)
+- [Adopt a third-party app into your tenancy](../how-to/adopt-a-third-party-app.md)
 - [Choose and order resolvers: Enforce membership after resolution](../how-to/choose-and-order-resolvers.md#enforce-membership-after-resolution)
 - README: [Defence in Depth](../../README.md#how-it-works), [Row Level Security](../../README.md#row-level-security), [Settings Reference](../../README.md#settings-reference)

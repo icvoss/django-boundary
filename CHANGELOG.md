@@ -4,6 +4,129 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`BOUNDARY_TENANT_APPS` and `BOUNDARY_ADOPT_EXCLUDE` settings, and the
+  `AdoptTenantApp` migration operation** (issue #69, ADR-115). A consumer
+  could not tenant-scope the concrete models a third-party app ships:
+  allauth, taggit and wagtail each own their models and their migrations, so
+  there is no abstract base to compose `TenantMixin` onto and no way to add a
+  field without forking the app or taking over its migration history. Tenancy
+  is now addable entirely in the database, invisibly to the ORM, because
+  Django emits explicit column lists on `INSERT` and `SELECT` and therefore
+  never names a column the model does not declare. List an app label in
+  `BOUNDARY_TENANT_APPS` and apply `AdoptTenantApp("account")` from a
+  migration in your own app: each concrete table of that app gains a
+  `tenant_id` column typed from your tenant model's primary key, declared
+  `NOT NULL DEFAULT boundary_current_tenant_id()`, with Row Level Security
+  enabled and forced, the same `boundary_tenant_isolation` and
+  `boundary_admin_bypass` policies a mixin-scoped table gets, and every
+  non-primary-key unique constraint rewritten to a composite leading with
+  `tenant_id` so uniqueness is per tenant rather than global. The adopted set
+  is derived from the app registry rather than hand-listed, which is what
+  makes drift after an upstream upgrade detectable;
+  `BOUNDARY_ADOPT_EXCLUDE` exempts individual models by
+  `"app_label.ModelName"`. The adopted package ships nothing, knows nothing,
+  and is not modified: no Django field, no migration in its tree, no
+  `MIGRATION_MODULES` relocation, and no entry in Django's migration state.
+  A populated table is refused unless `backfill_tenant` names the tenant its
+  rows belong to, because PostgreSQL evaluates `ADD COLUMN ... DEFAULT` once
+  for pre-existing rows and would otherwise stamp them with whichever tenant
+  was current at migration time, which during `migrate` is none. RLS is
+  enabled last, after any backfill, because under `FORCE ROW LEVEL SECURITY`
+  a migrating role without `BYPASSRLS` would update zero rows with no error.
+  The operation is idempotent per table and refuses, rather than silently
+  skips, any unique form it cannot safely rewrite (a constraint a foreign key
+  targets, a partial unique index, an expression index, a deferrable
+  constraint). `contenttypes`, `sessions`, `sites`, `auth.Permission`,
+  `admin.LogEntry`, `django_migrations`, and the configured tenant model with
+  its through tables are refused outright as global by construction.
+  Documented in the new
+  `docs/how-to/adopt-a-third-party-app.md`.
+
+- **`boundary.E007` system check** (issues #69, #71). A database-backed,
+  PostgreSQL-only Error that derives the expected adopted set from the live
+  app registry and reports, per table, a missing or wrongly typed `tenant_id`
+  column, Row Level Security that is not both enabled and forced, a missing
+  `boundary_tenant_isolation` or `boundary_admin_bypass` policy, and any
+  non-primary-key unique constraint that is not composite leading with
+  `tenant_id`. It also reports a deny-listed or uninstalled app label in
+  `BOUNDARY_TENANT_APPS`, the one condition that needs no database
+  connection, and reports `boundary.W007` when a probe fails on a live
+  connection so its absence cannot be misread as a pass. The unique-constraint
+  condition is the load-bearing one: an upstream migration that drops and
+  recreates an index replaces the composite constraint with a global one,
+  restoring cross-tenant uniqueness with no other signal anywhere in the
+  system, which is why this is an Error rather than a Warning. Because the
+  check derives from the live registry while `AdoptTenantApp` derived from
+  the historical migration state, a model added by an upstream upgrade is
+  reported as a missing column; the remedy is a second `AdoptTenantApp`
+  migration, which the per-table idempotency makes safe. Listing your own app
+  in `BOUNDARY_TENANT_APPS` is supported, and is how a model in it that
+  forgot its mixin gets reported.
+
+- **Optional `app_label` keyword on `EnableRLS`, `CreateTenantPolicy` and
+  `DropTenantPolicy`** (issue #70). Each operation now resolves its model
+  from the given app label instead of the label of the app owning the
+  migration, in both `database_forwards()` and `database_backwards()`, so a
+  consumer can enable RLS on another app's table from a migration in their
+  own app without relocating that app's migrations via `MIGRATION_MODULES`.
+  `describe()` names the target as `app_label.ModelName` when the override is
+  set; `deconstruct()` includes the keyword only when it is set, so every
+  migration written before this keyword existed serialises byte-identically
+  to what it serialised before.
+
+- **`boundary.adoption` module.** The deny-list, the adopted-set derivation
+  (usable against either the live app registry or a migration's historical
+  state), and the PostgreSQL catalogue introspection helpers the operation
+  and `boundary.E007` share.
+
+### Changed
+
+- **README comparison with django-tenants corrected against the vendor's own
+  documentation** (#74). The old table attributed a "~500 tenants" ceiling
+  that django-tenants never states, described its tenant storage as a
+  thread-local when it is held on the database connection object, and called
+  its Celery support "manual" when its docs point at the separate
+  `tenant-schemas-celery` package. The table now cites the vendor docs and
+  gains a third-party apps row.
+
+- **`boundary.E006` and `boundary.W009` now cover adopted tables.** An
+  adopted table owns a `tenant_id` column and a policy exactly as a
+  column-bearing table does, so the same `pg_class` probe applies. `W009` in
+  particular matters more there: an adopted table has no ORM layer to fall
+  back on, so `BOUNDARY_SET_DB_SESSION_VAR = False` alongside live RLS
+  policies leaves it with no isolation at all.
+
+- **`boundary_deprovision` now covers adopted tables** in its collect, export
+  and delete steps, so "all tenant-scoped rows" stays true once an app is
+  adopted. An adopted table has no scoped manager, so each step reaches it by
+  raw SQL against `tenant_id`, inside `admin_bypass()`, with the export
+  streamed through a server-side cursor in `--batch-size` chunks. An adopted
+  row's NDJSON line carries `"_adopted": true` and is keyed by **database
+  column name** rather than Django field name, so a re-import can tell that
+  `tenant_id` is not a Django field and that every value is in its raw
+  database form. Adopted rows are deleted before the tenant row, by
+  `tenant_id` value only, since the column is not a `ForeignKey` and has no
+  database-level cascade. An adopted table whose app is missing from
+  `BOUNDARY_TENANT_APPS` is invisible to deprovision and its rows survive the
+  tenant.
+
+- **`boundary.testing.assert_rls_enforced()` now covers adopted tables**
+  alongside the registered column-bearing models it already inspected.
+  Adopted tables are where it matters most: with no ORM layer beneath them, a
+  suite running as a `BYPASSRLS` role, or against a database where the
+  adoption DDL never applied, exercises no isolation at all and still passes
+  every test. Its contract is otherwise unchanged.
+
+### Behaviour change for existing consumers
+
+None, unless `BOUNDARY_TENANT_APPS` is set. Both new settings default to an
+empty list; with them unset, `boundary.E007` has nothing to check, `E006`,
+`W009`, `boundary_deprovision` and `assert_rls_enforced()` see exactly the
+models they saw before, and no existing migration changes what it serialises
+or what it applies.
+
 ## [0.8.0] - 2026-09-11
 
 ### Added

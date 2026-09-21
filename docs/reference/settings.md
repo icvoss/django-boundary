@@ -315,6 +315,46 @@ This matters well beyond requests: management commands (`boundary_run`, `boundar
 
 ---
 
+### `BOUNDARY_TENANT_APPS`
+
+| | |
+|---|---|
+| **Type** | `list[str]` |
+| **Default** | `[]` |
+
+App labels whose concrete models are adopted into tenancy at the database layer: each table gains a `tenant_id` column that no Django field models, plus Row Level Security and the same two policies a mixin-scoped table gets. Entries are app labels as `apps.get_app_config()` resolves them (`"account"`, not `"allauth.account"`), never dotted module paths. An empty list means adoption is not in use.
+
+The adopted set for a listed app is derived, never hand-listed: every concrete, non-abstract, non-proxy model the app config returns, auto-created many-to-many through models included, minus `BOUNDARY_ADOPT_EXCLUDE`, minus models already scoped by a boundary mixin or path mixin, minus the tenant model and its own through tables.
+
+**When to change it:** When a third-party app ships concrete models you need tenant-scoped and offers no swappable abstract base to compose a mixin onto. Listing your own app is also supported, and is how a model in it that forgot its mixin gets reported by `boundary.E007`.
+
+**This setting alone changes nothing.** It declares intent and drives the check; the DDL is applied by the `AdoptTenantApp` migration operation from a migration in your own app. See [Adopt a third-party app into your tenancy](../how-to/adopt-a-third-party-app.md).
+
+**Refused apps and models:** `contenttypes`, `sessions`, `sites`, `auth.Permission`, `admin.LogEntry`, the `django_migrations` table, the model named by `BOUNDARY_TENANT_MODEL` (or its `ICV_TENANT_MODEL` fallback), and that model's auto-created through tables. These are global by construction. The deny-list covers the tenant model, not the app that owns it: listing that app is supported, and the tenant model is skipped from the derived set the way an excluded model is.
+
+**Interactions:** Read by `AdoptTenantApp`, `boundary.E007`, `boundary.E006`, `boundary.W009`, `boundary_deprovision`, and `assert_rls_enforced()`. An adopted table whose app is missing from this setting is invisible to deprovision, so its rows survive the tenant.
+
+**System check:** `boundary.E007` (Error) fires for an expected-adopted table missing its column or the expected database state, and for an app label here that is deny-listed or not installed.
+
+---
+
+### `BOUNDARY_ADOPT_EXCLUDE`
+
+| | |
+|---|---|
+| **Type** | `list[str]` |
+| **Default** | `[]` |
+
+`"app_label.ModelName"` strings exempted from adoption, for a genuinely global reference table inside an otherwise adopted app. Matching is exact and case-sensitive against `f"{model._meta.app_label}.{model.__name__}"`.
+
+**When to change it:** When one model of an adopted app must stay global, or when the app owns a model boundary refuses to adopt (a unique constraint a foreign key targets, a partial unique index, an expression index, a deferrable constraint) and you would rather leave that table global than rewrite the constraint by hand. Also the escape route for an app whose own data migration inserts seed rows, which cannot be adopted as it stands.
+
+**An entry matching no model is inert, not an error.** A package upgrade may legitimately remove a model you had excluded, and that should not break your deployment.
+
+**Interactions:** Applies to both `AdoptTenantApp` and `boundary.E007`, so an excluded model is neither adopted nor policed. The operation's own `exclude` argument is the per-migration form, unioned with this setting for that operation; use it to split one app across several operations when different tables need different `backfill_tenant` values.
+
+---
+
 ## Regional
 
 ### `BOUNDARY_REGIONS`
@@ -430,6 +470,8 @@ def before_tenant_deleted(tenant):
 | `BOUNDARY_ADMIN_FLAG_VAR` | `"app.boundary_admin"` | No |
 | `BOUNDARY_FUNCTION_LEAKPROOF` | `False` | No |
 | `BOUNDARY_WRAP_ATOMIC` | `True` | No |
+| `BOUNDARY_TENANT_APPS` | `[]` | No |
+| `BOUNDARY_ADOPT_EXCLUDE` | `[]` | No |
 | `BOUNDARY_REGIONS` | `None` | No |
 | `BOUNDARY_REGION_FIELD` | `"region"` | No |
 | `BOUNDARY_POST_PROVISION_HOOK` | `None` | No |

@@ -22,6 +22,8 @@ All boundary exceptions subclass `boundary.exceptions.BoundaryError`, so you can
 | `boundary.E003` at startup | A resolver in `BOUNDARY_RESOLVERS` cannot be imported | Fix the dotted path |
 | `boundary.E004` at startup | `TenantMiddleware` not in `MIDDLEWARE` | Add `boundary.middleware.TenantMiddleware` to `MIDDLEWARE` |
 | `boundary.E006` at startup | A tenant-scoped table is missing forced RLS | Run the `EnableRLS` migration operation for that model |
+| `boundary.E007` at startup | An expected-adopted table is missing its `tenant_id` column, its RLS state, a policy, or its composite unique constraints | Apply an `AdoptTenantApp` migration for that app, or exclude the model |
+| `IntegrityError` on `tenant_id` with no tenant | A write to an adopted table with no active tenant context | Wrap the write in `TenantContext.using(tenant)`; `admin_bypass()` does not help |
 | `boundary.W001` at startup | `BOUNDARY_STRICT_MODE` is off | Set `BOUNDARY_STRICT_MODE = True` |
 
 ---
@@ -140,6 +142,38 @@ MIDDLEWARE = [
 
 **Fix:** add the `EnableRLS` migration operation for the affected model so the database enforces isolation even for raw SQL and superuser-less connections. RLS is the defence-in-depth layer beneath ORM filtering; do not rely on the ORM alone.
 
+### `boundary.E007`: adopted table is not in the expected state
+
+**Triggers when:** running on PostgreSQL, a table boundary expects to be adopted is not in the state adoption produces. The expected set is every concrete model of an app listed in `BOUNDARY_TENANT_APPS`, minus `BOUNDARY_ADOPT_EXCLUDE`, minus models already scoped by a boundary mixin or path mixin, minus the tenant model itself. Per table, the check reports:
+
+1. the `tenant_id` column is absent, or present with a type other than the one your tenant model's primary key derives;
+2. Row Level Security is not both enabled and forced;
+3. the `boundary_tenant_isolation` policy is absent;
+4. the `boundary_admin_bypass` policy is absent;
+5. a unique constraint or unique index other than the primary key is not composite leading with `tenant_id`.
+
+It also reports a deny-listed or uninstalled app label in `BOUNDARY_TENANT_APPS`, which is the one condition needing no database connection. Like `boundary.E006`, the check is PostgreSQL-only, skips when the connection is unavailable, and reports `boundary.W007` when a probe fails on a live connection rather than staying silent.
+
+**Fix:** add an `AdoptTenantApp` migration for the app in your own app's migrations, or exclude the offending model via `BOUNDARY_ADOPT_EXCLUDE`. See [Adopt a third-party app into your tenancy](./how-to/adopt-a-third-party-app.md).
+
+#### `boundary.E007` appeared after a package upgrade
+
+**Cause:** one of two things, and the report tells you which.
+
+- **A model added upstream.** `boundary.E007` derives its expected set from the **live** app registry, while `AdoptTenantApp` derived its set from the historical migration state at the time you wrote it. A model the new package version added is in one and not the other, so its table has no `tenant_id` column and the check reports condition 1. This is the intended signal, not a false positive.
+- **A unique constraint recreated globally.** An upstream migration that drops and recreates an index replaces your composite constraint with a global one, restoring cross-tenant uniqueness with no other signal anywhere in the system, and the check reports condition 5. This is why `boundary.E007` is an Error rather than a Warning, and why `manage.py check` belongs in your deploy pipeline before any adopted-package upgrade reaches production.
+
+**Fix:** add a **second** `AdoptTenantApp` migration for the same app:
+
+```python
+# myapp/migrations/0011_adopt_allauth_account_again.py
+operations = [
+    AdoptTenantApp("account"),
+]
+```
+
+The operation is idempotent per table: a table already carrying a `tenant_id` column of the expected type is skipped unchanged, so this adopts only the newly added tables and re-establishes the constraints that drifted. If the new table already holds rows, supply `backfill_tenant` with the tenant those rows belong to, or the operation refuses (see the how-to). A table carrying a `tenant_id` column of a **different** type is refused rather than altered: boundary cannot tell its own column from one the package now genuinely declares.
+
 ### `boundary.W001`: strict mode off
 
 **Triggers when:** `BOUNDARY_STRICT_MODE` is `False`.
@@ -177,6 +211,27 @@ In a request, verify `TenantMiddleware` resolved a tenant (`request.tenant`, or 
 2. **Row Level Security** is the database-level guarantee. If RLS is not enabled and forced, raw SQL, `.using()` to a region, or queries through a non-tenant manager can cross boundaries (`E006`).
 
 **Fix:** keep strict mode on, ensure scoped models use `TenantMixin` / `make_tenant_mixin()`, and apply the `EnableRLS` migration operation. Resolve any `E006` errors before trusting isolation in production.
+
+### `IntegrityError` on `tenant_id` with no tenant
+
+**Cause:** a write to an **adopted** table (one belonging to an app in `BOUNDARY_TENANT_APPS`, given its tenancy by the `AdoptTenantApp` migration operation) while no tenant is active in context. The column is `NOT NULL DEFAULT boundary_current_tenant_id()`; with no tenant set, that default evaluates to `NULL` and the `NOT NULL` constraint rejects the row.
+
+This is fail-closed behaviour working as designed. Do not make the column nullable and do not relax the isolation policy to get past it.
+
+**`admin_bypass()` is not the fix.** The `NOT NULL` constraint is evaluated before any policy is consulted, and the bypass flag has no bearing on what `boundary_current_tenant_id()` returns. A write inside `admin_bypass()` with no tenant active raises exactly the same `IntegrityError`.
+
+**Fix:** run the write inside a tenant context for the tenant the rows belong to.
+
+```python
+from boundary.context import TenantContext
+
+with TenantContext.using(tenant):
+    EmailAddress.objects.create(user=user, email="a@example.com")
+```
+
+Unlike a mixin-scoped model, there is no `TenantNotSetError` and no strict-mode branch to catch this earlier: an adopted table has no ORM layer at all, so the database is the first thing that notices.
+
+The paths that commonly hit this are `createsuperuser` and `loaddata` (both fixable by wrapping them in a tenant context), plus `post_migrate` handlers and an adopted app's own data migrations, which run inside `migrate` with no tenant and no call site to wrap. Those last two have no remedy: exclude the model via `BOUNDARY_ADOPT_EXCLUDE`, or seed the rows per tenant from your own code. See [Adopt a third-party app into your tenancy](./how-to/adopt-a-third-party-app.md) and [Run cross-tenant admin operations](./how-to/cross-tenant-admin-operations.md).
 
 ### Regional queries all hit the default database
 
