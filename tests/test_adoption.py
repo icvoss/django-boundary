@@ -1,9 +1,10 @@
 """Acceptance tests for third-party app adoption (BR-RLS-010 to BR-RLS-020).
 
-One test per Given/When/Then of AC-RLS-008, 009, 010, 011, 013, 014 and 016,
-named after the acceptance criterion and carrying its text in the docstring.
-AC-RLS-012 and AC-RLS-015 cover ``boundary.E007``, which is Phase C, and are
-not implemented here.
+One test per Given/When/Then of AC-RLS-008 to 016, named after the
+acceptance criterion and carrying its text in the docstring. AC-RLS-012 and
+AC-RLS-015 cover ``boundary.E007``, and sit at the end of the module behind
+their own section marker, because they are the only tests here driven by
+``BOUNDARY_TENANT_APPS`` rather than by the operation directly.
 
 Most tests apply the operation through ``connection.schema_editor()`` with
 the ``FakeState`` pattern ``tests/test_rls.py`` established, because the
@@ -916,3 +917,570 @@ class TestAcRls016WriteWithNoTenantFailsClosed:
             cursor.execute("COMMIT")
 
         assert visible == 1
+
+
+# ── boundary.E007 (Phase C) ──────────────────────────────────
+#
+# E007 derives its expected set from BOUNDARY_TENANT_APPS and
+# BOUNDARY_ADOPT_EXCLUDE, neither of which tests/settings.py sets: the whole
+# check is inert by default, which is why no existing test in this suite
+# changes behaviour. Each test below turns it on with override_settings, and
+# must mirror the consumer migration's own exclude= in ADOPT_EXCLUDE, because
+# boundary_consumer/0002 excluded Seat, SeatBooking and Coupon per-migration
+# while E007 reads only the setting.
+
+E007_TENANT_APPS = ["thirdparty"]
+E007_ADOPT_EXCLUDE = list(ORDINARY_EXCLUDE)
+
+
+def _e007_errors():
+    """Run boundary.E007 and return only its errors, dropping W007.
+
+    Calling the check function directly rather than through
+    ``call_command("check")`` so the assertions read the Error objects
+    themselves (id, msg, hint) rather than parsing formatted console output,
+    and so a W007 could-not-determine warning is visibly a different thing
+    from a real E007 rather than both being lines of text.
+    """
+    from boundary.checks import _check_adopted_tables
+
+    return [e for e in _check_adopted_tables() if e.id == "boundary.E007"]
+
+
+def _e007_for(label):
+    """Return the E007 errors naming *label*, in ``app_label.ModelName`` form."""
+    return [e for e in _e007_errors() if label in e.msg]
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAcRls012E007ReportsAdoptedTableDrift:
+    """AC-RLS-012 (BR-RLS-010, BR-RLS-017): boundary.E007 reports a missing
+    column, missing RLS, a missing policy and a decomposed index.
+
+    transaction=True throughout: every test here damages the schema with DDL
+    and restores it in a finally block, and a non-transactional django_db
+    would roll the damage back before the check's own connection could see
+    a consistent picture of it.
+
+    Each damage state is produced in turn against the real adopted
+    thirdparty_widget table and then restored, rather than against a
+    purpose-built fixture table, so what E007 is proven to catch is drift in
+    exactly the schema AdoptTenantApp produces.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _e007_settings(self, settings, adopted):
+        """Turn E007 on for every test in this class.
+
+        Depends on ``adopted`` so the baseline is the correct adopted state:
+        a test that asserts a specific damage state is reported would
+        otherwise be reporting whatever a previous test left behind.
+        """
+        settings.BOUNDARY_TENANT_APPS = E007_TENANT_APPS
+        settings.BOUNDARY_ADOPT_EXCLUDE = E007_ADOPT_EXCLUDE
+
+    def test_ac_rls_012_the_correct_state_reports_nothing(self):
+        """Then a run against the fully correct state reports no
+        boundary.E007.
+
+        The positive control for every damage test below. Without it, a
+        check that reported nothing under any condition would pass all four
+        of them vacuously.
+        """
+        assert _e007_errors() == [], f"expected no E007 against the correct adopted state; got {_e007_errors()}"
+
+    def test_ac_rls_012_a_dropped_tenant_id_column_is_reported(self):
+        """When the tenant_id column is dropped, then the run reports a
+        boundary.E007 naming thirdparty.Widget, its table, and the missing
+        column, hinting at a new AdoptTenantApp migration.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_widget" DROP COLUMN tenant_id CASCADE')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            missing = [e for e in errors if "no tenant_id column" in e.msg]
+            assert missing, f"expected E007 for the dropped column; got {[e.msg for e in errors]}"
+            assert "thirdparty_widget" in missing[0].msg
+            assert "AdoptTenantApp('thirdparty')" in missing[0].hint
+        finally:
+            _executor().migrate([PRE_ADOPTION_MIGRATION])
+            _executor().migrate([ADOPTION_MIGRATION])
+
+    def test_ac_rls_012_an_unforced_table_is_reported(self):
+        """When NO FORCE ROW LEVEL SECURITY is applied, then the run reports
+        a boundary.E007 naming thirdparty.Widget, its table, and that RLS is
+        not both enabled and forced.
+
+        NO FORCE rather than DISABLE, because it is the subtler half: with
+        RLS enabled but not forced, PostgreSQL exempts the table OWNER from
+        every policy on it, which is exactly the role a Django deployment
+        usually connects as.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_widget" NO FORCE ROW LEVEL SECURITY')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            unforced = [e for e in errors if "Row Level Security enabled and forced" in e.msg]
+            assert unforced, f"expected E007 for the unforced table; got {[e.msg for e in errors]}"
+            assert "thirdparty_widget" in unforced[0].msg
+            assert "relforcerowsecurity=False" in unforced[0].msg
+            assert "AdoptTenantApp('thirdparty')" in unforced[0].hint
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute('ALTER TABLE "thirdparty_widget" FORCE ROW LEVEL SECURITY')
+
+    def test_ac_rls_012_a_dropped_isolation_policy_is_reported(self):
+        """When boundary_tenant_isolation is dropped, then the run reports a
+        boundary.E007 naming thirdparty.Widget, its table, and the missing
+        policy.
+
+        Asserts the admin_bypass policy is NOT also reported, which is what
+        proves the check distinguishes the two policies rather than
+        reporting "some policy is missing" for either.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('DROP POLICY boundary_tenant_isolation ON "thirdparty_widget"')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            missing = [e for e in errors if "boundary_tenant_isolation" in e.msg]
+            assert missing, f"expected E007 for the dropped policy; got {[e.msg for e in errors]}"
+            assert "thirdparty_widget" in missing[0].msg
+            assert not [e for e in errors if "boundary_admin_bypass" in e.msg], (
+                "the admin_bypass policy is still present and must not be reported"
+            )
+        finally:
+            from boundary.migrations_ops import create_tenant_policies
+
+            with connection.schema_editor() as editor:
+                editor.execute('DROP POLICY IF EXISTS boundary_admin_bypass ON "thirdparty_widget"')
+                create_tenant_policies(editor, "thirdparty_widget")
+
+    def test_ac_rls_012_a_dropped_admin_bypass_policy_is_reported(self):
+        """When boundary_admin_bypass is dropped, then the run reports a
+        boundary.E007 naming it, and does not report the isolation policy
+        that is still there.
+
+        The counterpart direction of the test above: together they prove
+        conditions 3 and 4 are two conditions rather than one.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('DROP POLICY boundary_admin_bypass ON "thirdparty_widget"')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            missing = [e for e in errors if "boundary_admin_bypass" in e.msg]
+            assert missing, f"expected E007 for the dropped policy; got {[e.msg for e in errors]}"
+            assert not [e for e in errors if "boundary_tenant_isolation" in e.msg], (
+                "the isolation policy is still present and must not be reported"
+            )
+        finally:
+            from boundary.migrations_ops import create_tenant_policies
+
+            with connection.schema_editor() as editor:
+                editor.execute('DROP POLICY IF EXISTS boundary_tenant_isolation ON "thirdparty_widget"')
+                create_tenant_policies(editor, "thirdparty_widget")
+
+    def test_ac_rls_012_a_composite_unique_index_decomposed_to_a_global_one_is_reported(self):
+        """When the composite unique constraint on (tenant_id, code) is
+        replaced by a global unique one on (code), then the run reports a
+        boundary.E007 naming thirdparty.Widget, its table, and that the
+        unique form does not lead with tenant_id.
+
+        This is BR-RLS-017's load-bearing condition 5, and the state an
+        upstream package upgrade produces when its own migration drops and
+        recreates the index: cross-tenant uniqueness is silently restored
+        with no other signal anywhere in the system.
+        """
+        original = {name: columns for name, columns in unique_constraints_by_name("thirdparty_widget").items()}
+        target = [name for name, columns in original.items() if columns == ["tenant_id", "code"]]
+        assert target, f"expected a composite (tenant_id, code) constraint to damage; got {original}"
+        name = target[0]
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'ALTER TABLE "thirdparty_widget" DROP CONSTRAINT "{name}"')
+            cursor.execute(f'ALTER TABLE "thirdparty_widget" ADD CONSTRAINT "{name}" UNIQUE (code)')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            decomposed = [e for e in errors if "does not lead with tenant_id" in e.msg]
+            assert decomposed, f"expected E007 for the decomposed constraint; got {[e.msg for e in errors]}"
+            assert "thirdparty_widget" in decomposed[0].msg
+            assert name in decomposed[0].msg
+            assert "unique across every tenant" in decomposed[0].msg
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(f'ALTER TABLE "thirdparty_widget" DROP CONSTRAINT "{name}"')
+                cursor.execute(f'ALTER TABLE "thirdparty_widget" ADD CONSTRAINT "{name}" UNIQUE (tenant_id, code)')
+
+    def test_ac_rls_012_a_bare_global_unique_index_is_reported(self):
+        """A unique INDEX backing no constraint is reported too.
+
+        Django emits the four unique sources into two different catalogue
+        forms, and an upstream migration writing a bare
+        ``CREATE UNIQUE INDEX`` produces one that no pg_constraint row
+        covers. A check reading only pg_constraint would miss it entirely,
+        which is why condition 5 inspects both.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('CREATE UNIQUE INDEX thirdparty_widget_bare_name_uniq ON "thirdparty_widget" (name)')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            bare = [e for e in errors if "thirdparty_widget_bare_name_uniq" in e.msg]
+            assert bare, f"expected E007 for the bare unique index; got {[e.msg for e in errors]}"
+            assert "does not lead with tenant_id" in bare[0].msg
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("DROP INDEX thirdparty_widget_bare_name_uniq")
+
+    def test_ac_rls_012_the_primary_key_is_not_reported(self):
+        """The primary key index leads with id, not tenant_id, and must not
+        be reported.
+
+        BR-RLS-017 excludes it by name: adoption deliberately leaves the
+        primary key alone, so a primary key that does not lead with
+        tenant_id is the expected state rather than drift. Without this
+        exclusion, condition 5 would fire on every adopted table forever.
+        """
+        assert _e007_errors() == [], (
+            f"the primary key must not be reported against a correct adopted state; got {_e007_errors()}"
+        )
+
+    def test_ac_rls_012_a_mixin_model_in_a_listed_app_is_not_reported(self, settings):
+        """And a model in the listed app that already carries TenantMixin is
+        not reported.
+
+        Adoption is the third of three mutually exclusive categories
+        (BR-RLS-010), so a model that is already column-bearing is skipped
+        from the derived set rather than expected to carry an adopted
+        column. Proven against boundary_testapp, none of whose tables is
+        adopted: Booking carries TenantMixin and its table has no tenant_id
+        column of adoption's kind, so a check that did not skip it would
+        report it under condition 1 immediately.
+
+        The positive control cannot be another model in the SAME app,
+        because every boundary_testapp model except Tenant is mixin-scoped
+        and the whole derived set is therefore empty. It is instead the same
+        check, in the same call, reporting the genuinely unadopted
+        thirdparty.Gadget: E007 is demonstrably running and finding a
+        missing column elsewhere in the very run that stays silent about
+        Booking, so the silence is the skip and not the check failing to
+        run.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_gadget" DROP COLUMN tenant_id CASCADE')
+        try:
+            settings.BOUNDARY_TENANT_APPS = ["boundary_testapp", "thirdparty"]
+            settings.BOUNDARY_ADOPT_EXCLUDE = E007_ADOPT_EXCLUDE
+
+            errors = _e007_errors()
+            assert not [e for e in errors if "boundary_testapp.Booking" in e.msg], (
+                f"a mixin-scoped model must not be reported as expected-adopted; got {[e.msg for e in errors]}"
+            )
+            assert _e007_for("thirdparty.Gadget"), (
+                "positive control: this same run must report the genuinely unadopted "
+                "table, or the silence about Booking proves nothing"
+            )
+        finally:
+            _executor().migrate([PRE_ADOPTION_MIGRATION])
+            _executor().migrate([ADOPTION_MIGRATION])
+
+    def test_ac_rls_012_an_excluded_model_is_not_reported(self, settings):
+        """And a model listed in BOUNDARY_ADOPT_EXCLUDE is not reported.
+
+        Widget is dropped from the derived set by naming it in the setting,
+        so the missing-column damage below goes unreported. The same damage
+        WITHOUT the exclusion is asserted to be reported, which is what
+        makes the silence attributable to the exclusion rather than to the
+        check not running.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_widget" DROP COLUMN tenant_id CASCADE')
+        try:
+            assert _e007_for("thirdparty.Widget"), (
+                "positive control: the dropped column must be reported when Widget is not excluded"
+            )
+
+            settings.BOUNDARY_ADOPT_EXCLUDE = [*E007_ADOPT_EXCLUDE, "thirdparty.Widget"]
+            assert not _e007_for("thirdparty.Widget"), "an excluded model must not be reported"
+        finally:
+            _executor().migrate([PRE_ADOPTION_MIGRATION])
+            _executor().migrate([ADOPTION_MIGRATION])
+
+    def test_ac_rls_012_the_auto_created_through_model_is_reported(self):
+        """And the auto-created many-to-many through model of a
+        ManyToManyField declared in thirdparty is reported when its table
+        lacks the column, proving the adopted set is derived with
+        include_auto_created=True (BR-RLS-010).
+
+        thirdparty.Widget_tags is a class Django generated, which appears in
+        no models.py and which a hand-written list of models to check would
+        never contain. It is reported by name, in the generated class's own
+        app_label.ModelName form, which is also the form that makes
+        excluding one of them possible.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_widget_tags" DROP COLUMN tenant_id CASCADE')
+        try:
+            errors = _e007_for("thirdparty.Widget_tags")
+            missing = [e for e in errors if "no tenant_id column" in e.msg]
+            assert missing, f"expected E007 for the through table; got {[e.msg for e in _e007_errors()]}"
+            assert "thirdparty_widget_tags" in missing[0].msg
+        finally:
+            _executor().migrate([PRE_ADOPTION_MIGRATION])
+            _executor().migrate([ADOPTION_MIGRATION])
+
+    def test_ac_rls_012_a_model_added_after_the_adoption_migration_is_reported(self):
+        """And a model added to the live thirdparty app registry after the
+        adoption migration was written is reported as a missing column,
+        proving E007 derives its expected set from the LIVE registry rather
+        than the historical migration state (BR-RLS-017).
+
+        Gadget is that model here: thirdparty/0001_initial created its
+        table, and the adoption migration's own derivation from the
+        historical state covers it, so the standing state has it adopted.
+        The live-registry claim is proven by removing its column WITHOUT
+        touching any migration state at all: the historical state still says
+        it is adopted, the database says it is not, and E007 must side with
+        the database and the live registry.
+
+        The complementary half, a model in the live registry that the
+        historical state never had, cannot be produced here without editing
+        thirdparty's migrations, which BR-RLS-011 forbids. Removing the
+        column is the same observable condition from E007's side: the live
+        registry names a model whose table has no column.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_gadget" DROP COLUMN tenant_id CASCADE')
+        try:
+            errors = _e007_for("thirdparty.Gadget")
+            missing = [e for e in errors if "no tenant_id column" in e.msg]
+            assert missing, f"expected E007 for the new model's table; got {[e.msg for e in _e007_errors()]}"
+            assert "thirdparty_gadget" in missing[0].msg
+        finally:
+            _executor().migrate([PRE_ADOPTION_MIGRATION])
+            _executor().migrate([ADOPTION_MIGRATION])
+
+    def test_ac_rls_012_the_expected_set_comes_from_the_live_registry(self, settings):
+        """The derivation itself, asserted directly rather than only through
+        its symptoms.
+
+        ``adoption.expected_adopted_models()`` is what E007, E006, W009,
+        boundary_deprovision and assert_rls_enforced all select from, so
+        pinning it here pins all five. It must return the LIVE registry's
+        models for the listed app, including the auto-created through model,
+        minus what the setting excludes, and it must never consult a
+        migration state.
+        """
+        from boundary import adoption
+
+        settings.BOUNDARY_TENANT_APPS = E007_TENANT_APPS
+        settings.BOUNDARY_ADOPT_EXCLUDE = E007_ADOPT_EXCLUDE
+
+        labels = {adoption.model_label(m) for m in adoption.expected_adopted_models()}
+        assert labels == {
+            "thirdparty.Widget",
+            "thirdparty.Widget_tags",
+            "thirdparty.Tag",
+            "thirdparty.Gadget",
+        }, f"unexpected expected-adopted set: {sorted(labels)}"
+
+        # Every one of them is the LIVE class, not a state-rendered stand-in.
+        from django.apps import apps as live_apps
+
+        for model in adoption.expected_adopted_models():
+            assert model is live_apps.get_model(model._meta.app_label, model.__name__)
+
+    def test_ac_rls_012_each_failing_condition_is_a_separate_error(self):
+        """One Error per failing condition per table, not one per table.
+
+        An operator fixing a table needs to see everything wrong with it,
+        not only whichever condition the check happened to test first. Three
+        conditions are damaged at once and all three must come back.
+        """
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE "thirdparty_widget" NO FORCE ROW LEVEL SECURITY')
+            cursor.execute('DROP POLICY boundary_tenant_isolation ON "thirdparty_widget"')
+            cursor.execute('DROP POLICY boundary_admin_bypass ON "thirdparty_widget"')
+        try:
+            errors = _e007_for("thirdparty.Widget")
+            assert len(errors) == 3, f"expected three separate errors; got {[e.msg for e in errors]}"
+            assert {"Row Level Security enabled and forced" in e.msg for e in errors} == {True, False}, (
+                "expected exactly one of the three to be the RLS condition"
+            )
+        finally:
+            from boundary.migrations_ops import create_tenant_policies
+
+            with connection.schema_editor() as editor:
+                editor.execute('ALTER TABLE "thirdparty_widget" FORCE ROW LEVEL SECURITY')
+                create_tenant_policies(editor, "thirdparty_widget")
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAcRls015AdoptionRefusesDeniedAppsButNotTheTenantModelsApp:
+    """AC-RLS-015 (BR-RLS-016): adoption refuses a deny-listed app, the
+    tenant model itself and an uninstalled app, but not the tenant model's
+    own app.
+
+    The acceptance criterion is written against a ``clubs`` app holding
+    ``Club`` (the tenant model), ``Membership`` and ``ClubSettings``. This
+    suite's ``boundary_testapp`` is that app: ``Tenant`` is the configured
+    tenant model and its siblings live beside it, which is the exact shape
+    BR-RLS-016 refuses to refuse.
+
+    Refusal is asserted at operation-apply time, per the rule's "at
+    operation-apply time and again at check time" split; the check-time half
+    is the last two tests, which need no migration at all.
+    """
+
+    def test_ac_rls_015_a_deny_listed_app_is_refused_naming_the_reason(self):
+        """When a migration applies AdoptTenantApp("contenttypes"), then it
+        fails with an error naming the app and the reason (global by
+        construction).
+
+        contenttypes rather than sessions here because it is the sharper
+        case: scoping it breaks Django's own bootstrap, since every
+        ContentType row is looked up before any tenant could be resolved.
+        """
+        with pytest.raises(AdoptionRefusedError) as exc_info:
+            _adopt(exclude=(), app_label="contenttypes")
+
+        message = str(exc_info.value)
+        assert "contenttypes" in message
+        assert "global by construction" in message
+
+    def test_ac_rls_015_an_uninstalled_app_is_refused_naming_the_reason(self):
+        """When a migration applies AdoptTenantApp("not_installed"), then it
+        fails with an error naming the app and the reason (not installed).
+        """
+        with pytest.raises(AdoptionRefusedError) as exc_info:
+            _adopt(exclude=(), app_label="not_installed")
+
+        message = str(exc_info.value)
+        assert "not_installed" in message
+        assert "is not installed" in message
+
+    def test_ac_rls_015_the_tenant_model_itself_is_refused_naming_the_reason(self):
+        """When AdoptTenantApp is applied to an app whose only adoptable
+        model is the configured tenant model, then it fails with an error
+        naming the model and the reason (it is the tenant model).
+
+        The criterion's "``AdoptTenantApp("clubs", exclude=())`` in a
+        configuration where ``Club`` is the only model" is reproduced by
+        excluding every sibling, which leaves exactly that configuration:
+        the derived set is empty, and BR-RLS-016 requires naming the model
+        rather than leaving the consumer to discover nothing was adopted.
+        """
+        from django.apps import apps as live_apps
+
+        from boundary import adoption
+
+        siblings = tuple(
+            adoption.model_label(model)
+            for model in live_apps.get_app_config("boundary_testapp").get_models(include_auto_created=True)
+            if adoption.model_label(model) != "boundary_testapp.Tenant"
+        )
+
+        with pytest.raises(AdoptionRefusedError) as exc_info:
+            _adopt(exclude=siblings, app_label="boundary_testapp")
+
+        message = str(exc_info.value)
+        assert "boundary_testapp.Tenant" in message
+        assert "configured tenant model" in message
+
+    def test_ac_rls_015_the_tenant_models_own_app_skips_only_the_tenant_model(self):
+        """When the tenant model's own app is derived, then the tenant model
+        is SKIPPED from the set rather than refusing the whole app, and the
+        tenant table carries no tenant_id column and no boundary policy.
+
+        The criterion's ``clubs_membership`` and ``clubs_clubsettings`` are
+        ``boundary_testapp``'s siblings here, and this suite's version of
+        that app is the stronger case rather than the weaker one: every one
+        of Tenant's siblings already carries a boundary mixin, so the
+        derived set is empty for a reason that has nothing to do with the
+        tenant model. What BR-RLS-016 turns on is WHY each model is absent,
+        so each is asserted against its own reason rather than inferred from
+        the empty result:
+
+        - the tenant model is absent because it is the tenant model, which
+          ``refusal_reason_for_model`` says in those words;
+        - every sibling is absent because it is already scoped, which
+          ``_is_already_scoped`` says;
+        - the APP is not refused at all, which is the whole point: its
+          ``refusal_reason`` is None, unlike contenttypes' above.
+
+        The adopt-the-siblings half of the criterion is proven by the
+        thirdparty adoption the rest of this module exercises, which is the
+        same derivation applied to an app with unscoped models in it.
+        """
+        from django.apps import apps as live_apps
+
+        from boundary import adoption
+
+        # The app itself is NOT refused: that is the distinction BR-RLS-016
+        # draws between the tenant model's app and a deny-listed one.
+        assert adoption.refusal_reason("boundary_testapp") is None
+
+        tenant_model = live_apps.get_model("boundary_testapp", "Tenant")
+        reason = adoption.refusal_reason_for_model(tenant_model)
+        assert reason is not None and "configured tenant model" in reason
+
+        for model in live_apps.get_app_config("boundary_testapp").get_models(include_auto_created=True):
+            if model is tenant_model:
+                continue
+            assert adoption._is_already_scoped(model), (
+                f"{adoption.model_label(model)} is neither the tenant model nor "
+                f"mixin-scoped, so this test's reasoning about why the set is "
+                f"empty no longer holds"
+            )
+
+        derived = {adoption.model_label(m) for m in adoption.adopted_models("boundary_testapp")}
+        assert "boundary_testapp.Tenant" not in derived, (
+            "the tenant model must be SKIPPED from its own app's derived set, not refuse the whole app"
+        )
+
+        # And the tenant table is untouched: no adopted column, no policy.
+        with connection.cursor() as cursor:
+            assert column_type(cursor, "boundary_testapp_tenant", "tenant_id") is None
+        assert _policies("boundary_testapp_tenant") == set()
+
+    def test_ac_rls_015_e007_reports_a_deny_listed_app_before_any_migration(self, db, settings):
+        """And with BOUNDARY_TENANT_APPS = ["sessions"], manage.py check
+        reports boundary.E007 for the deny-listed app before any migration
+        is run.
+
+        Condition 6 is settings-only by BR-RLS-017's own division: it reads
+        the setting against the app registry and the deny-list, so it fires
+        with no adoption migration anywhere and nothing in the database to
+        look at. sessions is not even in INSTALLED_APPS here, so the error
+        must be the deny-list one rather than the not-installed one: the
+        deny-list is checked first precisely so an operator is told the app
+        can never be adopted rather than to go install it.
+        """
+        settings.BOUNDARY_TENANT_APPS = ["sessions"]
+        settings.BOUNDARY_ADOPT_EXCLUDE = []
+
+        errors = _e007_errors()
+        assert len(errors) == 1, f"expected exactly one E007 for the deny-listed app; got {[e.msg for e in errors]}"
+        assert "sessions" in errors[0].msg
+        assert "global by construction" in errors[0].msg
+        assert "BOUNDARY_TENANT_APPS" in errors[0].hint
+
+    def test_ac_rls_015_e007_reports_nothing_for_the_tenant_model_itself(self, db, settings):
+        """And with BOUNDARY_TENANT_APPS = ["boundary_testapp"], manage.py
+        check reports no boundary.E007 for the tenant model itself.
+
+        The tenant model is skipped from the derived set the way an excluded
+        model is, so it is never expected-adopted and its table's total
+        absence of a tenant_id column is the correct state rather than
+        condition 1 drift. Without this skip, listing the tenant model's own
+        app would report the tenant table forever, which is what BR-RLS-016
+        means by not refusing the app.
+        """
+        settings.BOUNDARY_TENANT_APPS = ["boundary_testapp"]
+        settings.BOUNDARY_ADOPT_EXCLUDE = []
+
+        errors = _e007_errors()
+        assert not [e for e in errors if "boundary_testapp.Tenant" in e.msg], (
+            f"the tenant model must never be expected-adopted; got {[e.msg for e in errors]}"
+        )
+        assert not [e for e in errors if "boundary_testapp_tenant" in e.msg], (
+            f"the tenant TABLE must never be reported either; got {[e.msg for e in errors]}"
+        )

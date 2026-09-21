@@ -302,3 +302,251 @@ class TestBoundaryRunAll:
         slugs = [r["tenant"] for r in results]
         assert tenant_a.slug in slugs
         assert tenant_b.slug not in slugs
+
+
+# ── boundary_deprovision over adopted tables (BR-PRV-009) ────
+#
+# BOUNDARY_TENANT_APPS is unset in tests/settings.py, so the command's
+# adopted branch is inert by default and every existing deprovision test
+# above is unaffected. Each test here turns it on, mirroring the consumer
+# migration's own per-migration exclude= in BOUNDARY_ADOPT_EXCLUDE because
+# the command, like boundary.E007, reads only the setting.
+
+DEPROVISION_TENANT_APPS = ["thirdparty"]
+DEPROVISION_ADOPT_EXCLUDE = [
+    "thirdparty.Seat",
+    "thirdparty.SeatBooking",
+    "thirdparty.Coupon",
+]
+
+
+def _insert_widgets(tenant, count, prefix):
+    """Insert *count* adopted rows for *tenant*, naming tenant_id explicitly.
+
+    Raw SQL inside admin_bypass(), which is the documented way to write an
+    adopted row from outside a tenant context (BR-RLS-018): the column
+    DEFAULT would otherwise stamp NULL and the NOT NULL constraint would
+    reject it. Uses Django's own connection, so the rows are committed by
+    the surrounding transaction=True test rather than rolled back before
+    the command's server-side cursor could read them.
+    """
+    from django.db import connection
+
+    from boundary.context import admin_bypass
+
+    with admin_bypass(), connection.cursor() as cursor:
+        for index in range(count):
+            cursor.execute(
+                'INSERT INTO "thirdparty_widget" (name, code, owner, label, tenant_id) VALUES (%s, %s, %s, %s, %s)',
+                [f"{prefix}{index}", f"{prefix}-code-{index}", "owner", f"{prefix}{index}", tenant.pk],
+            )
+
+
+def _widget_count(tenant):
+    """Return the adopted table's row count for *tenant*, across RLS."""
+    from django.db import connection
+
+    from boundary.context import admin_bypass
+
+    with admin_bypass(), connection.cursor() as cursor:
+        cursor.execute('SELECT count(*) FROM "thirdparty_widget" WHERE tenant_id = %s', [tenant.pk])
+        return cursor.fetchone()[0]
+
+
+def _clear_widgets():
+    """Empty the adopted table between tests.
+
+    transaction=True commits, so a row left behind by one test would be
+    counted by the next one's assertions.
+    """
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute('TRUNCATE "thirdparty_widget_tags", "thirdparty_widget" CASCADE')
+
+
+@pytest.mark.django_db(transaction=True)
+class TestBoundaryDeprovisionAdoptedTables:
+    """AC-CMD-008/009/010 (BR-PRV-003, BR-PRV-004, BR-PRV-009): the
+    deprovision command covers adopted tables.
+
+    transaction=True is required rather than cosmetic: the command's export
+    reads through a PostgreSQL server-side cursor and every adopted
+    statement runs inside admin_bypass(), so the rows under test must be
+    genuinely committed rather than held in an outer atomic block that a
+    non-transactional django_db would roll back.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _adopted_settings(self, settings):
+        settings.BOUNDARY_TENANT_APPS = DEPROVISION_TENANT_APPS
+        settings.BOUNDARY_ADOPT_EXCLUDE = DEPROVISION_ADOPT_EXCLUDE
+        _clear_widgets()
+        yield
+        _clear_widgets()
+
+    @pytest.fixture
+    def four_and_two(self, tenant_a, tenant_b):
+        """Four adopted rows for tenant A and two for tenant B (AC-CMD-008)."""
+        _insert_widgets(tenant_a, 4, "a")
+        _insert_widgets(tenant_b, 2, "b")
+        return tenant_a, tenant_b
+
+    def test_ac_cmd_008_dry_run_counts_adopted_rows_for_the_target_tenant_only(self, four_and_two, capsys):
+        """Given thirdparty.Widget is adopted and holds four rows for tenant
+        A and two for tenant B, when boundary_deprovision --tenant club-a
+        --dry-run is run, then the output names thirdparty.Widget with a
+        count of 4, and no row is deleted from any table and the tenant row
+        still exists.
+
+        The count of 4 rather than 6 is the load-bearing half: a collect
+        step that ran its raw SELECT without admin_bypass() would see zero
+        rows under RLS, and one that ignored the WHERE clause would see six.
+        """
+        tenant_a, tenant_b = four_and_two
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, dry_run=True)
+        output = capsys.readouterr().out
+
+        assert "DRY RUN" in output
+        assert "thirdparty.Widget" in output, f"expected the adopted table named by label; got {output}"
+        assert "adopted" in output, f"expected the adopted table marked as adopted; got {output}"
+        widget_lines = [line for line in output.splitlines() if "thirdparty.Widget" in line]
+        assert len(widget_lines) == 1, f"expected exactly one Widget line; got {widget_lines}"
+        assert "4 rows" in widget_lines[0], f"expected a count of 4 for tenant A; got {widget_lines[0]}"
+
+        # Nothing deleted, tenant still there.
+        assert _widget_count(tenant_a) == 4
+        assert _widget_count(tenant_b) == 2
+        from boundary_testapp.models import Tenant
+
+        assert Tenant.objects.filter(pk=tenant_a.pk).exists()
+
+    def test_ac_cmd_009_export_carries_adopted_and_column_keys(self, four_and_two, tmp_path):
+        """Given the same state, when boundary_deprovision --tenant club-a
+        --export data.ndjson --yes is run, then data.ndjson contains four
+        lines whose _model is thirdparty.Widget, each carrying _pk as text,
+        _adopted as true, and every column of the adopted table keyed by
+        column name, tenant_id included.
+
+        And no line for an adopted row carries _adopted absent or false, and
+        no line for a column-bearing model carries _adopted at all: that
+        last clause is what makes _adopted a usable discriminator on
+        re-import rather than a key a consumer must guess the meaning of.
+        """
+        tenant_a, _tenant_b = four_and_two
+
+        # A column-bearing model's rows too, so the "no _adopted on a scoped
+        # line" half of the criterion has something to be true about.
+        from boundary_testapp.models import Booking
+
+        with set_tenant(tenant_a):
+            Booking.objects.create(court=1)
+
+        export_path = tmp_path / "data.ndjson"
+        call_command("boundary_deprovision", tenant=tenant_a.slug, export=str(export_path), yes=True)
+
+        lines = [json.loads(line) for line in export_path.read_text().splitlines() if line]
+        widget_lines = [row for row in lines if row["_model"] == "thirdparty.Widget"]
+        assert len(widget_lines) == 4, f"expected four adopted lines; got {[r['_model'] for r in lines]}"
+
+        for row in widget_lines:
+            assert row["_adopted"] is True
+            assert isinstance(row["_pk"], str), f"_pk must be text; got {row['_pk']!r}"
+            # Every column, by column NAME, tenant_id included.
+            assert row["tenant_id"] == tenant_a.pk
+            for column in ("id", "name", "code", "owner", "label"):
+                assert column in row, f"expected column '{column}' in the exported line; got {sorted(row)}"
+
+        booking_lines = [row for row in lines if row["_model"] == "boundary_testapp.Booking"]
+        assert booking_lines, "positive control: the scoped model's line must be exported too"
+        for row in booking_lines:
+            assert "_adopted" not in row, f"a column-bearing model's line must not carry _adopted; got {sorted(row)}"
+
+    def test_ac_cmd_009_the_export_is_written_before_any_delete(self, four_and_two, tmp_path):
+        """And the file is written before any delete statement runs.
+
+        Proven by the file's own contents rather than by ordering the calls:
+        the export holds four Widget lines AFTER the command has finished
+        deleting them, which is only possible if it was written while the
+        rows still existed. An export written after the delete would be
+        empty, and that is the failure this clause exists to prevent, since
+        the file is the operator's only copy of what was destroyed.
+        """
+        tenant_a, _tenant_b = four_and_two
+
+        export_path = tmp_path / "data.ndjson"
+        call_command("boundary_deprovision", tenant=tenant_a.slug, export=str(export_path), yes=True)
+
+        lines = [json.loads(line) for line in export_path.read_text().splitlines() if line]
+        widget_lines = [row for row in lines if row["_model"] == "thirdparty.Widget"]
+        assert len(widget_lines) == 4, "the export must hold the rows the command then deleted"
+        assert _widget_count(tenant_a) == 0, "precondition: the rows really were deleted afterwards"
+
+    def test_ac_cmd_010_delete_removes_that_tenants_adopted_rows_only(self, four_and_two):
+        """Given the same state, when boundary_deprovision --tenant club-a
+        --yes is run, then the four tenant A rows are gone from
+        thirdparty_widget and the two tenant B rows remain.
+
+        The surviving tenant B rows are the whole assertion: a DELETE that
+        omitted the WHERE clause, or ran without admin_bypass() and silently
+        matched nothing, would leave either zero or six rows behind, and
+        both of those are catastrophic in opposite directions.
+        """
+        tenant_a, tenant_b = four_and_two
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, yes=True)
+
+        assert _widget_count(tenant_a) == 0, "tenant A's adopted rows must be gone"
+        assert _widget_count(tenant_b) == 2, "tenant B's adopted rows must survive"
+
+    def test_ac_cmd_010_the_tenant_row_is_deleted_after_its_adopted_rows(self, four_and_two):
+        """And the tenant A row is deleted after its adopted rows, not
+        before.
+
+        The adopted tenant_id column is not a Django ForeignKey and carries
+        no database-level cascade, so ordering is the only thing keeping an
+        adopted row from outliving the tenant it belongs to. Proven by the
+        end state: the tenant is gone AND no adopted row of its remains. A
+        command that deleted the tenant first would leave four orphan rows
+        pointing at a primary key that no longer exists, which is exactly
+        what BR-PRV-009 requires the ordering to prevent.
+        """
+        tenant_a, tenant_b = four_and_two
+        tenant_a_pk = tenant_a.pk
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, yes=True)
+
+        from boundary_testapp.models import Tenant
+
+        assert not Tenant.objects.filter(pk=tenant_a_pk).exists(), "the tenant row must be deleted"
+
+        from django.db import connection
+
+        from boundary.context import admin_bypass
+
+        with admin_bypass(), connection.cursor() as cursor:
+            cursor.execute('SELECT count(*) FROM "thirdparty_widget" WHERE tenant_id = %s', [tenant_a_pk])
+            orphans = cursor.fetchone()[0]
+        assert orphans == 0, "no adopted row may outlive the tenant whose primary key it holds"
+        assert _widget_count(tenant_b) == 2
+
+    def test_adopted_tables_are_untouched_when_tenant_apps_is_unset(self, four_and_two, settings, capsys):
+        """The whole adopted branch is inert without BOUNDARY_TENANT_APPS.
+
+        The discriminator for every test above: they all set the setting, so
+        without this counterpart none of them would show that the setting is
+        what turns the behaviour on rather than it having always been there.
+        A deployment that has adopted nothing must not pay for, or be
+        changed by, any of this.
+        """
+        tenant_a, tenant_b = four_and_two
+        settings.BOUNDARY_TENANT_APPS = []
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, dry_run=True)
+        output = capsys.readouterr().out
+        assert "thirdparty.Widget" not in output, f"the adopted table must not be collected; got {output}"
+
+        call_command("boundary_deprovision", tenant=tenant_a.slug, yes=True)
+        assert _widget_count(tenant_a) == 4, "with the setting off, the adopted rows must be left alone"
+        assert _widget_count(tenant_b) == 2
