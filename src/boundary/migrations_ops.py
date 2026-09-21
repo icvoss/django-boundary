@@ -471,24 +471,35 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         from boundary import adoption
         from boundary.exceptions import AdoptionRefusedError
 
-        if not self._router_allows(schema_editor, app_label):
-            return
-        self._require_postgresql(schema_editor)
-
         refusal = adoption.refusal_reason(self.app_label, apps=to_state.apps)
         if refusal is not None:
             raise AdoptionRefusedError(f"AdoptTenantApp cannot adopt: {refusal}")
 
-        pg_type = self._tenant_pg_type()
         models = adoption.adopted_models(self.app_label, apps=to_state.apps, exclude=self.exclude)
 
         # A single-model app whose only model is the tenant model derives an
         # empty set. That is a refusal rather than a silent no-op: the
         # consumer asked for something that cannot happen, and BR-RLS-016
         # requires naming the model rather than leaving them to discover
-        # nothing was adopted.
+        # nothing was adopted. Checked ahead of the router gate, because an
+        # app with nothing adoptable is a mistake in the migration file and
+        # is the same mistake on every alias, where a router denial is a
+        # legitimate per-alias skip.
         if not models:
             self._refuse_empty_set(to_state.apps)
+
+        # Gate one: the router, per model. A denied table drops out of the
+        # set for this alias; an empty remainder means this alias holds none
+        # of the app's tables, so the operation issues nothing at all, not
+        # even the helper, and the vendor gate is never reached.
+        models = self._router_allowed_models(schema_editor, models)
+        if not models:
+            return
+
+        # Gate two: the vendor, only now that at least one table is in play.
+        self._require_postgresql(schema_editor)
+
+        pg_type = self._tenant_pg_type()
 
         # Pass one: read-only. Every per-table refusal for every table in the
         # derived set, with nothing written. A plan of None means the table is
@@ -511,30 +522,36 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         for plan in plans:
             self._adopt_table(schema_editor, plan)
 
-    def _router_allows(self, schema_editor, app_label) -> bool:
-        """Return whether the router permits this operation on this alias.
+    def _router_allowed_models(self, schema_editor, models):
+        """Return the models the router permits on this alias (BR-RLS-013).
 
-        Mirrors ``RunSQL.database_forwards``: an operation emitting raw SQL
-        asks ``router.allow_migrate()`` for the migration's own app label and
-        does nothing at all when the answer is no. Without this a project
-        whose router keeps a non-PostgreSQL alias off the graph still has the
-        adoption DDL pushed at that alias, because ``reduces_to_sql``
-        operations are not covered by the model-level ``allow_migrate_model``
-        the schema-altering operations use.
+        Asked per model through ``router.allow_migrate_model()``, which is
+        the call Django's own ``CreateModel`` and ``AddField`` make for
+        model-level DDL. It reaches a consumer's routers as
+        ``allow_migrate(db, app_label, model_name=<model name>,
+        model=<model>)`` with the ADOPTED app's own label, which is what a
+        router keying on either argument expects to receive: the table under
+        consideration is a table of the adopted app, not of the app whose
+        migration happens to carry the operation.
 
-        ``model_name`` is passed as the hint, naming the app being adopted
-        rather than a single model, because the operation acts on every
-        concrete table of that app and a router answering per model has no
-        one model to answer for. A router that keys only on the app label
-        (which is the ordinary form) is unaffected by the hint.
+        Asking per model rather than once for the whole operation is what
+        makes the gate answerable. A router is written to answer "may this
+        table exist on this alias", and under regional routing an adopted
+        app's tables exist only on the aliases the router admits; a single
+        app-level question has no answer when the router admits some tables
+        and not others. A denied table is skipped on that alias with no DDL
+        and no error, and an empty remainder makes the whole operation a
+        silent no-op there.
+
+        Not covered by Django's own machinery: ``reduces_to_sql`` operations
+        such as this one are never passed through ``allow_migrate_model`` by
+        the executor, so without this gate a project whose router keeps an
+        alias off the adoption graph still has the DDL pushed at it.
         """
         from django.db import router
 
-        return router.allow_migrate(
-            schema_editor.connection.alias,
-            app_label,
-            model_name=self.app_label,
-        )
+        alias = schema_editor.connection.alias
+        return [model for model in models if router.allow_migrate_model(alias, model)]
 
     def _require_postgresql(self, schema_editor) -> None:
         """Refuse a non-PostgreSQL connection the router did allow.
@@ -548,10 +565,11 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         (BR-RLS-015: an adopted table on a non-PostgreSQL backend is
         unisolated and has no ORM layer underneath it to compensate).
 
-        Checked only after the router has allowed the alias, so the
-        documented way to keep a non-PostgreSQL alias off the adoption graph
-        (a router's ``allow_migrate``) stays a silent no-op rather than
-        becoming a refusal.
+        Checked only once the router has left at least one table in the set,
+        so the documented way to keep a non-PostgreSQL alias off the adoption
+        graph (a router's ``allow_migrate``) stays a silent no-op rather than
+        becoming a refusal. An alias the router denies every table on is
+        never asked about its vendor at all.
         """
         from boundary.exceptions import AdoptionRefusedError
 
@@ -895,11 +913,16 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         """
         from boundary import adoption
 
-        if not self._router_allows(schema_editor, app_label):
+        models = adoption.adopted_models(self.app_label, apps=from_state.apps, exclude=self.exclude)
+
+        # Both gates, in the forward's order (BR-RLS-013). A table the router
+        # denies on this alias is skipped silently, and an alias holding none
+        # of them is left entirely alone rather than refused on its vendor.
+        models = self._router_allowed_models(schema_editor, models)
+        if not models:
             return
         self._require_postgresql(schema_editor)
 
-        models = adoption.adopted_models(self.app_label, apps=from_state.apps, exclude=self.exclude)
         for model in models:
             self._unadopt_table(schema_editor, model)
 

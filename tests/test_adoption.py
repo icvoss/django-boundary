@@ -26,7 +26,7 @@ import pytest
 from django.db import IntegrityError, connection, transaction
 from django.test import override_settings
 
-from boundary.adoption import column_type, unique_constraints, unique_indexes
+from boundary.adoption import adopted_models, column_type, unique_constraints, unique_indexes
 from boundary.exceptions import AdoptionRefusedError
 from boundary.migrations_ops import AdoptTenantApp
 
@@ -1934,13 +1934,33 @@ class _DenyingRouter:
 
 
 class _RecordingRouter:
-    """A router that allows everything and records what it was asked."""
+    """A router that allows everything and records what it was asked.
+
+    Written to Django's documented ``allow_migrate(db, app_label,
+    model_name=None, **hints)`` signature, which is the shape a consumer's
+    router has, so what it records is what a real router would receive.
+    """
 
     calls = []
 
-    def allow_migrate(self, db, app_label, **hints):
-        type(self).calls.append((db, app_label, hints))
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        type(self).calls.append((db, app_label, model_name, hints))
         return True
+
+
+class _ModelDenyingRouter:
+    """A router that denies one named model of the app and allows the rest.
+
+    The per-model gate's discriminator. An app-level gate cannot express
+    this at all: it must answer the same way for every table of the app.
+    """
+
+    #: ``model_name`` values this router refuses, lowercase as Django passes
+    #: them.
+    denied = frozenset({"gadget"})
+
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        return not (app_label == "thirdparty" and model_name in self.denied)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1948,12 +1968,17 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
     """A ``reduces_to_sql`` operation must ask the router before emitting, and
     must name the vendor when a non-PostgreSQL alias gets through.
 
-    ``allow_migrate_model``, which the schema-altering operations go through,
-    does not cover an operation that emits raw SQL; Django's own ``RunSQL``
-    calls ``router.allow_migrate()`` itself for exactly this reason, and
-    adoption follows it. A project's documented way to keep a non-PostgreSQL
-    alias off the adoption graph is that router, so the vendor refusal is
-    checked only after the router has allowed the alias.
+    Django's executor never passes a ``reduces_to_sql`` operation through
+    ``allow_migrate_model`` the way it does a schema-altering one, so the
+    operation makes that call itself, once per model in the derived set. It is
+    the model-level form rather than ``RunSQL``'s bare app-level
+    ``allow_migrate()`` because the question a router answers is whether a
+    TABLE belongs on an alias, and under regional routing a router may admit
+    some of an adopted app's tables and not others (BR-RLS-013 gate 1).
+
+    A project's documented way to keep a non-PostgreSQL alias off the adoption
+    graph is that router, so the vendor refusal is checked only once the
+    router has left at least one table in the set.
     """
 
     def test_a_denying_router_makes_the_forward_emit_nothing(self, unadopted):
@@ -2003,13 +2028,24 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
             "boundary_admin_bypass",
         }
 
-    def test_the_router_is_asked_for_the_migrations_own_app_label(self, unadopted):
-        """And the router is asked about the app the MIGRATION belongs to, not
-        the app being adopted, matching RunSQL.
+    def test_the_router_is_asked_per_model_with_the_adopted_apps_own_label(self, unadopted):
+        """And the router is asked through allow_migrate_model, so it receives
+        the ADOPTED app's label as app_label and each model's own model_name,
+        never an app label in the model_name position.
 
-        The consumer's own app is what the migration lives in, and a router
-        keying on app labels routes by that; the adopted app is passed as the
-        model_name hint so a router that wants it can see it.
+        This is the half a consumer's router actually depends on. A router is
+        written to Django's ``allow_migrate(db, app_label, model_name=None,
+        **hints)`` signature, boundary's own ``RegionalRouter`` included, so a
+        hand-built call passing ``model_name="thirdparty"`` hands it an APP
+        label in the argument documented to carry a model name. A router
+        matching on ``model_name`` would then match nothing, or match the
+        wrong thing, and route adoption DDL to an alias the consumer meant to
+        keep it off.
+
+        Asserted against the whole derived set rather than the first call, so
+        a gate that asked once and reused the answer fails here: the set
+        includes Widget's auto-created through model, which a per-model gate
+        must ask about separately.
         """
         state = _fake_state()
         operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
@@ -2022,10 +2058,69 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
             operation.database_forwards("boundary_consumer", editor, state, state)
 
         assert _RecordingRouter.calls, "the operation must ask the router at all"
-        alias, app_label, hints = _RecordingRouter.calls[0]
-        assert alias == connection.alias
-        assert app_label == "boundary_consumer"
-        assert hints == {"model_name": "thirdparty"}
+        for alias, app_label, model_name, hints in _RecordingRouter.calls:
+            assert alias == connection.alias
+            assert app_label == "thirdparty", (
+                f"the router must receive the ADOPTED app's label, not the migration's; got {app_label!r}"
+            )
+            assert model_name != "thirdparty", f"model_name must never carry an app label; got {model_name!r}"
+            assert hints["model"]._meta.model_name == model_name
+
+        asked = {model_name for _, _, model_name, _ in _RecordingRouter.calls}
+        expected = {model._meta.model_name for model in adopted_models("thirdparty", exclude=ORDINARY_EXCLUDE)}
+        assert asked == expected, f"the router must be asked once per adopted model; got {sorted(asked)}"
+        assert "widget_tags" in asked, "the auto-created through model must be asked about too"
+
+    def test_a_router_denying_one_model_leaves_only_that_table_untouched(self, unadopted):
+        """And a router that denies one model of the set but allows the rest
+        leaves only that model's table untouched.
+
+        The per-model gate's whole point, and the case no app-level gate can
+        express: the router says yes to thirdparty.Widget and no to
+        thirdparty.Gadget on the same alias in the same call. Gadget is the
+        denied one because it carries no unique constraint and no foreign key,
+        so leaving it out cannot disturb what the others do.
+
+        Both directions of the assertion are load-bearing. Gadget keeping no
+        tenant_id column proves the denial took effect; Widget and the through
+        table gaining one proves the denial was scoped to Gadget rather than
+        suppressing the operation outright, which a gate that failed open on
+        any denial would also produce.
+        """
+        state = _fake_state()
+        operation = AdoptTenantApp("thirdparty", exclude=ORDINARY_EXCLUDE)
+
+        with (
+            override_settings(DATABASE_ROUTERS=[_ModelDenyingRouter()]),
+            connection.schema_editor() as editor,
+        ):
+            operation.database_forwards("boundary_consumer", editor, state, state)
+
+        try:
+            with connection.cursor() as cursor:
+                assert column_type(cursor, "thirdparty_gadget", "tenant_id") is None, (
+                    "the denied model's table must be left entirely untouched"
+                )
+                for table in ("thirdparty_widget", "thirdparty_tag", "thirdparty_widget_tags"):
+                    assert column_type(cursor, table, "tenant_id") == "bigint", (
+                        f"the allowed model's table must be adopted normally; {table} was not"
+                    )
+            assert _policies("thirdparty_gadget") == set(), "the denied table must carry no boundary policy"
+            assert _policies("thirdparty_widget") == {
+                "boundary_tenant_isolation",
+                "boundary_admin_bypass",
+            }
+            assert _rls_state("thirdparty_gadget") == (False, False), (
+                "the denied table must have RLS neither enabled nor forced"
+            )
+        finally:
+            # The unadopted fixture restores by re-applying the consumer's
+            # migration, which skips an already-adopted table; the partial
+            # state this test leaves must be reversed here so it does not
+            # reach the next test. The reverse runs with the router back to
+            # its default, so it sees every table.
+            with connection.schema_editor() as editor:
+                operation.database_backwards("boundary_consumer", editor, state, state)
 
     @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
     def test_a_non_postgresql_alias_the_router_allowed_is_refused_naming_the_vendor(self):
