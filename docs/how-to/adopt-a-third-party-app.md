@@ -146,7 +146,8 @@ value silently assigns every pre-existing row to a tenant that may not exist.
 ### 4. Know what the operation rewrites, and what it refuses
 
 Per adopted table, the operation adds the `tenant_id` column (typed from your
-tenant model's primary key: `uuid` for a UUID key, `bigint` for an integer one),
+tenant model's primary key: `uuid` for a UUID key, `bigint` for an integer one;
+any other key type is refused by name rather than guessed),
 rewrites the unique constraints, enables and forces Row Level Security, and
 creates the same two policies a mixin-scoped table gets. From PostgreSQL's side
 an adopted table is indistinguishable from a column-bearing one.
@@ -162,7 +163,7 @@ active tenant, and the composite index agrees with that scope, so two tenants ma
 hold the same value and neither sees the other's.
 
 The operation reads the PostgreSQL catalogue to find what it is rewriting rather
-than guessing constraint names, and **four forms make it refuse outright**,
+than guessing constraint names, and **five forms make it refuse outright**,
 naming the constraint or index and the model:
 
 | Form | Why it is refused |
@@ -171,6 +172,7 @@ naming the constraint or index and the model:
 | A partial unique index (one with a condition) | Its predicate cannot safely be re-expressed against the added column |
 | An expression index | Same reason: the definition cannot be reproduced safely |
 | A deferrable constraint | Cannot be reproduced safely |
+| A bare unique index backing no constraint (a `models.Index` with `unique=True`, or one created by hand) | Replacing an index with a composite UNIQUE constraint is not an equivalent rewrite, and your next `makemigrations` would not recognise the result |
 
 Refusing is the point. A unique constraint skipped silently stays globally
 unique, which is precisely the cross-tenant collapse this whole mechanism exists
@@ -178,13 +180,21 @@ to prevent. Your answer in each case is to exclude that model, via
 `BOUNDARY_ADOPT_EXCLUDE` or the operation's own `exclude`, or to write the
 rewrite by hand in your own migration.
 
-The operation runs inside the migration's own transaction, so a refusal or a
-failure on any one table rolls back every table the same call had already
-altered. It is idempotent per table: a table that already carries a `tenant_id`
+The operation checks every table in the set before it issues any statement, so
+a refusal on one table means nothing was changed on any table. The migration's
+own transaction is the backstop behind that, not the mechanism: a failure
+mid-way through the DDL is rolled back with it. It is idempotent per table: a table that already carries a `tenant_id`
 column of the expected type is skipped unchanged, which is what makes a second
 `AdoptTenantApp` migration after a package upgrade adopt only the newly added
 tables. A table carrying a `tenant_id` column of a **different** type is refused,
 because boundary cannot tell its own column from one the app genuinely declares.
+
+The operation also honours your database router. When `allow_migrate` says no
+for the alias being migrated, it issues nothing there and raises nothing, the
+same way Django's own `RunSQL` behaves; that is the intended way to keep a
+SQLite or MySQL alias out of the picture. When the router allows an alias that
+is not PostgreSQL, the operation refuses by naming the vendor rather than
+sending DDL that backend cannot run.
 
 ### 5. Know which apps cannot be adopted
 
