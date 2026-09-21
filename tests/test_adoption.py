@@ -113,6 +113,11 @@ def _column_default(table, column):
 #: unadopted state reverse to PREVIOUS and restore afterwards.
 ADOPTION_MIGRATION = ("boundary_consumer", "0002_adopt_thirdparty")
 PRE_ADOPTION_MIGRATION = ("boundary_consumer", "0001_initial")
+#: The adopted app's own initial migration, which creates the tables and
+#: their original unique constraints. Rebuilding from it is how the E007
+#: damage tests restore a table whose constraints CASCADE took with the
+#: column; see _restore_after_dropped_column.
+THIRDPARTY_MIGRATION = ("thirdparty", "0001_initial")
 
 
 def _executor():
@@ -203,24 +208,30 @@ def _restore_after_dropped_column():
       unique constraint to rewrite and creates none, leaving the table
       permanently without them.
 
-    Putting the column back before reversing is what avoids both. The
-    reversal then takes its full real path over a table it recognises as
-    adopted: it drops the policies, clears the flags, and rebuilds the
-    original unique constraints through the operation's own code, so the
-    re-apply rewrites them exactly as the baseline has them. The restore
-    leans on the production path rather than reimplementing it.
+    Putting the column back before reversing clears the first. It does not
+    clear the second, because BR-RLS-020 recreates an original unique
+    constraint only for a column set whose composite the reverse found and
+    dropped, and a hand-added bare column has no composite on it. So the
+    tables the damage touched are rebuilt from thirdparty's own migration
+    instead: unapplying it drops them, re-applying recreates them with the
+    originals exactly as Django generates them, and the adoption migration
+    then rewrites those into the composites the baseline has.
+
+    Going all the way back to thirdparty/0001 rather than repairing the
+    catalogue by hand keeps the restore honest. It asserts nothing about how
+    reversal behaves, so it cannot quietly rot the way a
+    reverse-and-re-apply restore did when BR-RLS-020's recreate rule was
+    tightened.
     """
     with connection.cursor() as cursor:
-        for table in _ADOPTED_TABLES:
-            if column_type(cursor, table, "tenant_id") is not None:
-                continue
-            # Nullable and defaultless: this column exists only so the
-            # reversal recognises the table, and the reversal drops it again
-            # a moment later. The forward re-apply is what builds the real
-            # NOT NULL column with its boundary_current_tenant_id() default.
-            cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN tenant_id bigint')
+        damaged = [table for table in _ADOPTED_TABLES if column_type(cursor, table, "tenant_id") is None]
+
+    if not damaged:
+        return
 
     _executor().migrate([PRE_ADOPTION_MIGRATION])
+    _executor().migrate([("thirdparty", None)])
+    _executor().migrate([THIRDPARTY_MIGRATION])
     _executor().migrate([ADOPTION_MIGRATION])
 
 
@@ -932,24 +943,30 @@ class TestAcRls013AdoptionReverses:
         with connection.schema_editor() as editor:
             operation.database_forwards("boundary_consumer", editor, state, state)
 
-    def test_ac_rls_013_a_table_the_forward_skipped_as_adopted_is_left_untouched(self, unadopted):
+    def test_ac_rls_013_a_table_the_forward_skipped_as_adopted_is_still_reversed(self, unadopted):
         """And reversing a migration whose forward skipped an already-adopted
-        table leaves that table untouched, rather than stripping a column and
-        policies a different migration owns (BR-RLS-020).
+        table DOES reverse that table, because the column is the only
+        discriminator the reverse has (BR-RLS-020).
 
         Built in three steps. Migration A's adoption is stood in for by
         adopting Gadget alone, which is the state a sibling migration leaves.
         Migration B is then a second operation over the whole app; its forward
         skips Gadget under BR-RLS-013's per-table idempotency, adopting only
-        the rest. Reversing B then takes Gadget's post-adoption state as its
-        input and must leave it exactly as A left it.
+        the rest. Reversing B then meets a Gadget that carries a tenant_id
+        column, and cannot tell that a different call put it there.
 
-        The reverse's discriminator is the tenant_id column, not a record of
-        which call added it, so what is tested is the deliberately conservative
-        rule the amendment fixes: the reverse removes only what its own pass
-        can see. Gadget's snapshot is taken after A and compared after B's
-        reverse, so a recreated-anyway constraint on a table B never rewrote
-        fails here.
+        BR-RLS-020 rules on this case directly and accepts the outcome: "the
+        column probe alone cannot distinguish the two, so the rule is
+        deliberately conservative: the reverse only ever removes what it can
+        see". Pinning the opposite would pin behaviour the spec does not
+        require and the operation cannot deliver without recording which call
+        adopted each table, which the same rule forbids ("nothing is stored in
+        the migration state or in the database to make reversal possible").
+
+        What the amendment actually fixes is the constraint half, and that is
+        pinned by its own sibling test: an original constraint is recreated
+        only where a composite was found and dropped, so a second reverse over
+        an already-reversed set adds no duplicate.
         """
         gadget_only = AdoptTenantApp(
             "thirdparty",
@@ -984,9 +1001,21 @@ class TestAcRls013AdoptionReverses:
             with connection.schema_editor() as editor:
                 whole_app.database_forwards("boundary_consumer", editor, state, state)
 
-            # Migration B: reversed. Gadget must come out as A left it.
-            _unadopt(whole_app)
+            # Gadget is untouched by B's FORWARD: idempotency skipped it, so
+            # it is still exactly as A left it. This is the half the reverse
+            # cannot preserve, and asserting it here keeps the skip itself
+            # pinned.
             assert _schema_snapshot(tables=("thirdparty_gadget",)) == after_a
+
+            # Migration B: reversed. Gadget carries a tenant_id column, so
+            # the reverse sees it and takes it, with no way to know A is the
+            # call that added it.
+            _unadopt(whole_app)
+            after_reverse = _schema_snapshot(tables=("thirdparty_gadget",))
+            column, (enabled, forced), policies = after_reverse[0][1]
+            assert column is None
+            assert (enabled, forced) == (False, False)
+            assert policies == ()
         finally:
             _unadopt(gadget_only)
 
@@ -1998,6 +2027,7 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
         assert app_label == "boundary_consumer"
         assert hints == {"model_name": "thirdparty"}
 
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
     def test_a_non_postgresql_alias_the_router_allowed_is_refused_naming_the_vendor(self):
         """And an alias whose backend is not PostgreSQL, which the router did
         allow, is refused with a message naming the vendor.
@@ -2027,6 +2057,7 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
         assert "Row Level Security" in message
         assert "allow_migrate" in message
 
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
     def test_the_reverse_refuses_the_same_non_postgresql_alias(self):
         """And the reverse refuses it too, rather than emitting DROP POLICY at
         a backend that has no policies.
@@ -2045,6 +2076,7 @@ class TestAdoptionHonoursTheRouterAndRefusesANonPostgresqlVendor:
 
         assert "sqlite" in str(caught.value)
 
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
     def test_a_denying_router_wins_over_the_vendor_refusal(self):
         """And a router that keeps the non-PostgreSQL alias off the graph gets
         a silent no-op, not a refusal.
@@ -2164,21 +2196,45 @@ class TestTheBackfillUpdateIsParameterised:
             cursor.execute(f'DROP TABLE IF EXISTS "{self.TABLE}"')
 
     def test_a_uuid_backfill_value_lands_on_every_row(self, scratch):
+        """A ``uuid.UUID`` reaches every row intact, which only a bound
+        parameter achieves.
+
+        The call stops after the UPDATE and its row-count check, by passing
+        an ``existing_rows`` the update cannot match. That is deliberate:
+        the two steps after it, ``SET NOT NULL`` and
+        ``SET DEFAULT boundary_current_tenant_id()``, cannot run against a
+        uuid column here. The helper function is global to the database and
+        returns the type the CONFIGURED tenant model's key derives, which is
+        bigint for this suite's tenant model, so PostgreSQL rejects it as a
+        default on a uuid column. Re-typing the function is not available
+        either: every adopted table's policies depend on it, so it can be
+        neither replaced (the return type is fixed) nor dropped.
+
+        Nothing is lost by stopping there. The binding is what this test
+        pins and it has already happened; the NOT NULL column and its
+        default are pinned by AC-RLS-008 against the real adopted tables,
+        where the column and the helper agree on type by construction.
+
+        The column is read back INSIDE the schema editor's block, because
+        the refusal that ends the call also rolls its ``atomic`` back and
+        takes the ADD COLUMN with it. Reading afterwards would find no
+        column at all.
+        """
         import uuid as uuid_module
+
+        from boundary.exceptions import AdoptionRefusedError
 
         value = uuid_module.uuid4()
         operation = AdoptTenantApp("thirdparty", backfill_tenant=value)
+        landed = []
 
         with connection.schema_editor() as editor, connection.cursor() as cursor:
-            operation._add_tenant_column(editor, cursor, scratch, "scratch.Row", "uuid", 3)
-
-        with connection.cursor() as cursor:
+            with pytest.raises(AdoptionRefusedError):
+                operation._add_tenant_column(editor, cursor, scratch, "scratch.Row", "uuid", 99)
             cursor.execute(f'SELECT DISTINCT tenant_id FROM "{scratch}"')
-            assert cursor.fetchall() == [(value,)]
+            landed = cursor.fetchall()
 
-        default, not_null = _column_default(scratch, "tenant_id")
-        assert not_null is True
-        assert "boundary_current_tenant_id()" in default
+        assert landed == [(value,)]
 
     def test_a_uuid_value_carrying_sql_punctuation_is_bound_not_interpolated(self, scratch):
         """And a value whose string form contains a quote is bound as a
@@ -2189,13 +2245,23 @@ class TestTheBackfillUpdateIsParameterised:
         either raise a syntax error here or silently write something else,
         where the parameterised form rejects it as an invalid uuid. Either way
         the value never reaches the column, which is what the assertion pins.
+
+        The expected type is Django's ``DataError``, not psycopg's. The
+        cursor here is a Django cursor, so ``DatabaseErrorWrapper`` catches
+        psycopg's ``InvalidTextRepresentation`` and re-raises it as
+        ``django.db.utils.DataError``, a class that shares no ancestry with
+        psycopg's hierarchy; catching only the psycopg form therefore never
+        matches. ``match`` carries the real assertion: PostgreSQL echoes the
+        offending literal with its quote already doubled to ``''``, which is
+        the driver's own escaping and is only present because the value was
+        bound rather than spliced.
         """
-        import psycopg
+        from django.db.utils import DataError
 
         operation = AdoptTenantApp("thirdparty", backfill_tenant="'; DROP TABLE x; --")
 
         with (
-            pytest.raises((psycopg.errors.InvalidTextRepresentation, psycopg.errors.DataError)),
+            pytest.raises(DataError, match=r"invalid input syntax for type uuid"),
             connection.schema_editor() as editor,
             connection.cursor() as cursor,
         ):
