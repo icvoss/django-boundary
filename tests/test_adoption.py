@@ -360,6 +360,38 @@ def unique_constraints_by_name(table):
         return {c["name"]: c["columns"] for c in unique_constraints(cursor, table)}
 
 
+def _schema_snapshot(tables=_ADOPTED_TABLES):
+    """Return a comparable snapshot of everything adoption changes.
+
+    Per table: the tenant_id column's type or None, the two pg_class RLS
+    flags, the policy names, and every non-primary-key unique constraint by
+    name and column set. Sorted throughout so two snapshots compare by value.
+
+    Written as one structure rather than a set of separate assertions because
+    the rules it pins are "nothing changed", and a partial snapshot would let a
+    spurious recreated constraint or a surviving policy through. Constraint
+    NAMES are included deliberately: a second unconditional recreate derives
+    the same schema-editor name, so a count alone would miss it on a backend
+    that tolerated the duplicate.
+    """
+    snapshot = []
+    with connection.cursor() as cursor:
+        for table in tables:
+            constraints = sorted((c["name"], tuple(c["columns"])) for c in unique_constraints(cursor, table))
+            snapshot.append(
+                (
+                    table,
+                    (
+                        column_type(cursor, table, "tenant_id"),
+                        _rls_state(table),
+                        tuple(sorted(_policies(table))),
+                    ),
+                    tuple(constraints),
+                )
+            )
+    return snapshot
+
+
 @pytest.mark.django_db(transaction=True)
 class TestAcRls009AdoptedTableIsolatesThirdPartyOrmCode:
     """AC-RLS-009 (BR-RLS-011, BR-RLS-015): an adopted table isolates
@@ -853,6 +885,135 @@ class TestAcRls013AdoptionReverses:
         with connection.cursor() as cursor:
             cursor.execute("SELECT count(*) FROM pg_proc WHERE proname = 'boundary_current_tenant_id'")
             assert cursor.fetchone()[0] == 1
+
+    def test_ac_rls_013_reversing_twice_changes_nothing_and_raises_nothing(self, adopted):
+        """And reversing twice leaves the schema exactly as one reverse left
+        it, raising nothing (BR-RLS-020).
+
+        Driven from the ADOPTED state, so the first reverse is a real one and
+        the second meets what the first produced, rather than starting from an
+        already-reversed fixture where only the second pass is exercised.
+
+        The reverse iterates the derived set, which is not the set of tables
+        the call actually altered, so a second pass meets tables with no
+        tenant_id column, no policies and no composite. Without the column
+        probe it would fail on DROP POLICY or on dropping a column that is
+        already gone; without the conditional recreate it would add a
+        DUPLICATE original constraint to a table it should have left alone,
+        which is the quieter of the two defects and is what the snapshot
+        comparison catches.
+
+        The snapshot covers every adopted table, not just Widget, and covers
+        constraint names as well as column sets, because a second
+        unconditional CREATE derives the same schema-editor name and would
+        surface as a duplicate-name error on some tables and as a silently
+        doubled constraint count on others.
+        """
+        operation = AdoptTenantApp(
+            "thirdparty",
+            exclude=(
+                "thirdparty.Seat",
+                "thirdparty.SeatBooking",
+                "thirdparty.Coupon",
+            ),
+        )
+
+        _unadopt(operation)
+        after_one = _schema_snapshot()
+        assert [table for table, state, _ in after_one if state[0] is not None] == [], after_one
+
+        _unadopt(operation)
+        assert _schema_snapshot() == after_one
+
+        # Restore the baseline the adopted fixture guarantees for later tests,
+        # through the production forward path rather than by hand.
+        state = _fake_state()
+        with connection.schema_editor() as editor:
+            operation.database_forwards("boundary_consumer", editor, state, state)
+
+    def test_ac_rls_013_a_table_the_forward_skipped_as_adopted_is_left_untouched(self, unadopted):
+        """And reversing a migration whose forward skipped an already-adopted
+        table leaves that table untouched, rather than stripping a column and
+        policies a different migration owns (BR-RLS-020).
+
+        Built in three steps. Migration A's adoption is stood in for by
+        adopting Gadget alone, which is the state a sibling migration leaves.
+        Migration B is then a second operation over the whole app; its forward
+        skips Gadget under BR-RLS-013's per-table idempotency, adopting only
+        the rest. Reversing B then takes Gadget's post-adoption state as its
+        input and must leave it exactly as A left it.
+
+        The reverse's discriminator is the tenant_id column, not a record of
+        which call added it, so what is tested is the deliberately conservative
+        rule the amendment fixes: the reverse removes only what its own pass
+        can see. Gadget's snapshot is taken after A and compared after B's
+        reverse, so a recreated-anyway constraint on a table B never rewrote
+        fails here.
+        """
+        gadget_only = AdoptTenantApp(
+            "thirdparty",
+            exclude=(
+                "thirdparty.Tag",
+                "thirdparty.Widget",
+                "thirdparty.Widget_tags",
+                "thirdparty.Seat",
+                "thirdparty.SeatBooking",
+                "thirdparty.Coupon",
+            ),
+        )
+        whole_app = AdoptTenantApp(
+            "thirdparty",
+            exclude=(
+                "thirdparty.Seat",
+                "thirdparty.SeatBooking",
+                "thirdparty.Coupon",
+            ),
+        )
+
+        # Migration A: adopt Gadget alone.
+        state = _fake_state()
+        with connection.schema_editor() as editor:
+            gadget_only.database_forwards("boundary_consumer", editor, state, state)
+
+        after_a = _schema_snapshot(tables=("thirdparty_gadget",))
+        assert after_a[0][1][0] == "bigint", after_a
+
+        try:
+            # Migration B: forwards over the whole app, skipping Gadget.
+            with connection.schema_editor() as editor:
+                whole_app.database_forwards("boundary_consumer", editor, state, state)
+
+            # Migration B: reversed. Gadget must come out as A left it.
+            _unadopt(whole_app)
+            assert _schema_snapshot(tables=("thirdparty_gadget",)) == after_a
+        finally:
+            _unadopt(gadget_only)
+
+    def test_ac_rls_013_a_table_with_no_column_is_skipped_without_recreating_constraints(self, unadopted):
+        """And a table carrying no tenant_id column when the reverse runs is
+        skipped entirely, with no original constraint recreated.
+
+        This is the half of the same rule that the column probe alone does not
+        cover. Reversing an operation over a set nothing in the database has
+        adopted must be a complete no-op; recreating an original
+        unconditionally would add a duplicate unique constraint to every table
+        in the derived set, which is the defect that shows up two reverses
+        later rather than at the first.
+        """
+        before = _schema_snapshot()
+        assert [table for table, state, _ in before if state[0] is not None] == [], before
+
+        operation = AdoptTenantApp(
+            "thirdparty",
+            exclude=(
+                "thirdparty.Seat",
+                "thirdparty.SeatBooking",
+                "thirdparty.Coupon",
+            ),
+        )
+        _unadopt(operation)
+
+        assert _schema_snapshot() == before
 
     def test_ac_rls_013_deconstruct_round_trips_all_three_arguments(self):
         """And AdoptTenantApp("thirdparty", exclude=("thirdparty.Tag",),
