@@ -152,8 +152,33 @@ class Booking(TenantModel):
     start_time = models.DateTimeField()
 ```
 
-That's it. `Booking.objects.all()` now automatically filters by the active
-tenant. Creating a booking auto-populates the `tenant` field from context.
+`Booking.objects.all()` now automatically filters by the active tenant.
+Creating a booking auto-populates the `tenant` field from context. That is
+the ORM layer. Add the database layer before you ship.
+
+### 5. Turn on Row Level Security (PostgreSQL)
+
+Write the migration by hand, in the app owning the model
+(`python manage.py makemigrations bookings --empty --name rls`):
+
+```python
+from boundary.migrations_ops import CreateTenantPolicy, EnableRLS
+
+operations = [
+    EnableRLS("Booking"),
+    CreateTenantPolicy("Booking"),
+]
+```
+
+Apply it, then confirm `python manage.py check` reports neither
+`boundary.E006` nor `boundary.W003`. Connect as a `NOSUPERUSER NOBYPASSRLS`
+role: superusers and BYPASSRLS roles are exempt from every policy, so the
+layer exists but enforces nothing for them. These operations are
+PostgreSQL-only and refuse on any other alias with an error naming the
+backend vendor, so keep a non-PostgreSQL alias off this migration's graph
+with a router's `allow_migrate()`. See
+[Add RLS policies with migrations](docs/how-to/add-rls-policies-with-migrations.md)
+for the migrating-role caveats and verification.
 
 ---
 
