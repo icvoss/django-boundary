@@ -1042,9 +1042,78 @@ fixture among a wall of now-meaningless downstream test results.
 
 ## Requirements
 
-- Python 3.12+
-- Django 5.2+ (5.2 LTS and 6.0 supported)
-- PostgreSQL 14+ (for RLS; ORM layer works with any database)
+- Python 3.12 and 3.13
+- Django 5.2 (LTS), 6.0 and 6.1
+- PostgreSQL 14 to 16 for the RLS layer; the ORM layer also runs on SQLite
+
+See [Supported environments](#supported-environments) below for what each of
+those means in practice, and for the isolation consequence of running on
+SQLite.
+
+---
+
+## Supported environments
+
+Every combination below is exercised by a CI leg. Anything not listed is
+untested rather than actively blocked: boundary adds no refusal for it, and
+running outside this matrix is at your own risk.
+
+### Databases
+
+| Backend | Support |
+|---|---|
+| PostgreSQL 14, 15, 16 | Fully supported, both isolation layers. A release above 16 is not refused and is expected to work, since nothing in the generated DDL uses a feature newer than 14, but it is outside the verified matrix until a leg runs it. |
+| SQLite | Supported as an **ORM-only** backend, for local development and CI. |
+| MySQL, MariaDB | **Unsupported and untested.** Neither has Row Level Security, so the RLS layer cannot exist there, and no CI leg exercises the ORM layer on them. |
+
+**What SQLite gives you, and what it does not.** The ORM filtering layer, the
+context layer, resolution, Celery propagation and the management commands all
+work. Row Level Security does not exist on SQLite, and boundary keeps that
+absence quiet rather than noisy: `boundary.E006`, `boundary.W003`,
+`boundary.W007` and `boundary.W009` return nothing, `assert_rls_enforced()`
+returns without raising, `TenantContext` issues no session variable, and the
+three RLS migration operations log one line each and apply no DDL. You can run
+the same migration files on both backends.
+
+**The consequence, stated plainly: an adopted table has no isolation at all on
+SQLite.** A model using boundary's mixins keeps its ORM-layer filtering when
+the policy is skipped, so it is left with less isolation. An adopted
+third-party table (`AdoptTenantApp`) has no ORM layer beneath the policy, so
+on SQLite it has none whatsoever. `AdoptTenantApp` therefore still refuses to
+run off PostgreSQL, where the other three operations skip quietly.
+
+More generally on a non-PostgreSQL alias, a mixin-scoped model has ORM-layer
+isolation only: `TenantManager` filtering and `BOUNDARY_STRICT_MODE` behave
+exactly as on PostgreSQL, but `raw()`, `extra()`, hand-built SQL and any
+third-party package writing directly have no backstop, because the backstop is
+RLS. Use PostgreSQL wherever isolation matters.
+
+### Python and Django
+
+| | Supported |
+|---|---|
+| Python | 3.12, 3.13 |
+| Django | 5.2 (LTS), 6.0, 6.1 |
+
+Every combination of the two is supported and runs in CI. Python 3.14 is not
+supported in the 1.0 line.
+
+### Deployment shapes
+
+- **ASGI.** Context propagation is `contextvars` throughout, and
+  `TenantMiddleware` is a `MiddlewareMixin` serving both WSGI and ASGI. An
+  async view, async middleware downstream of boundary's, and a sync view in
+  the same process all see the same tenant context semantics.
+- **Celery.** Tenant context crosses a task dispatch through the shipped
+  signal handlers and the `tenant_task` decorator or `TenantTask` base class,
+  once you wire them. Boundary does not auto-install them into your Celery
+  app.
+- **Multiple database aliases.** More than one alias is supported through
+  `RegionalRouter` and, for migration-time DDL, through the router gates. A
+  deployment may hold a PostgreSQL alias carrying the RLS layer beside a
+  non-PostgreSQL alias carrying none, in one process, provided its router
+  keeps the RLS migrations off the second alias. The vendor gates are applied
+  per alias, not per deployment.
 
 ---
 
