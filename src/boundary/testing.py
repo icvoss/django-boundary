@@ -215,7 +215,7 @@ def provision_rls_test_role(
     }
 
 
-def assert_rls_enforced(connection_params: dict) -> None:
+def assert_rls_enforced(connection_params: dict, *, alias: str = "default") -> None:
     """Fail-closed assertion that RLS is actually enforced for *connection_params*.
 
     The load-bearing half of the RLS test-role helper (issue #55): a role
@@ -264,7 +264,40 @@ def assert_rls_enforced(connection_params: dict) -> None:
     tenant-scoped table yet migrated (column-bearing or adopted), has
     nothing for this assertion to check: it returns without raising rather
     than treating "nothing to enforce" as a failure.
+
+    **The non-PostgreSQL return happens before any connection is opened, and
+    before psycopg is imported** (BR-PRV-010). Until 1.0 the early return was
+    promised here and absent from the body: the first action was
+    ``psycopg.connect(**connection_params)``, so a consumer calling this on a
+    SQLite deployment got a connection error, or an ``ImportError`` where
+    psycopg was not installed at all, rather than the documented quiet return
+    (icvoss/django-boundary#77). That was BR-ENV-002's quiet-on-SQLite
+    guarantee failing at the one helper whose whole purpose is to prove RLS is
+    enforced, so the guard must precede the import and not merely the connect.
+
+    The vendor is read from the Django alias rather than from
+    *connection_params*, because *connection_params* is a raw psycopg mapping
+    with no vendor field and opening it is the thing being avoided. Which
+    alias: ``"default"``, matching every other vendor gate in the package
+    (``checks.py`` reads ``django.db.connection``), unless the caller passes
+    one. A caller who has configured a PostgreSQL alias other than
+    ``default`` and asserts against it passes *alias* explicitly.
+
+    Args:
+        connection_params: connection kwargs passed to ``psycopg.connect()``,
+            as returned by :func:`provision_rls_test_role`.
+        alias: the Django database alias whose vendor decides whether to
+            proceed. Default ``"default"``. Keyword-only, and added
+            compatibly: every existing call keeps working unchanged.
     """
+    from django.db import connections
+
+    # Before the psycopg import, not merely before the connect: on a
+    # deployment with no psycopg installed at all, an import at function top
+    # would raise ImportError and defeat the quiet return entirely.
+    if connections[alias].vendor != "postgresql":
+        return
+
     import psycopg
     from django.apps import apps
 
