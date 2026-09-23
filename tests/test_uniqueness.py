@@ -98,6 +98,106 @@ class TestConstraintResolution:
         assert "local tenant column" in message
 
 
+class TestMigrationStateRendersTheResolvedConstraint:
+    """A migration state render prepares a model with no tenant FK field.
+
+    BR-ORM-015. ``ModelState.render()`` rebuilds the model with
+    ``type(name, bases, body)`` on ``models.Model`` rather than on the tenant
+    mixin, so ``_boundary_fk_field`` is absent from the rendered class, while
+    the constraint it carries is ALREADY resolved: it round-tripped through
+    ``deconstruct()``, which serialises both the resolved ``fields`` and the
+    author's ``tenant_fields``.
+
+    The regression this pins: ``_resolve()`` used to check for the FK field
+    before checking whether there was anything left to resolve, so every state
+    render raised. That is every ``migrate`` and every ``makemigrations``, and
+    on this suite it meant the test database could not be created at all, so
+    all 284 database-backed tests errored in setup rather than one test
+    failing. No database here: state rendering reads the app registry.
+    """
+
+    def test_rendering_the_model_from_project_state_does_not_raise(self):
+        """The defect's own reproduction, at the smallest scope that shows it."""
+        from django.apps import apps
+        from django.db.migrations.state import ProjectState
+
+        rendered = ProjectState.from_apps(apps).apps.get_model("boundary_testapp", "UniqueDoc")
+
+        assert rendered is not None
+
+    def test_the_rendered_models_constraint_keeps_the_resolved_fields(self):
+        """Not merely "does not raise": the rendered constraint must still
+        carry the tenant column, since that field list is what the schema
+        editor builds the UNIQUE constraint from. An early return that also
+        dropped the resolution would pass the test above and ship a constraint
+        on the author's fields alone."""
+        from django.apps import apps
+        from django.db.migrations.state import ProjectState
+
+        rendered = ProjectState.from_apps(apps).apps.get_model("boundary_testapp", "UniqueDoc")
+
+        constraint = _only_tenant_unique(rendered)
+        assert constraint.fields == ("tenant", "slug"), (
+            f"the state-rendered constraint must keep its resolved fields; got {constraint.fields}"
+        )
+
+    def test_the_rendered_class_really_lacks_the_attribute_resolution_needs(self):
+        """Direction check, so the two tests above cannot pass vacuously.
+
+        If the rendered class carried ``_boundary_fk_field`` after all, the
+        ordering in ``_resolve()`` would be irrelevant and this module would be
+        proving nothing. It does not carry it, which is exactly why the
+        already-resolved check has to come first.
+        """
+        from django.apps import apps
+        from django.db.migrations.state import ProjectState
+
+        rendered = ProjectState.from_apps(apps).apps.get_model("boundary_testapp", "UniqueDoc")
+
+        assert getattr(rendered, "_boundary_fk_field", None) is None
+        from boundary_testapp.models import UniqueDoc
+
+        assert UniqueDoc._boundary_fk_field == "tenant", (
+            "the real model must carry the attribute the rendered one lacks, "
+            "otherwise the contrast this test draws does not exist"
+        )
+
+    def test_migration_writer_serialises_the_resolved_form(self):
+        """What makemigrations writes into a migration file. The resolved
+        ``fields`` and the author's ``tenant_fields`` both appear, which is
+        what lets the constraint arrive in state already resolved and needing
+        nothing from the model."""
+        from boundary_testapp.models import UniqueDoc
+        from django.db.migrations.writer import MigrationWriter
+
+        statement, imports = MigrationWriter.serialize(_only_tenant_unique(UniqueDoc))
+
+        assert "boundary.models.TenantUniqueConstraint" in statement
+        assert "fields=('tenant', 'slug')" in statement, (
+            f"the serialised form must carry the resolved fields; got {statement}"
+        )
+        assert "tenant_fields=('slug',)" in statement, (
+            f"the serialised form must carry the author's fields too; got {statement}"
+        )
+        assert "import boundary.models" in imports
+
+    def test_a_constraint_rebuilt_from_the_serialised_kwargs_resolves_no_further(self):
+        """The apply-time path: a migration file's constraint is reconstructed
+        from those kwargs, and must not prepend the tenant column a second
+        time when the model it is applied against prepares."""
+        from boundary_testapp.models import UniqueDoc
+
+        rebuilt = TenantUniqueConstraint(
+            fields=("tenant", "slug"),
+            tenant_fields=("slug",),
+            name="rebuilt_from_a_migration",
+        )
+
+        rebuilt._resolve(UniqueDoc)
+
+        assert rebuilt.fields == ("tenant", "slug"), f"resolution must be idempotent; got {rebuilt.fields}"
+
+
 class TestConstraintNaming:
     def test_an_explicit_name_is_used_verbatim(self):
         constraint = tenant_unique("a", "b", name="inv_ab")

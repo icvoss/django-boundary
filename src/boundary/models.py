@@ -695,6 +695,14 @@ class TenantUniqueConstraint(models.UniqueConstraint):
     (this class with its ``fields`` already leading with the tenant column)
     and the migration needs nothing from boundary at apply time beyond the
     import.
+
+    **A migration state render prepares a model that has no tenant FK
+    field.** ``ModelState.render()`` rebuilds the model with
+    ``type(name, bases, body)`` on ``models.Model``, not on the tenant mixin,
+    so ``_boundary_fk_field`` is absent from the rendered class while the
+    constraint it carries is already resolved. That is why ``_resolve()``
+    checks for a resolved constraint before it checks for the FK field; see
+    its docstring.
     """
 
     def __init__(self, *, tenant_fields, **kwargs):
@@ -713,7 +721,36 @@ class TenantUniqueConstraint(models.UniqueConstraint):
         return path, args, kwargs
 
     def _resolve(self, model):
-        """Prepend *model*'s tenant FK field, or raise if it has no column."""
+        """Prepend *model*'s tenant FK field, or raise if it has no column.
+
+        **The already-resolved check runs before the raise, and must.** This
+        receiver fires for every ``class_prepared``, and a migration state
+        render is one of them: ``ModelState.render()`` rebuilds the model with
+        ``type(name, bases, body)`` on ``models.Model``, so the rendered class
+        carries the constraint but NOT ``_boundary_fk_field``, which lives on
+        the mixin the rendered class does not inherit. The constraint arriving
+        in state is nonetheless already resolved, having round-tripped through
+        ``deconstruct()`` with both ``fields=("tenant", "slug")`` and
+        ``tenant_fields=("slug",)`` written into the migration. Raising for a
+        missing FK field before asking whether there is anything left to do
+        made every state render fail, which is every ``migrate`` and every
+        ``makemigrations``: the test suite could not create its database at
+        all (BR-ORM-015).
+
+        Resolution is therefore detected by comparing the two field lists
+        rather than by a flag carried through ``deconstruct()``. A flag would
+        have to pick a default for the migrations consumers have already
+        written, which carry none: defaulting it to unresolved re-raises here
+        on exactly the rendered model that has no FK field, and defaulting it
+        to resolved leaves a genuinely fresh constraint unresolvable. The
+        comparison needs no default and no new serialised kwarg.
+        """
+        if self.fields != self.tenant_fields:
+            # Already resolved: the tenant column has been prepended, so the
+            # lists differ. A state-rendered model reaches here (and has no
+            # ``_boundary_fk_field`` to offer), as does a re-prepared model or
+            # a clone of one.
+            return
         fk_field = getattr(model, "_boundary_fk_field", None)
         if not fk_field:
             raise ValueError(
@@ -724,8 +761,6 @@ class TenantUniqueConstraint(models.UniqueConstraint):
                 f"make_tenant_mixin() if this model should own a tenant FK, or a "
                 f"plain UniqueConstraint if the uniqueness is genuinely global."
             )
-        if self.fields and self.fields[0] == fk_field:
-            return  # already resolved (a re-prepared model, or a clone of one)
         self.fields = (fk_field, *self.tenant_fields)
 
 
