@@ -55,7 +55,9 @@ exposure during development.
   `AbstractTenant` convenience base.
 - **Non-PostgreSQL Row Level Security.** The ORM filtering layer works on
   any Django-supported database, but RLS enforcement requires PostgreSQL
-  14+, with no database-level backstop elsewhere.
+  14+, with no database-level backstop elsewhere. The RLS migration
+  operations are a logged no-op there rather than an error, so the same
+  migration files run on a SQLite development database.
 - **Cross-region data migration.** Moving a tenant's data from one regional
   database to another is your own operational tooling.
 - **Frontend, API or Django admin components.** You wire your own admin and
@@ -173,15 +175,20 @@ operations = [
 Apply it, then confirm `python manage.py check` reports neither
 `boundary.E006` nor `boundary.W003`. Connect as a `NOSUPERUSER NOBYPASSRLS`
 role: superusers and BYPASSRLS roles are exempt from every policy, so the
-layer exists but enforces nothing for them. These operations are
-PostgreSQL-only and refuse on any other alias with an error naming the
-backend vendor. A router's `allow_migrate()` is how you keep an alias off
-the graph, but note the limit for a model in your own app: the router is
-asked about the model being altered, which is the same question Django's
-`CreateModel` asks, so denying that app denies its **table** too. Until
-[#86](https://github.com/icvoss/django-boundary/issues/86) is resolved,
-build the operation list conditionally in the migration for a
-column-bearing model, and use the router for an adopted app. See
+layer exists but enforces nothing for them.
+
+**The same migration runs on SQLite.** `EnableRLS`, `CreateTenantPolicy` and
+`DropTenantPolicy` apply on PostgreSQL and are a logged no-op on any other
+backend: one `logger.info` line each on the `boundary.migrations` logger
+naming the operation, the model, the alias and the vendor, then no DDL and no
+error. So you write this migration once and run it unchanged against a SQLite
+development database and a PostgreSQL production one, with no backend
+conditional and no router. Your model keeps its ORM-layer tenant filtering on
+SQLite; it is the RLS layer, and only that, which is absent there.
+
+`AdoptTenantApp` is the one operation that still refuses off PostgreSQL,
+because an adopted table has no ORM layer beneath the policy and would be
+left with no isolation at all rather than reduced isolation. See
 [Add RLS policies with migrations](docs/how-to/add-rls-policies-with-migrations.md)
 for the migrating-role caveats and verification.
 
