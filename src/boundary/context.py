@@ -94,13 +94,27 @@ def _is_postgresql(using: str = "default") -> bool:
     matching :func:`_ensure_atomic`'s tolerance of the same case: a regional
     alias named in ``BOUNDARY_REGIONS`` but absent from ``DATABASES`` has no
     connection to write a session variable on, so there is nothing to do
-    rather than something to fail.
+    rather than something to fail. That case logs one DEBUG line naming the
+    alias, so the two ways of reaching ``False`` stay distinguishable when
+    tracing why a session variable was never written.
     """
     from django.utils.connection import ConnectionDoesNotExist
 
     try:
         return connections[using].vendor == "postgresql"
     except ConnectionDoesNotExist:
+        # DEBUG, not a warning: an alias named in BOUNDARY_REGIONS but absent
+        # from DATABASES is a supported configuration (see the docstring
+        # above), so this is narration for someone tracing why a session
+        # variable was never written, not a fault to report. Naming the alias
+        # is the whole point: without it the quiet return is indistinguishable
+        # from a non-PostgreSQL alias, and the two have different remedies.
+        logger.debug(
+            "Alias %r is not configured in DATABASES; treating it as non-PostgreSQL "
+            "and writing no tenant session variable on it.",
+            using,
+            extra={"using": using},
+        )
         return False
 
 
