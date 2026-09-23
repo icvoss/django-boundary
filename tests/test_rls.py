@@ -642,13 +642,29 @@ class TestAcRls019RouterAndVendorGates:
     ``DropTenantPolicy`` each apply the router gate then the vendor gate, in
     that order, in both directions.
 
-    The ordering is the whole point of having two gates. A router denial is a
-    legitimate per-alias skip and stays silent, because a router's
-    ``allow_migrate()`` is the documented way to keep a non-PostgreSQL alias
-    off the RLS graph and so cannot itself raise; a vendor mismatch on an
-    alias the router DID admit is a consumer error and is named, rather than
-    surfacing as SQLite's own parser error on a fragment of generated SQL
-    (icvoss/django-boundary#75).
+    **What gate 2 does, per the icvoss/django-boundary#86 ruling of
+    2026-09-23**: on a non-PostgreSQL alias the router ADMITTED, the operation
+    is a logged no-op. One ``logger.info`` line on ``boundary.migrations``
+    naming the operation, the model, the alias and the vendor, then a return
+    with no DDL. It is not a refusal, which is what this rule specified until
+    that ruling: a consumer runs SQLite locally and PostgreSQL in production
+    from the same migration files, and a refusal forced every one of them to
+    hand-wrap the RLS migration in a backend conditional.
+
+    The two gates remain distinguishable, and the distinction is still the
+    point of having two. A router denial is a deliberate per-alias exclusion
+    and stays entirely silent; a non-PostgreSQL vendor on an alias the router
+    admitted is narrated, so a consumer can see which parts of the RLS layer
+    their SQLite database did not get. Those two outcomes differ only in the
+    log, which is why ``caplog`` is load-bearing here rather than decorative:
+    without it, "emitted no DDL" cannot tell the two gates apart.
+
+    ``AdoptTenantApp`` is unchanged and still refuses off PostgreSQL; its
+    refusal tests live in ``tests/test_adoption.py`` and are deliberately not
+    touched. The asymmetry is the isolation consequence: a column-bearing
+    model keeps its ORM-layer filtering on SQLite, where an adopted table has
+    no ORM layer beneath the policy and a silent skip would leave it with no
+    isolation at all.
 
     Asserted against the suite's real SQLite ``eu-west`` alias rather than a
     stub connection, so the vendor string is the one a real backend reports.
@@ -662,6 +678,10 @@ class TestAcRls019RouterAndVendorGates:
         ("CreateTenantPolicy", CreateTenantPolicy),
         ("DropTenantPolicy", DropTenantPolicy),
     )
+
+    #: The logger the no-op line is emitted on, per ADR-101's
+    #: one-logger-per-module convention.
+    LOGGER = "boundary.migrations"
 
     def test_a_denying_router_emits_nothing_on_eu_west_in_both_directions(self):
         """Given a router denying the SQLite ``eu-west`` alias, when each of
@@ -693,71 +713,121 @@ class TestAcRls019RouterAndVendorGates:
                 operation.database_backwards("boundary_testapp", editor, state, state)
                 assert list(editor.collected_sql) == [], f"{name}.database_backwards emitted DDL on a denied alias"
 
-    def test_an_allowing_router_on_eu_west_is_refused_naming_operation_alias_and_vendor(self):
-        """When the router is changed to admit ``eu-west`` and the same
-        operations are applied to it, then each raises a ``BoundaryError``
-        subclass whose message names that operation, the alias and the vendor.
+    def test_a_denying_router_logs_nothing_at_all(self, caplog):
+        """And a router denial is entirely silent: no DDL AND no log line.
 
-        Three separate assertions on one message, all load-bearing. Naming the
-        vendor is what tells the consumer the layer is PostgreSQL-only; naming
-        the alias is what tells them WHICH of their databases refused, which a
-        multi-alias project needs; naming the operation is what keeps a
-        consumer reading an ``EnableRLS`` traceback from being told about app
-        adoption, a different operation they may not have written at all
-        (BR-RLS-021: the error is ``AdoptionRefusedError``'s sibling, not its
-        reuse).
+        This is what keeps the two gates distinguishable now that neither
+        raises. A router denial is a per-alias exclusion the consumer wrote
+        deliberately, so narrating it would be noise about a decision they
+        already made; the vendor skip below is narrated because they did not
+        choose it. An implementation that logged on both paths would pass
+        every DDL assertion in this class and fail here.
         """
+        import logging
+
         from django.db import connections
         from django.test import override_settings
-
-        from boundary.exceptions import BoundaryError
 
         state = _get_fake_state()
         for name, op_class in self.OPERATIONS:
             operation = op_class("Booking")
+            caplog.clear()
             with (
-                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
-                connections["eu-west"].schema_editor() as editor,
-                pytest.raises(BoundaryError) as caught,
+                caplog.at_level(logging.INFO, logger=self.LOGGER),
+                override_settings(DATABASE_ROUTERS=[_DenyingRouter()]),
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
             ):
                 operation.database_forwards("boundary_testapp", editor, state, state)
+                operation.database_backwards("boundary_testapp", editor, state, state)
 
-            message = str(caught.value)
-            assert name in message, f"the refusal must name the operation; got {message!r}"
-            assert "eu-west" in message, f"the refusal must name the alias; got {message!r}"
-            assert "sqlite" in message, f"the refusal must name the vendor; got {message!r}"
-            assert "Row Level Security" in message
-            assert "allow_migrate" in message, "the refusal must point at the documented remedy"
+            records = [r for r in caplog.records if r.name == self.LOGGER]
+            assert records == [], f"{name} must not log on a router denial; got {[r.message for r in records]}"
 
-    def test_the_reverse_refuses_the_admitted_non_postgresql_alias_too(self):
+    def test_an_allowing_router_on_eu_west_is_a_logged_no_op_naming_operation_model_alias_and_vendor(self, caplog):
+        """When the router is changed to admit ``eu-west`` and the same
+        operations are applied to it, then each emits no DDL, raises nothing,
+        and logs exactly one info line naming that operation, the model, the
+        alias and the vendor.
+
+        Four separate assertions on one message, all load-bearing. Naming the
+        vendor is what tells the consumer the layer is PostgreSQL-only; naming
+        the alias is what tells them WHICH of their databases skipped it,
+        which a multi-alias project needs; naming the model tells them which
+        table is without a policy; naming the operation keeps a consumer
+        reading a line about ``EnableRLS`` from being told about a different
+        operation they may not have written at all.
+
+        "Exactly one" matters as much as the content: a migration carrying
+        both ``EnableRLS`` and ``CreateTenantPolicy`` should say so twice, once
+        per operation, not once per statement it would have emitted.
+        """
+        import logging
+
+        from django.db import connections
+        from django.test import override_settings
+
+        state = _get_fake_state()
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking")
+            caplog.clear()
+            with (
+                caplog.at_level(logging.INFO, logger=self.LOGGER),
+                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
+            ):
+                operation.database_forwards("boundary_testapp", editor, state, state)
+                assert list(editor.collected_sql) == [], f"{name} must emit no DDL on a non-PostgreSQL alias"
+
+            records = [r for r in caplog.records if r.name == self.LOGGER]
+            assert len(records) == 1, f"{name} must log exactly one line; got {[r.message for r in records]}"
+
+            record = records[0]
+            assert record.levelno == logging.INFO, (
+                f"{name} must log at INFO: on a backend the consumer develops against "
+                f"deliberately this is the designed outcome, not a problem to flag"
+            )
+            message = record.getMessage()
+            assert name in message, f"the line must name the operation; got {message!r}"
+            assert "boundary_testapp.Booking" in message, f"the line must name the model; got {message!r}"
+            assert "eu-west" in message, f"the line must name the alias; got {message!r}"
+            assert "sqlite" in message, f"the line must name the vendor; got {message!r}"
+
+    def test_the_reverse_is_a_logged_no_op_on_the_admitted_non_postgresql_alias_too(self, caplog):
         """And the same two gates apply in the same order on reverse: an
-        admitted non-PostgreSQL alias is refused by name there as well.
+        admitted non-PostgreSQL alias is a logged no-op there as well, naming
+        the operation the consumer's migration actually contains.
 
         Its own test rather than a second assertion in the forward's, because
         ``DropTenantPolicy.database_backwards()`` delegates to
         ``CreateTenantPolicy.database_forwards()``. A reverse gated only
-        inside the delegate would refuse with the delegate's name, telling the
-        consumer ``CreateTenantPolicy`` refused when their migration contains
-        ``DropTenantPolicy``, so the operation name is asserted here
-        specifically.
+        inside the delegate would log the delegate's name, telling the
+        consumer ``CreateTenantPolicy`` skipped when their migration contains
+        ``DropTenantPolicy``, and would log twice rather than once.
         """
+        import logging
+
         from django.db import connections
         from django.test import override_settings
-
-        from boundary.exceptions import BoundaryError
 
         state = _get_fake_state()
         for name, op_class in self.OPERATIONS:
             operation = op_class("Booking")
+            caplog.clear()
             with (
+                caplog.at_level(logging.INFO, logger=self.LOGGER),
                 override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
-                connections["eu-west"].schema_editor() as editor,
-                pytest.raises(BoundaryError) as caught,
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
             ):
                 operation.database_backwards("boundary_testapp", editor, state, state)
+                assert list(editor.collected_sql) == [], f"{name}.database_backwards must emit no DDL"
 
-            message = str(caught.value)
-            assert name in message, f"the reverse refusal must name the operation; got {message!r}"
+            records = [r for r in caplog.records if r.name == self.LOGGER]
+            assert len(records) == 1, (
+                f"{name}.database_backwards must log exactly one line naming itself; "
+                f"got {[r.getMessage() for r in records]}"
+            )
+            message = records[0].getMessage()
+            assert name in message, f"the reverse line must name the operation; got {message!r}"
             assert "eu-west" in message
             assert "sqlite" in message
 
@@ -781,8 +851,6 @@ class TestAcRls019RouterAndVendorGates:
         from django.db import connections
         from django.test import override_settings
 
-        from boundary.exceptions import BoundaryError
-
         state = _get_fake_state()
         for name, op_class in self.OPERATIONS:
             operation = op_class("Booking")
@@ -790,11 +858,10 @@ class TestAcRls019RouterAndVendorGates:
             with (
                 override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
                 connections["eu-west"].schema_editor(collect_sql=True) as editor,
-                pytest.raises(BoundaryError),
             ):
-                # The vendor gate raises immediately after the router gate on
-                # this alias; the router call is what is being asserted, and
-                # it happened before the raise.
+                # The vendor gate turns this into a logged no-op immediately
+                # after the router gate on this alias; the router call is what
+                # is being asserted, and it happened before that.
                 operation.database_forwards("boundary_testapp", editor, state, state)
 
             assert _RecordingRouter.calls, f"{name} must ask the router at all"
@@ -824,8 +891,6 @@ class TestAcRls019RouterAndVendorGates:
         from django.db import connections
         from django.test import override_settings
 
-        from boundary.exceptions import BoundaryError
-
         state = _get_fake_state()
         owning_app = "boundary"  # holds no Booking
         for name, op_class in self.OPERATIONS:
@@ -834,7 +899,6 @@ class TestAcRls019RouterAndVendorGates:
             with (
                 override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
                 connections["eu-west"].schema_editor(collect_sql=True) as editor,
-                pytest.raises(BoundaryError),
             ):
                 operation.database_forwards(owning_app, editor, state, state)
 
@@ -854,6 +918,13 @@ class TestAcRls019RouterAndVendorGates:
         implemented as an unconditional skip. One router instance denies
         ``eu-west`` and admits ``default``; the PostgreSQL alias must come out
         with RLS enabled, forced, and both boundary policies present.
+
+        Load-bearing twice over since the #86 ruling. With the vendor gate now
+        a silent-but-for-a-log return rather than a raise, every "emitted
+        nothing" assertion above would also hold for an implementation that
+        had stopped emitting DDL anywhere at all. This is the test that
+        catches that, and it is the only one here that reads real RLS state
+        out of a real PostgreSQL database.
         """
         from django.db import connections
         from django.test import override_settings
@@ -884,13 +955,37 @@ class TestAcRls019RouterAndVendorGates:
 
                 # And the reverse likewise discriminates: the admitted alias
                 # is cleaned up through the gated reverse itself, so a reverse
-                # that refused an admitted PostgreSQL alias would fail here.
+                # that skipped an admitted PostgreSQL alias would fail here.
                 with connection.schema_editor() as editor:
                     EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
                 assert _has_rls("boundary_testapp_booking") == (False, False)
             finally:
                 with connection.schema_editor() as editor:
                     EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
+
+    def test_the_postgresql_alias_logs_no_skip_line(self, caplog):
+        """And the admitted PostgreSQL alias logs no skip line, so the log is
+        evidence about the vendor rather than noise on every migrate.
+
+        The negative control for the log assertions above. Without it, they
+        would all pass against an implementation that logged the line
+        unconditionally and emitted its DDL anyway.
+        """
+        import logging
+
+        from django.test import override_settings
+
+        state = _get_fake_state()
+        with caplog.at_level(logging.INFO, logger=self.LOGGER), override_settings(DATABASE_ROUTERS=[]):
+            try:
+                with connection.schema_editor() as editor:
+                    EnableRLS("Booking").database_forwards("boundary_testapp", editor, state, state)
+            finally:
+                with connection.schema_editor() as editor:
+                    EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
+
+        records = [r for r in caplog.records if r.name == self.LOGGER]
+        assert records == [], f"PostgreSQL must log no skip line; got {[r.getMessage() for r in records]}"
 
     def test_deconstruct_is_byte_identical_for_all_three_operations(self):
         """And ``deconstruct()`` emits exactly ``{"model_name": "Booking"}``
