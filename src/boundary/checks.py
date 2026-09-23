@@ -30,6 +30,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_resolvers())
     errors.extend(_check_middleware())
     errors.extend(_check_strict_mode())
+    errors.extend(_check_production_posture())
     errors.extend(_check_rls_enabled())
     errors.extend(_check_identity_double_resolve())
     errors.extend(_check_rls_bypassable())
@@ -187,6 +188,88 @@ def _check_strict_mode():
             )
         ]
     return []
+
+
+#: The two settings that, alone, remove a category of isolation a deployment
+#: believes it has (BR-CHK-001). Each entry is the setting name, what turning
+#: it off actually does, and the layer-specific remedy sentence.
+_POSTURE_SETTINGS = (
+    (
+        "BOUNDARY_STRICT_MODE",
+        (
+            "a queryset executed with no active tenant context returns every "
+            "tenant's rows instead of raising, which is a cross-tenant read "
+            "that nothing logs"
+        ),
+    ),
+    (
+        "BOUNDARY_SET_DB_SESSION_VAR",
+        (
+            "nothing writes the database session variable every Row Level "
+            "Security policy reads, so a deployment carrying live policies "
+            "has them all evaluating against an empty tenant"
+        ),
+    ),
+)
+
+
+def _check_production_posture():
+    """E008: refuse an unsafe production posture (BR-CHK-001).
+
+    Reports one Error per offending setting when ``settings.DEBUG`` is False
+    and either ``BOUNDARY_STRICT_MODE`` or ``BOUNDARY_SET_DB_SESSION_VAR`` is
+    False. Both default to the safe value, so reaching this state takes an
+    explicit opt-out; an opt-out set during development and never revisited is
+    precisely how a deployment ships with no enforced boundary, which is the
+    one outcome the package exists to prevent (issue #82).
+
+    Settings-only, no database. This check reads ``settings`` and nothing
+    else: it issues no query, opens no connection, and is therefore not gated
+    on vendor, connection availability or migration state. It reports
+    identically on SQLite, on PostgreSQL and with no database configured at
+    all, which is what makes it the one check in the package a consumer cannot
+    have silently skipped (contrast the vendor gates on E006, W003 and W009).
+
+    W001 and W009 are unchanged. Both keep warning exactly as they do today at
+    every ``DEBUG`` value, so E008 adds a severity at ``DEBUG = False`` rather
+    than replacing either: a warning in development, an error in production.
+
+    E008 fires under the test runner, not only in production. Django's test
+    runner sets ``settings.DEBUG`` to False for the duration of the run
+    (``DiscoverRunner.setup_test_environment()``; pytest-django does the
+    same), and ``migrate`` runs the system checks when it creates the test
+    database, so a consumer whose test settings module sets either flag to
+    False fails at test-database creation before a single test runs. That is
+    the first place most consumers meet this check, so the hint names it
+    rather than speaking only of production.
+    """
+    from django.conf import settings
+
+    if getattr(settings, "DEBUG", False):
+        return []
+
+    errors = []
+    for setting_name, consequence in _POSTURE_SETTINGS:
+        if getattr(settings, setting_name, True):
+            continue
+        errors.append(
+            Error(
+                f"{setting_name} is False with DEBUG = False. With it off, {consequence}.",
+                hint=(
+                    f"Set {setting_name} = True (the default). This check fires "
+                    f"wherever DEBUG is False, including under the test runner, "
+                    f"where DEBUG is False, so a test settings module that "
+                    f"disables the flag fails test-database creation. A "
+                    f"deliberately ORM-only deployment, or a test suite that "
+                    f"means it, records the choice by adding 'boundary.E008' to "
+                    f"SILENCED_SYSTEM_CHECKS in the settings module that "
+                    f"disables the flag, which for a test-only posture is the "
+                    f"test settings module rather than the production one."
+                ),
+                id="boundary.E008",
+            )
+        )
+    return errors
 
 
 def _check_identity_double_resolve():
