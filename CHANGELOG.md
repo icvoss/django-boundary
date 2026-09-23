@@ -4,6 +4,8 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-09-23
+
 ### Added
 
 - **`boundary.E008` system check** (issue #82, BR-CHK-001). A deployment
