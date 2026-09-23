@@ -58,7 +58,45 @@ All notable changes to django-boundary are documented here.
   including the migration consequences of converting an existing global
   constraint.
 
+- **An `alias` keyword on `assert_rls_enforced()` and
+  `boundary.testing.rls_enforced()`** (issue #77, BR-PRV-010). Both helpers
+  read a connection's vendor to decide whether there is any RLS to assert
+  about, and both previously read the `default` alias with no way to say
+  otherwise. A deployment whose RLS-carrying database is not `default` could
+  not point them at the right one. `alias` is keyword-only and defaults to
+  `"default"`, so every existing call site keeps the behaviour it had.
+
+- **`boundary.schema_compat`** (BR-RLS-022). A small adapter module, now the
+  only place in the package that names a private Django schema-editor
+  attribute. Both wrapped attributes are private API that Django may rename or
+  re-signature in any feature release with no deprecation cycle; with the
+  calls spread across `migrations_ops.py`, such a rename surfaced as an
+  `AttributeError` inside a consumer's `migrate`. It is public because a
+  migration's `deconstruct()` path must be able to import it, not because
+  consumers are expected to call it; nothing about your own code needs to
+  change.
+
+- **Internal, not a consumer surface:** the package's own test suite gained an
+  `rls` pytest marker and a `BOUNDARY_TEST_DB` environment variable, which
+  select the SQLite leg of its CI matrix. They are mentioned only so a
+  contributor reading this file knows where they came from; they are not part
+  of boundary's API, they do not affect your test suite, and a consumer needs
+  neither.
+
 ### Changed
+
+- **The three RLS operations now consult your database router before doing
+  anything** (issue #86, BR-RLS-021). `EnableRLS`, `CreateTenantPolicy` and
+  `DropTenantPolicy` each ask `router.allow_migrate_model()` for the target
+  model and the alias being migrated, and return without emitting DDL when a
+  router says no. **If you run a router that denies an alias, that alias now
+  receives no RLS DDL where it previously received it.** For nearly everyone
+  this is the fix they wanted: a router denial is how you keep an alias off
+  the RLS graph deliberately, and it previously did not work for these three
+  operations. But if you were relying on the operations ignoring your router,
+  the policies will stop being created on the denied alias, and nothing will
+  say so, because a router denial is silent by design. Check any alias your
+  router denies that you nonetheless expect to carry policies.
 
 - **`EnableRLS`, `CreateTenantPolicy` and `DropTenantPolicy` are a logged
   no-op on a non-PostgreSQL database instead of an error** (issue #86,
@@ -93,6 +131,35 @@ All notable changes to django-boundary are documented here.
   filtering when the policy is skipped, so it is left with less isolation. An
   adopted third-party table has no ORM layer beneath the policy, so skipping
   there would leave it with none at all, silently.
+
+### Fixed
+
+- **`assert_rls_enforced()` no longer fails on a non-PostgreSQL backend**
+  (issue #77, BR-PRV-010). Its documented contract was always to return
+  quietly where there is no RLS to assert about, but the early return was
+  promised in the docstring and absent from the body: the function's first
+  action was `psycopg.connect(...)`, so calling it on a SQLite deployment gave
+  a connection error, or an `ImportError` where psycopg was not installed at
+  all. A suite that called it on SQLite failed for the wrong reason. The
+  vendor guard now really does precede the psycopg import.
+
+- **`TenantContext` and `admin_bypass()` no longer raise on a non-PostgreSQL
+  alias** (issue #85, BR-ENV-002, BR-CTX-002, BR-CTX-010). Entering a tenant
+  context issued `set_config()` unconditionally, which is a PostgreSQL
+  function no other backend has, so the first request that resolved a tenant
+  on SQLite died with `OperationalError: no such function: set_config`. That
+  made SQLite unusable for the ORM layer it is supposed to support, which is
+  the backend most consumers develop against. Both now check the alias's
+  vendor first and skip the session-variable work, per alias rather than per
+  deployment, so a PostgreSQL `default` beside a SQLite secondary keeps the
+  session variable on the former. `admin_bypass()` still yields, so `unscoped`
+  access inside it behaves the same. The ContextVar, ORM filtering and the
+  exit restore are unchanged on every backend.
+
+- **The RLS migration operations no longer fail a migration on a backend that
+  cannot carry policies** (issue #86, BR-RLS-021). Described under Changed
+  above, and listed here because for most consumers it arrives as the fix to a
+  migration that could not run on SQLite rather than as a behaviour change.
 
 ### Behaviour change for existing consumers
 
@@ -146,6 +213,18 @@ RLS by failing to migrate without it will now migrate and pass with no
 database-level isolation in place. Use `assert_rls_enforced()` (or
 `boundary.testing.rls_enforced()` as a session fixture) if you need that
 proven rather than assumed.
+
+**Your router is now consulted by the three RLS operations, and an alias it
+denies receives no DDL it previously received.** This is the one item here
+that can take something away rather than add it. Previously the operations
+emitted their DDL regardless of what `allow_migrate_model()` answered, so a
+router written to keep an alias off the RLS graph did not actually do so, and
+the policies were created anyway. They now are not. If that alias was relying
+on policies it was never supposed to get, it loses them at the next migrate,
+silently: a router denial logs nothing, deliberately, because an alias
+excluded on purpose is different from one that cannot carry the layer. Review
+any alias your router denies and confirm you did not want policies on it. For
+almost everyone the denial was the intent and this is the fix.
 
 ## [0.9.0] - 2026-09-21
 
