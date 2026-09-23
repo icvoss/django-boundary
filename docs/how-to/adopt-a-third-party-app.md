@@ -196,6 +196,15 @@ SQLite or MySQL alias out of the picture. When the router allows an alias that
 is not PostgreSQL, the operation refuses by naming the vendor rather than
 sending DDL that backend cannot run.
 
+This works cleanly for adoption because the app you deny is the adopted app,
+and denying it removes both its tables and its RLS layer from that alias,
+which is coherent: an adopted table has no ORM filtering layer beneath the
+policy, so a table without the policy would have no isolation anyway. The
+same router pattern does **not** transfer to `EnableRLS` or
+`CreateTenantPolicy` on a model in your own app, where denying the app would
+take the table you still need with it
+([#86](https://github.com/icvoss/django-boundary/issues/86)).
+
 ### 5. Know which apps cannot be adopted
 
 Adoption is refused, with an error rather than a warning, for all of the

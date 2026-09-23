@@ -404,9 +404,14 @@ and `CreateTenantPolicy` raise an error naming the backend vendor rather than
 part-applying their DDL. `boundary.E006` and `boundary.W003` are silent on
 those backends by design, so a clean check there tells you nothing about the
 database layer. If you have an alias that is not PostgreSQL, keep it off this
-migration's graph with a database router's `allow_migrate()`; otherwise run
-the tutorial on PostgreSQL, as Step 2 does, and you get the second layer for
-real.
+migration's graph. For a model in your own app, like `Booking` here, that
+means building the operation list conditionally in the migration: a router
+cannot do it, because it is asked about the model being altered, which is the
+same question Django's `CreateModel` asks, so denying the app denies the
+table with it ([#86](https://github.com/icvoss/django-boundary/issues/86)).
+A router's `allow_migrate()` is the right tool for an adopted third-party
+app, where denying the app correctly denies both. Otherwise run the tutorial
+on PostgreSQL, as Step 2 does, and you get the second layer for real.
 
 ## You did it
 

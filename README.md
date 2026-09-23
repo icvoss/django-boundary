@@ -175,8 +175,13 @@ Apply it, then confirm `python manage.py check` reports neither
 role: superusers and BYPASSRLS roles are exempt from every policy, so the
 layer exists but enforces nothing for them. These operations are
 PostgreSQL-only and refuse on any other alias with an error naming the
-backend vendor, so keep a non-PostgreSQL alias off this migration's graph
-with a router's `allow_migrate()`. See
+backend vendor. A router's `allow_migrate()` is how you keep an alias off
+the graph, but note the limit for a model in your own app: the router is
+asked about the model being altered, which is the same question Django's
+`CreateModel` asks, so denying that app denies its **table** too. Until
+[#86](https://github.com/icvoss/django-boundary/issues/86) is resolved,
+build the operation list conditionally in the migration for a
+column-bearing model, and use the router for an adopted app. See
 [Add RLS policies with migrations](docs/how-to/add-rls-policies-with-migrations.md)
 for the migrating-role caveats and verification.
 
