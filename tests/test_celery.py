@@ -98,6 +98,7 @@ class TestTenantTaskAutocommit:
     the task body's own query ran.
     """
 
+    @pytest.mark.rls
     def test_call_holds_db_session_var_for_task_body(self, tenant_a):
         from django.db import connection
 

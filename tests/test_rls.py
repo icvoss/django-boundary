@@ -78,6 +78,7 @@ class TestDropTenantPolicyUnit:
         assert "Booking" in DropTenantPolicy("Booking").describe()
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestCustomSessionVariables:
     """Issue #5: RLS SQL must honour BOUNDARY_DB_SESSION_VAR / ADMIN_FLAG_VAR.
@@ -125,6 +126,7 @@ class TestCustomSessionVariables:
 # ── Database integration tests ────────────────────────────────
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestRLSOperations:
     """Test that RLS operations modify pg_class correctly."""
@@ -207,6 +209,7 @@ class TestRLSOperations:
         _remove_rls()
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestRLSEnforcement:
     """AC-RLS-001/002/003/006/007: Database-level enforcement tests.
@@ -435,6 +438,7 @@ def _remove_rls_from_brand():
         EnableRLS("Brand").database_backwards("boundary_testapp", editor, state, state)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestPathScopedModelHasNoOwnRls:
     """Issue #14: path-scoped (relation-scoped) models are ORM-layer-only.

@@ -53,6 +53,14 @@ boundary = ["py.typed"]
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "settings"
 pythonpath = ["src", "tests"]
+markers = [
+    # A test that cannot apply on a backend without Row Level Security, so
+    # the SQLite leg of the CI matrix deselects it with -m "not rls"
+    # (BR-ENV-006). Deselection, not pytest.skip: a skipped test is
+    # indistinguishable from a leg whose database or role never materialised,
+    # which is the failure the zero-skipped rule exists to catch.
+    "rls: requires a PostgreSQL RLS backend (deselected on the SQLite leg)",
+]
 
 [tool.coverage.run]
 source = ["src"]

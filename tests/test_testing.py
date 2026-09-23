@@ -163,6 +163,7 @@ class TestProvisionRLSTestRole:
         monkeypatch.setattr(connection, "vendor", "sqlite")
         assert provision_rls_test_role(bootstrap_connection_params={"dbname": "irrelevant"}) == {}
 
+    @pytest.mark.rls
     def test_idempotent_against_an_existing_role(self, settings):
         """The role CI provisions in ci.yml already exists in this suite's
         environment; provisioning it again must not error, and must return
@@ -186,6 +187,7 @@ class TestProvisionRLSTestRole:
         assert result_again == result
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestAssertRLSEnforced:
     """Issue #55: the fail-closed half. Proven both ways: it passes for the
@@ -298,6 +300,7 @@ class TestAssertRLSEnforced:
         assert "No registered tenant-scoped table has Row Level Security" in message
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAcTest005AssertRlsEnforcedCoversAnAdoptedTable:
     """AC-TEST-005 (BR-PRV-010): assert_rls_enforced covers an adopted table.

@@ -517,6 +517,7 @@ class TestW003RlsBypassableRole:
     catch, not an artefact to work around.
     """
 
+    @pytest.mark.rls
     def test_w003_fires_for_the_default_test_connection(self, settings):
         """The stock test-suite connection (icv_test) is bootstrap-superuser
         by default in the CI postgres:16 service and in a typical local
@@ -526,6 +527,7 @@ class TestW003RlsBypassableRole:
         w003 = [e for e in errors if e.id == "boundary.W003"]
         assert w003, "expected boundary.W003 to fire against the default (superuser) test connection"
 
+    @pytest.mark.rls
     def test_w003_message_names_consequence_remedy_and_escape_hatch(self, settings):
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         errors = check_boundary_configuration(None)
@@ -539,6 +541,7 @@ class TestW003RlsBypassableRole:
         assert "SILENCED_SYSTEM_CHECKS" in w003.msg
         assert "boundary.W003" in w003.msg
 
+    @pytest.mark.rls
     def test_w003_absent_for_a_non_bypassing_role(self, settings):
         """Proven silent: a plain NOSUPERUSER NOBYPASSRLS role must not warn."""
         import psycopg
@@ -581,6 +584,7 @@ class TestW003RlsBypassableRole:
         assert _check_rls_bypassable() == []
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestW003ReproducesTheConsumerProof:
     """Issue #21: reproduce Magmify's raw proof that FORCE ROW LEVEL SECURITY
@@ -633,6 +637,7 @@ class TestW003ReproducesTheConsumerProof:
                 cursor.execute(f'ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY')
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006SkipsPathScopedModels:
     """Issue #14: _check_rls_enabled() must not flag path-scoped models.
@@ -689,6 +694,7 @@ def _remove_rls_from_booking():
         EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006FiresOnMissingRls:
     """Issue #34: boundary.E006 must be proven to actually fire.
@@ -760,6 +766,7 @@ class TestE006FiresOnMissingRls:
             _remove_rls_from_booking()
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006CannotDetermineRlsState:
     """Issue #34: E006's exception handling must not fail open.
@@ -867,6 +874,7 @@ class TestE006CannotDetermineRlsState:
         assert errors == []
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestE006QualifiesTableLookupByOid:
     """Issue #34: the pg_class lookup must resolve the model's real table,
@@ -970,6 +978,7 @@ class TestE006QualifiesTableLookupByOid:
         assert resolved is None
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestW009SetDbSessionVarDisabledWithRlsEnabled:
     """Issue #53: boundary.W009 fires only for the opt-out-plus-RLS-enabled
