@@ -9,7 +9,7 @@ import functools
 import inspect
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 from django.db import connections
@@ -160,7 +160,7 @@ class TenantContext:
     """Static/classmethod API for tenant context management."""
 
     @staticmethod
-    def set(tenant, *, using: str = "default") -> object:
+    def set(tenant, *, using: str = "default") -> Token[Any | None]:
         """Set the active tenant. Returns a token for clear().
 
         Also sets the PostgreSQL session variable via set_config(), on the
@@ -207,7 +207,7 @@ class TenantContext:
         return _current_tenant.get()
 
     @staticmethod
-    def clear(token, *, using: str = "default") -> None:
+    def clear(token: Token[Any | None], *, using: str = "default") -> None:
         """Restore the previous context using the token from set().
 
         Restores BOTH the ContextVar and the DB session variable (issue #13).

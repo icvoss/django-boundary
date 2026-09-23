@@ -6,7 +6,7 @@ multi-tenancy with configurable FK field names.
 """
 
 import logging
-from typing import ClassVar
+from typing import ClassVar, Protocol, cast
 
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -26,6 +26,25 @@ logger = logging.getLogger("boundary.models")
 # so that checks, routing, and other internals can recognise them
 # without requiring a strict issubclass(model, TenantMixin) check.
 _tenant_model_registry: set[type] = set()
+
+
+class _HasUnscopedManager(Protocol):
+    """The one attribute a registered tenant model is read for structurally.
+
+    ``is_tenant_model()`` is a registry-plus-duck-type check rather than an
+    ``issubclass()`` test, deliberately (see the registry note above), so it
+    cannot be a ``TypeGuard`` onto a single nominal base: a model built by
+    ``make_tenant_mixin()`` gets its managers from a locally defined abstract
+    class that shares no base with ``TenantMixin``. Both paths do attach
+    ``unscoped`` as a real class attribute, which is what this records, so a
+    caller that has already passed ``is_tenant_model()`` can say what it
+    expects rather than silencing the resulting attribute error.
+    """
+
+    # Quoted: UnscopedManager is defined further down this module, and this
+    # module has no ``from __future__ import annotations``, so an unquoted
+    # forward reference would raise NameError at import time.
+    unscoped: ClassVar["UnscopedManager"]
 
 
 def is_tenant_model(model: type) -> bool:
@@ -174,6 +193,18 @@ def validate_cross_tenant_fks(instance) -> None:
             continue  # the model's own tenant FK, not a cross-reference
 
         target_model = field.related_model
+        if not isinstance(target_model, type):
+            # django-stubs types ``related_model`` as ``type[Model] |
+            # Literal["self"]``, because a self-referential FK declared with
+            # the string ``"self"`` carries that sentinel until Django
+            # resolves the relation. By the time an instance exists to
+            # validate, every relation on its concrete model is resolved and
+            # this is always a model class; a self-referential FK arrives
+            # here as its own model class, which the docstring above already
+            # records as needing no special case. Narrowed rather than cast
+            # because an unresolved sentinel reaching a validation path would
+            # be a real defect to skip, not a type to assert away.
+            continue
         if not (is_tenant_model(target_model) and has_tenant_column(target_model)):
             continue
 
@@ -182,9 +213,12 @@ def validate_cross_tenant_fks(instance) -> None:
             continue
 
         target_fk_field = get_tenant_fk_field(target_model)
-        target_tenant_id = (
-            target_model.unscoped.filter(pk=target_id).values_list(f"{target_fk_field}_id", flat=True).first()
-        )
+        # is_tenant_model() above established this model carries boundary's
+        # managers, but it is a registry/duck-type check rather than an
+        # issubclass() test (see _HasUnscopedManager), so the nominal type
+        # here is still a bare type[Model].
+        target_manager = cast(_HasUnscopedManager, target_model).unscoped
+        target_tenant_id = target_manager.filter(pk=target_id).values_list(f"{target_fk_field}_id", flat=True).first()
         if target_tenant_id is None:
             # Target row does not exist (dangling FK). Not this check's
             # concern; Django's own FK validation covers existence.
@@ -437,7 +471,12 @@ def make_tenant_mixin(
     # at import time. An explicit BOUNDARY_TENANT_MODEL always takes
     # precedence, and changing either setting afterwards requires new
     # migrations, exactly as it always has for BOUNDARY_TENANT_MODEL users.
-    fk = models.ForeignKey(
+    # Annotated because the target is a settings STRING resolved at import
+    # (``"app.Model"``), not a class, so django-stubs has no concrete model to
+    # infer the generic parameter from. ``models.Model`` is the honest
+    # parameter here: which model this points at is a consumer's choice, made
+    # by BOUNDARY_TENANT_MODEL, and is unknowable to this package statically.
+    fk: models.ForeignKey[models.Model] = models.ForeignKey(
         resolve_tenant_model_setting(),
         on_delete=on_delete,
         db_index=db_index,
@@ -751,7 +790,13 @@ def _derive_constraint_name(fields) -> str:
     which joined names do not: the model half's length is not known until
     interpolation, so a length-dependent scheme could not be resolved here.
     """
-    from django.db.backends.utils import names_digest
+    # django-stubs does not declare names_digest, though Django has exported
+    # it from this module since 3.0 and still does on every version in
+    # BR-ENV-004's supported set (verified against the installed 5.2). A
+    # public name the stubs omit, not a private API: BR-RLS-022's
+    # schema_compat.py rule governs underscore-prefixed schema-editor
+    # attributes and does not reach this one.
+    from django.db.backends.utils import names_digest  # type: ignore[attr-defined]
 
     digest = names_digest(*fields, length=8)
     return f"%(app_label)s_%(class)s_tenant_uniq_{digest}"

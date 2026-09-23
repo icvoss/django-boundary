@@ -10,8 +10,9 @@
 #
 # The three steps run in one pass because they share a virtualenv and a
 # migrated database. --mypy-only runs the same setup and then step 3 alone,
-# so CI can mark the typing leg advisory (continue-on-error) without also
-# making the migration legs advisory, which ADR-027 requires to be blocking.
+# so CI can report the typing leg as its own step and name which of the two
+# questions broke: the consumer's migrations, or the consumer's typing.
+# All of them are blocking, as ADR-027 requires.
 #
 # The distinction ADR-027 is built on: the wheel goes into a clean virtualenv
 # with `pip install dist/*.whl`, never `pip install -e .`, and the consumer is
@@ -151,9 +152,8 @@ else
     echo
     echo "--- Step 3 of 3: mypy on the consumer with the django-stubs plugin"
     # ADR-027 defect 2: the package failing to typecheck clean in a consumer.
-    # This step is meant to FAIL the job when it fails; it is advisory only
-    # while icvoss/django-boundary#81's typing fix is outstanding, and the CI
-    # step that calls this carries the matching continue-on-error and note.
+    # Blocking: this step fails the job when it fails, and the CI steps that
+    # call it carry no continue-on-error.
     # Added 2026-09-23.
     "${VENV_DIR}/bin/mypy" --config-file mypy.ini smokeapp smokerls settings.py urls.py
 fi

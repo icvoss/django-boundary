@@ -299,16 +299,8 @@ jobs:
   mypy:
     # ADR-027's typing leg, run against the package itself under the exact
     # mypy and django-stubs pair the dev extra declares.
-    #
-    # continue-on-error until icvoss/django-boundary#81's typing fix lands
-    # (7 errors in src/boundary at 3fdc7bf under mypy 1.19.1 with
-    # django-stubs 5.2.9). ADR-027 names this advisory-vs-blocking state
-    # explicitly and requires it be recorded rather than left implicit.
-    # Added 2026-09-23; flip to blocking in the same change that makes
-    # src/boundary clean, and delete this comment with it.
-    name: Typecheck (mypy, advisory until #81)
+    name: Typecheck (mypy)
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v6
@@ -408,20 +400,16 @@ jobs:
           PGUSER: icv_app
           PGPASSWORD: icv_dev
 
-      # ADR-027 step 3, in its own step so the advisory marking below cannot
-      # also make the migration steps advisory. Advisory until
-      # icvoss/django-boundary#81's typing fix lands; ADR-027 requires the
-      # advisory-vs-blocking state to be recorded rather than left implicit.
-      # Added 2026-09-23; delete continue-on-error and this comment in the
-      # change that makes src/boundary clean.
-      - name: Smoke consumer typing on SQLite (mypy, advisory until #81)
-        continue-on-error: true
+      # ADR-027 step 3, kept in its own step (rather than folded into the
+      # migration steps above) because it typechecks the CONSUMER against the
+      # installed wheel, which is a different question from the `mypy
+      # src/boundary` job's, and a failure should say which one broke.
+      - name: Smoke consumer typing on SQLite (mypy)
         run: smoke/run.sh sqlite --mypy-only
         env:
           BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
 
-      - name: Smoke consumer typing on PostgreSQL (mypy, advisory until #81)
-        continue-on-error: true
+      - name: Smoke consumer typing on PostgreSQL (mypy)
         run: smoke/run.sh postgresql --mypy-only
         env:
           BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
