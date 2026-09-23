@@ -10,7 +10,7 @@ The ORM layer (the tenant manager and middleware) works on any database. RLS enf
 
 - A model that is already tenant-scoped (it has a tenant foreign key, the column is `tenant_id` by default). See the [README](../../README.md) for how models acquire the tenant FK.
 - `BOUNDARY_TENANT_MODEL` configured in settings.
-- PostgreSQL 14+. On any other database, do not add these operations: they emit PostgreSQL-specific DDL.
+- PostgreSQL 14+ for the policies to actually exist. You do **not** need a separate migration path for other backends: `EnableRLS`, `CreateTenantPolicy` and `DropTenantPolicy` each log one line and skip on any other database, emitting no DDL and raising nothing, so the same migration file applies everywhere and a SQLite development database builds from it unchanged. What you lose there is the RLS layer itself, not the migration. `AdoptTenantApp` is the one exception and still refuses off PostgreSQL; see [Common pitfalls](#common-pitfalls) for why the two differ.
 - A migrating role that owns the tables and can create in the schema, and a non-superuser application role. See [Grants for the role that migrates](#grants-for-the-role-that-migrates).
 - The migration that creates the table (or adds the tenant FK column) already exists, or is created in the same file before the RLS operations.
 
