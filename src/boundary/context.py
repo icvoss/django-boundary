@@ -72,6 +72,38 @@ def _target_aliases(tenant: Any) -> list[str]:
     return aliases
 
 
+def _is_postgresql(using: str = "default") -> bool:
+    """Whether the named alias speaks PostgreSQL (BR-ENV-002 gate).
+
+    The context layer's only database writes are ``set_config()`` calls
+    (BR-CTX-002), and ``set_config`` is a PostgreSQL function that no other
+    backend has. BR-ENV-002 makes SQLite a supported backend for the context
+    layer and requires the missing RLS layer to be quiet there: no error, no
+    warning and no exception. Every caller therefore asks this first and
+    returns without issuing SQL when it answers ``False``, rather than
+    letting SQLite raise ``OperationalError: no such function: set_config``
+    on the first request that resolves a tenant (icvoss/django-boundary#85).
+
+    Asked per alias, never once per process, because the aliases in one
+    project need not share a vendor: a deployment may hold a PostgreSQL
+    ``default`` carrying the RLS layer beside a SQLite reporting alias
+    carrying none (BR-ENV-005), and the session variable must keep being
+    written on the former while being skipped on the latter.
+
+    An alias that is not configured in ``DATABASES`` answers ``False``,
+    matching :func:`_ensure_atomic`'s tolerance of the same case: a regional
+    alias named in ``BOUNDARY_REGIONS`` but absent from ``DATABASES`` has no
+    connection to write a session variable on, so there is nothing to do
+    rather than something to fail.
+    """
+    from django.utils.connection import ConnectionDoesNotExist
+
+    try:
+        return connections[using].vendor == "postgresql"
+    except ConnectionDoesNotExist:
+        return False
+
+
 def _ensure_atomic(using: str = "default"):
     """Return a context manager that guarantees an active transaction.
 
@@ -295,8 +327,20 @@ class TenantContext:
         ``False`` returns before issuing any SQL. ``BOUNDARY_DB_SESSION_VAR``
         itself stays a pure name so ``migrations_ops.py``, which reads the
         same name for RLS policy definitions, is unaffected by this opt-out.
+
+        Also gated on the alias's vendor (BR-ENV-002,
+        icvoss/django-boundary#85): ``set_config`` is a PostgreSQL function,
+        so on any other backend this returns before issuing SQL, on the same
+        quiet terms as the settings opt-out above. The absence is by design
+        on that backend rather than a misconfiguration, so it earns no
+        warning; the ORM filtering layer BR-ENV-002 promises on SQLite runs
+        unchanged above it. The gate reads *using*, not a process-wide
+        vendor, so a PostgreSQL ``default`` keeps its session variable when a
+        second alias does not speak PostgreSQL.
         """
         if not boundary_settings.SET_DB_SESSION_VAR:
+            return
+        if not _is_postgresql(using):
             return
         connection = connections[using]
         if connection.connection is not None:
@@ -320,9 +364,16 @@ class TenantContext:
         """Reset the PostgreSQL session variable to empty string.
 
         Gated by ``BOUNDARY_SET_DB_SESSION_VAR`` (default ``True``, issue
-        #53); see ``_set_db_session`` for the rationale.
+        #53) and by the alias's vendor (BR-ENV-002, BR-CTX-002,
+        icvoss/django-boundary#85); see ``_set_db_session`` for the rationale
+        behind both. The vendor gate must mirror the set side exactly: a
+        clear that raised on a backend where the matching set was skipped
+        would surface the missing RLS layer as an exception on every context
+        exit, which is precisely what BR-ENV-002 forbids.
         """
         if not boundary_settings.SET_DB_SESSION_VAR:
+            return
+        if not _is_postgresql(using):
             return
         connection = connections[using]
         if connection.connection is not None:
@@ -433,6 +484,28 @@ def admin_bypass(*, using: str = "default"):
     knowing entry happened and reading the surrounding code/logs for how
     long the block ran.
 
+    **Non-PostgreSQL aliases** (BR-ENV-002, BR-CTX-002,
+    icvoss/django-boundary#85). When ``using`` names an alias whose vendor is
+    not ``"postgresql"``, this sets no flag, opens no transaction for a
+    transaction-local setting that would not exist, performs no read-back,
+    and raises nothing: it simply yields. There is no RLS layer on such a
+    backend to bypass, so there is nothing for the flag to grant and nothing
+    for its absence to cost. What the block is actually for still works
+    there, because cross-tenant access on a backend with no RLS is reached
+    through ``.unscoped`` at the ORM layer, which this context manager has
+    never been the mechanism for on any backend.
+
+    Refusing by name instead was considered and rejected. It would make the
+    one documented cross-tenant idiom, ``with admin_bypass(): Model.unscoped
+    ...``, raise on SQLite while the ORM work inside it is exactly as correct
+    there as on PostgreSQL, which is the "no exception attributable to the
+    missing RLS layer" BR-ENV-002 forbids. The consequence a consumer must
+    hold is BR-ENV-002's own: an adopted table (BR-RLS-015) has no ORM layer
+    beneath it and therefore no isolation at all on SQLite, with or without
+    this block. The entry signal and the warning log still fire, because the
+    auditable event is that a caller opened the escape hatch, which happened
+    regardless of which backend answered.
+
     Usage::
 
         from boundary.context import admin_bypass
@@ -444,6 +517,19 @@ def admin_bypass(*, using: str = "default"):
         using: DB alias to set the flag on. Defaults to ``"default"``.
     """
     from boundary.signals import admin_bypass_activated
+
+    if not _is_postgresql(using):
+        admin_bypass_activated.send(
+            sender=None,
+            flag_var=boundary_settings.ADMIN_FLAG_VAR,
+            using=using,
+        )
+        logger.warning(
+            "RLS admin bypass entered on a non-PostgreSQL alias; no flag set",
+            extra={"flag_var": boundary_settings.ADMIN_FLAG_VAR, "using": using},
+        )
+        yield
+        return
 
     connection = connections[using]
     depth_map = dict(_admin_bypass_depth.get() or {})

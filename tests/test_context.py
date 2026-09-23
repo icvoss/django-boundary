@@ -935,3 +935,174 @@ class TestAdminBypassSignal:
             admin_bypass_activated.disconnect(_receiver)
 
         assert received == []
+
+
+class TestContextLayerIsQuietOnNonPostgreSQL:
+    """icvoss/django-boundary#85: the context layer's own writes are gated
+    on the alias's vendor, not just on BOUNDARY_SET_DB_SESSION_VAR.
+
+    BR-ENV-002 makes SQLite a supported backend for the context layer and
+    requires the missing RLS layer to be quiet there: "no error, no warning
+    and no exception attributable to the missing RLS layer". The only writes
+    this layer makes are ``set_config()`` calls (BR-CTX-002), and
+    ``set_config`` is a PostgreSQL function, so on any other backend they
+    must not be issued at all. Before the fix, ``TenantContext.set()`` raised
+    ``OperationalError: no such function: set_config`` on the first request
+    that resolved a tenant, which put the ORM filtering layer BR-ENV-002
+    promises on SQLite out of reach behind it.
+
+    Unmarked deliberately, so these run on the SQLite leg too (where the
+    ``default`` alias is also SQLite and the assertions hold for the same
+    reason). They assert against ``eu-west``, which ``tests/settings.py``
+    configures as SQLite on BOTH legs, so the non-PostgreSQL alias under
+    test is a real one on either. That doubles as this rule's per-alias
+    coverage: on the PostgreSQL leg the same process holds a PostgreSQL
+    ``default`` and a SQLite ``eu-west``, which is BR-ENV-005's mixed-vendor
+    deployment shape, and the gate has to answer differently per alias
+    rather than once per process.
+    """
+
+    SQLITE_ALIAS = "eu-west"
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_using_issues_no_set_config_on_a_sqlite_alias(self, tenant_a, settings):
+        """Entering and leaving TenantContext.using() on a SQLite alias
+        raises nothing and issues no set_config()."""
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        with (
+            CaptureQueriesContext(sqlite_connection) as captured,
+            TenantContext.using(tenant_a, using=self.SQLITE_ALIAS) as active,
+        ):
+            assert active == tenant_a
+            assert TenantContext.get() == tenant_a
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_set_and_clear_issue_no_set_config_on_a_sqlite_alias(self, tenant_a, settings):
+        """The set()/clear() pair underneath using() is gated on both sides.
+
+        A gate on the set side alone would move the failure from context
+        entry to context exit rather than removing it.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        with CaptureQueriesContext(sqlite_connection) as captured:
+            token = TenantContext.set(tenant_a, using=self.SQLITE_ALIAS)
+            TenantContext.clear(token, using=self.SQLITE_ALIAS)
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_admin_bypass_yields_and_raises_nothing_on_a_sqlite_alias(self, settings):
+        """admin_bypass() on a SQLite alias yields, sets no flag and does not
+        perform the read-back assertion.
+
+        The read-back is the part that would otherwise turn this into a
+        refusal: ``current_setting()`` does not exist on SQLite either, so
+        without the vendor gate the block raises before the caller's body
+        runs, and the documented cross-tenant idiom (``.unscoped`` inside an
+        ``admin_bypass()`` block) is unusable on a supported backend.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        entered = False
+        with CaptureQueriesContext(sqlite_connection) as captured, admin_bypass(using=self.SQLITE_ALIAS):
+            entered = True
+
+        assert entered
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+        assert [q["sql"] for q in captured.captured_queries if "current_setting" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_unscoped_reaches_other_tenants_rows_inside_the_bypass(self, tenant_a, tenant_b):
+        """The reason admin_bypass() yields rather than refusing: what the
+        block is FOR still works on a backend with no RLS.
+
+        Cross-tenant access is reached through ``.unscoped`` at the ORM
+        layer, which is backend-independent. This asserts the idiom the
+        how-to documents completes on SQLite rather than merely that the
+        context manager does not raise.
+        """
+        from boundary_testapp.models import Booking
+
+        Booking.unscoped.create(tenant=tenant_a, court=1)
+        Booking.unscoped.create(tenant=tenant_b, court=2)
+
+        with TenantContext.using(tenant_a):
+            assert Booking.objects.count() == 1
+            with admin_bypass(using=self.SQLITE_ALIAS):
+                assert Booking.unscoped.count() == 2
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_gate_is_per_alias_not_per_process(self, tenant_a, settings):
+        """Positive control for the per-alias claim, paired with the
+        negative above.
+
+        Skipped on the SQLite leg, where ``default`` is SQLite too and there
+        is no PostgreSQL alias in the process for the gate to answer
+        differently about. On the PostgreSQL leg this is the whole point of
+        gating on ``using``: the same process, the same call, one alias
+        writing the session variable and the other not.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        if connections["default"].vendor != "postgresql":
+            pytest.skip("needs a PostgreSQL default alias to contrast against eu-west")
+
+        settings.DEBUG = True
+        pg_connection = connections["default"]
+        pg_connection.ensure_connection()
+
+        with CaptureQueriesContext(pg_connection) as captured, TenantContext.using(tenant_a, using="default"):
+            pass
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] != []
+
+
+@pytest.mark.rls
+@pytest.mark.django_db(transaction=True)
+class TestContextLayerStillWritesOnPostgreSQL:
+    """The vendor gate must not have turned the PostgreSQL path off.
+
+    A gate that returned early everywhere would pass every assertion in
+    ``TestContextLayerIsQuietOnNonPostgreSQL`` while silently removing the
+    session variable RLS reads, which is an isolation failure rather than a
+    quiet backend. These pin the direction: on PostgreSQL the variable is
+    still set, still readable, and still cleared.
+    """
+
+    def test_session_variable_is_set_and_cleared_on_postgresql(self, tenant_a):
+        from boundary.conf import boundary_settings
+
+        with TenantContext.using(tenant_a), connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.DB_SESSION_VAR])
+            assert cursor.fetchone()[0] == str(tenant_a.pk)
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.DB_SESSION_VAR])
+            assert cursor.fetchone()[0] in ("", None)
+
+    def test_admin_bypass_still_sets_the_flag_on_postgresql(self):
+        from boundary.conf import boundary_settings
+
+        with admin_bypass(), connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.ADMIN_FLAG_VAR])
+            assert cursor.fetchone()[0] == "true"
