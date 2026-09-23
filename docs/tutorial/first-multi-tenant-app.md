@@ -83,13 +83,12 @@ psql -d courts -c "GRANT USAGE, CREATE ON SCHEMA public TO courts_app;"
 ```
 
 `NOSUPERUSER NOBYPASSRLS` is the whole point: it is what makes the policies
-apply to this connection. `CREATE ON SCHEMA public` is there because this
-tutorial runs `migrate` as the same role, so it needs to create tables (and
-the helper function `CreateTenantPolicy` installs) in that schema. It also
-makes `courts_app` the owner of the tables it creates, which is what lets it
-enable RLS and create policies on them in Step 10. A production deployment
-often splits these: a migrating role that owns the schema, and a narrower
-runtime role that only reads and writes.
+apply to this connection. The two grants are what this one role needs to run
+both `migrate` and the app itself, which is the simplest arrangement and the
+one this tutorial uses. For what each grant is for, why ownership of the
+tables matters in Step 10, and how production deployments usually split this
+into separate migrating and runtime roles, see
+[Grants for the role that migrates](../how-to/add-rls-policies-with-migrations.md#grants-for-the-role-that-migrates).
 
 Point Django at that role:
 
