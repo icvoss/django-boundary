@@ -58,6 +58,42 @@ All notable changes to django-boundary are documented here.
   including the migration consequences of converting an existing global
   constraint.
 
+### Changed
+
+- **`EnableRLS`, `CreateTenantPolicy` and `DropTenantPolicy` are a logged
+  no-op on a non-PostgreSQL database instead of an error** (issue #86,
+  BR-RLS-021). Row Level Security is PostgreSQL-only, so these three
+  operations could not do their work on any other backend, and previously
+  said so by failing the migration. The practical effect was that anyone
+  developing against SQLite and deploying to PostgreSQL, which is the common
+  local setup, had to keep the RLS operations out of their own migration
+  files: a backend conditional on `settings.DATABASES`, a second migration
+  module, or a router. You no longer need any of that. Write the migration
+  once and run it unchanged on both. On a non-PostgreSQL alias each operation
+  now emits one `INFO` line on the `boundary.migrations` logger, naming the
+  operation, the model, the alias and the vendor, then returns without
+  issuing DDL and without raising.
+
+  What you get on that backend is unchanged, and it is worth being plain
+  about: the model keeps its ORM-layer tenant filtering, and it does not get
+  the database-level layer. Nothing enforces isolation for a query that
+  bypasses the manager, and `boundary.E006` and `boundary.W003` stay silent
+  there as they always have, so a clean `manage.py check` on SQLite says
+  nothing about the database layer. The log line is there so this is visible
+  in a migrate log rather than inferred; it is `INFO` rather than a warning
+  because on a backend you have deliberately chosen for local development it
+  is the designed outcome, not a fault.
+
+  Your database router is still consulted first, and a router denial is still
+  entirely silent, logging nothing: keeping an alias off the RLS graph
+  deliberately is different from an alias that simply cannot carry it.
+
+  **`AdoptTenantApp` is unchanged and still refuses off PostgreSQL.** The
+  asymmetry is deliberate. A model using boundary's mixins keeps its ORM
+  filtering when the policy is skipped, so it is left with less isolation. An
+  adopted third-party table has no ORM layer beneath the policy, so skipping
+  there would leave it with none at all, silently.
+
 ### Behaviour change for existing consumers
 
 **`boundary.E008` can turn a passing `manage.py check` into a failing one.**
@@ -92,6 +128,24 @@ would hide the production case the check exists for.
 
 `tenant_unique()` changes nothing for an existing consumer: it is a new
 surface, and no existing model gains or loses a constraint.
+
+**A migration that already wraps the RLS operations keeps working, and can
+now be simplified.** If you kept `EnableRLS` or `CreateTenantPolicy` behind a
+backend conditional, a separate migration module, or a router, none of that
+breaks: the operations are a no-op on the backends your wrapper was excluding
+anyway. It is now redundant, and removing it leaves one migration file that
+runs on both backends. Nothing forces the change, and nothing depends on your
+doing it.
+
+The one case that changes materially is a migration you previously could NOT
+run on SQLite at all. It now applies, reporting as applied with the RLS
+operations skipped, so a SQLite test database or development environment that
+used to fail during `migrate` will now build. That is the point of the change,
+but note what it means for a test suite: a suite that was implicitly proving
+RLS by failing to migrate without it will now migrate and pass with no
+database-level isolation in place. Use `assert_rls_enforced()` (or
+`boundary.testing.rls_enforced()` as a session fixture) if you need that
+proven rather than assumed.
 
 ## [0.9.0] - 2026-09-21
 
