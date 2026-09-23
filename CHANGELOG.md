@@ -4,7 +4,7 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
-## [1.0.0rc1] - 2026-09-23
+## [1.0.0] - 2026-09-23
 
 ### Added
 
@@ -86,6 +86,12 @@ All notable changes to django-boundary are documented here.
   neither.
 
 ### Changed
+
+- **The `Development Status` trove classifier is now
+  `5 - Production/Stable`**, raised from `4 - Beta`. Package metadata only:
+  no code, API or behaviour changes with it. It records the stability
+  commitment described below rather than claiming anything new about the
+  implementation.
 
 - **The three RLS operations now consult your database router before doing
   anything** (issue #86, BR-RLS-021). `EnableRLS`, `CreateTenantPolicy` and
@@ -227,6 +233,22 @@ silently: a router denial logs nothing, deliberately, because an alias
 excluded on purpose is different from one that cannot carry the layer. Review
 any alias your router denies and confirm you did not want policies on it. For
 almost everyone the denial was the intent and this is the fix.
+
+### Stability commitment
+
+The CONTRACTS inventory is boundary's SemVer surface from this release on
+(ADR-116 D1): everything listed there is what a consumer may depend on, and
+anything outside it remains internal and may change in any release.
+A breaking change to that surface requires a major version, and a removal from
+it is preceded by at least one minor release in which the surface still works
+and emits a `DeprecationWarning`.
+
+## [1.0.0rc1] - 2026-09-23
+
+1.0.0rc1, 2026-09-23: release candidate for 1.0.0; the changes above
+shipped there first and are unchanged in 1.0.0; the icvlocal.com rehearsal
+([icvoss/icvlocal.com#111](https://github.com/icvoss/icvlocal.com/issues/111))
+passed against it.
 
 ## [0.9.0] - 2026-09-21
 

@@ -94,11 +94,16 @@ tagging:
 - `pyproject.toml` under `[project]` -> `version`
 - `src/boundary/__init__.py` -> `__version__`
 
-## Keep the CI Django pin in step with the floor
+## Keep the CI Django matrix in step with the floor
 
-The publish workflow's test job pins `Django~=5.2.0`. When you raise the
-minimum Django in `pyproject.toml`, **update the pin in the same PR**, or the
-tagged build's test job can fail to resolve dependencies and block the publish.
+The publish workflow's test job runs a Django matrix (BR-ENV-006), one leg per
+supported version, each installing `Django~=<version>.0` against the built
+wheel; `ci.yml`'s test job runs the same axis. When you raise the minimum
+Django in `pyproject.toml`, or add or drop a supported version, **update the
+`django-version` matrix in both workflows in the same PR**, and the
+`Framework :: Django ::` classifiers with them. A matrix leg below the new
+floor fails to resolve dependencies and blocks the publish; a supported
+version missing from the matrix ships untested.
 
 ## Pre-tag checklist
 
@@ -109,7 +114,8 @@ Before pushing the tag (the irreversible step):
 - [ ] Behaviour changes and breaking changes called out in that CHANGELOG entry.
 - [ ] Version bumped in `pyproject.toml` **and** `src/boundary/__init__.py`,
       and they match.
-- [ ] CI Django pin matches the package's minimum, if the floor changed.
+- [ ] CI Django matrix matches the supported versions, if the floor or the
+      supported set changed.
 - [ ] Tests pass locally and the package builds (`python -m build`).
 - [ ] The PR is **merged to `main`** and you are tagging that commit.
 - [ ] Tag format is `v<version>`.
