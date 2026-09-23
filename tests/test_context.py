@@ -35,6 +35,7 @@ class TestTenantContextClear:
             TenantContext.clear(token_a)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextClearRestoresDbSessionVar:
     """Regression for issue #13: clear() must restore the previous tenant's
@@ -158,6 +159,7 @@ class TestTenantContextRequire:
             assert TenantContext.require() == tenant_a
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextDBSession:
     """AC-CTX-005/006: DB session variable set and cleared."""
@@ -188,6 +190,7 @@ class TestTenantContextDBSession:
             assert val == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestSetDbSessionVarOptOut:
     """Issue #53: BOUNDARY_SET_DB_SESSION_VAR gates whether the session
@@ -229,6 +232,7 @@ class TestSetDbSessionVarOptOut:
             assert self._get_session_var() == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextSavepointBehaviour:
     """AC-CTX-008: Nested context restores DB session variable after savepoint."""
@@ -255,6 +259,7 @@ class TestTenantContextSavepointBehaviour:
                 TenantContext.clear(token)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextAutocommit:
     """Regression for #6: using() must not silently no-op in autocommit.
@@ -671,6 +676,7 @@ def _get_admin_flag():
         return cursor.fetchone()[0]
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassFlagLifecycle:
     """Issue #37 AC: the admin flag is set inside the block and cleared after.
@@ -721,6 +727,7 @@ class TestAdminBypassFlagLifecycle:
             assert cursor.fetchone()[0] == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassTransactionLocal:
     """The flag does not survive past the block (transaction-local guarantee).
@@ -747,6 +754,7 @@ class TestAdminBypassTransactionLocal:
                 assert cur.fetchone()[0] is None, "flag must not leak onto an unrelated connection"
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassWrapAtomicFalse:
     """Issue #37: BOUNDARY_WRAP_ATOMIC=False with no ambient transaction.
@@ -781,6 +789,7 @@ class TestAdminBypassWrapAtomicFalse:
             assert _get_admin_flag() == "true"
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassCleanupExceptionSafety:
     """Issue #60: admin_bypass()'s finally cleanup must not mask the
@@ -828,6 +837,7 @@ class TestAdminBypassCleanupExceptionSafety:
         )
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassNesting:
     """Issue #37: reentrant use on the same alias is idempotent.
@@ -862,6 +872,7 @@ class TestAdminBypassNesting:
                 assert cursor.fetchone()[0] == str(tenant_a.pk)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassSignal:
     """Issue #37: an auditable signal fires on entry with the expected payload."""

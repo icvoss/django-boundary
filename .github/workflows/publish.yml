@@ -69,9 +69,24 @@ jobs:
 
   # 2. Run the test suite before publishing
   test:
-    name: Test django-boundary
+    # BR-ENV-006: the publish gate runs the same Django matrix as ci.yml's
+    # test job, against the built wheel. A gate testing one Django where CI
+    # tests three can pass on a wheel CI would have failed, and it is the
+    # last check before an irreversible tag push. AC-TEST-008 compares the
+    # two parsed axes for equality, so adding a version to ci.yml alone
+    # fails the suite.
+    #
+    # The Python axis stays a single version deliberately: the wheel is pure
+    # Python and every pull request covers both interpreters through ci.yml.
+    # The Django axis may not, because Django compatibility is what changes
+    # between releases.
+    name: Test django-boundary (Django ${{ matrix.django-version }})
     runs-on: ubuntu-latest
     needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        django-version: ["5.2", "6.0", "6.1"]
 
     services:
       postgres:
@@ -115,7 +130,7 @@ jobs:
           # way a hand-listed set does. A hand-list predating an API layer is
           # exactly how icv-identity's v0.6.0rc1 publish gate failed.
           pip install "$(ls dist/*.whl)[dev]"
-          pip install "Django~=5.2.0"
+          pip install "Django~=${{ matrix.django-version }}.0"
 
       - name: Provision the non-superuser icv_app role for RLS enforcement tests
         # See ci.yml: the icv_test bootstrap role from the postgres:16
@@ -248,5 +263,31 @@ jobs:
           name: ${{ needs.resolve.outputs.release_title }}
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ startsWith(needs.resolve.outputs.version, '0.') }}
+          # BR-ENV-007: mark a prerelease by the version's PEP 440
+          # prerelease segment, not by its major. The old condition was
+          # startsWith(version, '0.') alone, which was correct while every
+          # version began 0. and becomes wrong at the first 1.0 release
+          # candidate: 1.0.0rc1 does not start with 0., so it would have been
+          # published as the repository's "latest release", which is what a
+          # consumer reading the releases page pins. A tag push is
+          # irreversible, so a mismarked rc can only be superseded.
+          #
+          # startsWith('0.') is KEPT deliberately: it is the separate pre-1.0
+          # convention that a 0.x version is a prerelease even when final,
+          # which BR-ENV-007 leaves undisturbed.
+          #
+          # Evaluates true for 0.9.0, 1.0.0rc1, 1.0.0a1, 1.0.0b1,
+          # 1.0.0.dev1 and 1.0.0.post1; false for 1.0.0, 1.1.0 and 2.0.0.
+          # The bare 'a' and 'b' tests are safe because a PEP 440 version
+          # carries no letters other than its prerelease marker, and they
+          # also catch the 'alpha' and 'beta' spellings. GitHub's contains()
+          # is CASE-SENSITIVE, so a tag written v1.0.0RC1 would not match;
+          # tag in lower case, which is PEP 440's normalised form anyway.
+          prerelease: >-
+            ${{ startsWith(needs.resolve.outputs.version, '0.')
+            || contains(needs.resolve.outputs.version, 'rc')
+            || contains(needs.resolve.outputs.version, 'a')
+            || contains(needs.resolve.outputs.version, 'b')
+            || contains(needs.resolve.outputs.version, 'dev')
+            || contains(needs.resolve.outputs.version, 'post') }}
           fail_on_unmatched_files: true

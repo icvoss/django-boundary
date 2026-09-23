@@ -30,6 +30,15 @@ from boundary.adoption import adopted_models, column_type, unique_constraints, u
 from boundary.exceptions import AdoptionRefusedError
 from boundary.migrations_ops import AdoptTenantApp
 
+# Every test in this module needs a PostgreSQL RLS backend (BR-ENV-006). The
+# operation under test emits PostgreSQL DDL, the isolation assertions read
+# pg_class and pg_policy through a psycopg connection, and even the pure-unit
+# classes assert on PostgreSQL type mapping and PostgreSQL's 63-character
+# identifier limit. On the SQLite leg the thirdparty and boundary_consumer
+# tables do not exist at all, because the leg's router keeps those apps off
+# the alias.
+pytestmark = pytest.mark.rls
+
 # The models the ordinary adoption path covers. Seat, SeatBooking and Coupon
 # are excluded because their unique forms are the refusal fixtures, asserted
 # directly in TestAcRls010.

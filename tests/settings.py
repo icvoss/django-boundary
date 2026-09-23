@@ -2,12 +2,24 @@
 Django settings for django-boundary standalone tests.
 
 Used by the publish workflow (CI) and for running tests independently
-of the monorepo sandbox settings. Requires PostgreSQL for RLS tests.
+of the monorepo sandbox settings. PostgreSQL is the default backend, and is
+required for the RLS tests.
+
+Set ``BOUNDARY_TEST_DB=sqlite`` to run the SQLite leg of the CI matrix
+instead, which puts SQLite on the ``default`` alias to prove BR-ENV-002's
+quiet returns on a backend with no Row Level Security. That leg runs with
+``-m "not rls"``, deselecting the tests that need a PostgreSQL RLS backend
+rather than skipping them at runtime (BR-ENV-006).
 """
 
 import os
 
 SECRET_KEY = "boundary-test-secret-key"  # noqa: S105
+
+#: The SQLite leg of the CI matrix (BR-ENV-006). Not a general-purpose knob:
+#: it selects a leg of the supported matrix, not a consumer configuration.
+BOUNDARY_TEST_DB = os.environ.get("BOUNDARY_TEST_DB", "postgresql").lower()
+_SQLITE_LEG = BOUNDARY_TEST_DB == "sqlite"
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -23,16 +35,29 @@ INSTALLED_APPS = [
     "boundary_consumer",
 ]
 
-# PostgreSQL required — RLS tests use raw SQL against pg_class.
-DATABASES = {
-    "default": {
+# PostgreSQL by default: the RLS tests use raw SQL against pg_class. The
+# SQLite leg replaces this alias wholesale (BR-ENV-002, BR-ENV-006).
+_DEFAULT_ALIAS = (
+    {
+        "ENGINE": "django.db.backends.sqlite3",
+        # Django rewrites ":memory:" to a shared-cache in-process database
+        # (file:memorydb_default?mode=memory&cache=shared), so the extra
+        # connections a transaction=True test opens all see the same data.
+        "NAME": ":memory:",
+    }
+    if _SQLITE_LEG
+    else {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": os.environ.get("POSTGRES_DB", "boundary_test"),
         "USER": os.environ.get("POSTGRES_USER", "icv_test"),
         "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "icv_test_password"),
         "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
         "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-    },
+    }
+)
+
+DATABASES = {
+    "default": _DEFAULT_ALIAS,
     # A second, genuinely separate alias for regional-routing tests that
     # must prove a row landed on a non-default database (issue #62). SQLite
     # keeps this alias free of the PostgreSQL fixture/role setup the tests
@@ -87,3 +112,26 @@ ROOT_URLCONF = "urls"
 # Boundary settings
 BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
 BOUNDARY_STRICT_MODE = True
+
+if _SQLITE_LEG:
+    # BR-ENV-006: the SQLite leg needs a router, and that is the point of it.
+    # thirdparty and boundary_consumer keep their real migration modules
+    # (see MIGRATION_MODULES above), and the consumer's adoption migration
+    # applies AdoptTenantApp. On a SQLite alias the router ADMITS, BR-RLS-013
+    # and BR-RLS-021 make that operation refuse by name, so the leg could not
+    # create its test database at all. Denying allow_migrate() for both apps
+    # is the documented way a project keeps a non-PostgreSQL alias off an RLS
+    # migration graph, and the test database existing is the router gate's
+    # own live exercise rather than scaffolding around it.
+    #
+    # The caveat, and why this is safe here: tests/test_checks.py assigns
+    # settings.DATABASE_ROUTERS directly in its boundary.E005 coverage, so
+    # this router is overwritten for the duration of those tests. That is
+    # harmless on this leg, because migrations run only once, at
+    # test-database creation, long before any test body executes; nothing
+    # after that point asks allow_migrate() about these apps. It is NOT a
+    # safe place to leave unguarded: a future test that drives a migration
+    # after reassigning the setting would meet the vendor refusal, which
+    # fails the leg loudly rather than quietly, and is the acceptable
+    # failure mode.
+    DATABASE_ROUTERS = ["sqlite_leg.DenyRlsMigrationsRouter"]
