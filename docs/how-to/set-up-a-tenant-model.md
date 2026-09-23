@@ -179,6 +179,99 @@ Then run the system checks; a correctly registered model produces no
 python manage.py check
 ```
 
+## Uniqueness within a tenant
+
+The tenant model's own `slug` is correctly globally unique: it identifies the
+tenant, so two tenants must not share one. Uniqueness on a **tenant-scoped**
+model is the opposite case, and it is the one that catches people out.
+
+`unique=True` on a field of a tenant-scoped model is enforced across every
+tenant, not within one:
+
+```python
+class Invoice(TenantModel):
+    reference = models.CharField(max_length=32, unique=True)   # globally unique
+```
+
+Two tenants cannot both hold an invoice with reference `INV-001`. The second
+one to try gets an `IntegrityError` naming a constraint that mentions neither
+tenancy nor the other tenant, and the row they collided with is one they
+cannot see. The same is true of `Meta.unique_together` and of a hand-written
+`UniqueConstraint` whose fields do not lead with the tenant column.
+
+Use `tenant_unique()` to say what you almost certainly meant:
+
+```python
+from boundary.models import TenantModel, tenant_unique
+
+
+class Invoice(TenantModel):
+    reference = models.CharField(max_length=32)     # note: no unique=True
+
+    class Meta:
+        constraints = [tenant_unique("reference")]
+```
+
+The constraint's columns are the model's tenant foreign key followed by the
+fields you gave, in that order, so each tenant gets its own `INV-001` and
+neither sees the other's.
+
+`tenant_unique()` reads the tenant field off the model when Django prepares
+it, not when the `Meta` body runs, so the same call works unchanged on a model
+built from `make_tenant_mixin()`:
+
+```python
+MerchantMixin = make_tenant_mixin("merchant")
+
+
+class Product(MerchantMixin):
+    sku = models.CharField(max_length=50)
+
+    class Meta:
+        constraints = [tenant_unique("sku")]   # resolves to ("merchant", "sku")
+```
+
+Pass `name=` to control the constraint name; without one, boundary derives a
+deterministic name from the model and the field list, so two `tenant_unique()`
+calls on one model cannot collide.
+
+A path-scoped model (`make_tenant_path_mixin()`) has no tenant column of its
+own to lead a constraint with, so `tenant_unique()` raises when the model class
+is prepared, naming the model. Express the uniqueness on the model that owns
+the tenant column, or use a plain `UniqueConstraint` if it is genuinely global.
+
+### Changing an existing global constraint to a per-tenant one
+
+`makemigrations` generates a `RemoveConstraint` (or a field alteration dropping
+`unique=True`) followed by an `AddConstraint`. That is a drop and a create, not
+an alteration in place, which has two consequences worth knowing before you run
+it in production:
+
+- **There is a window with no unique constraint at all**, between the drop and
+  the create, inside the migration's transaction. On PostgreSQL the DDL is
+  transactional, so concurrent writers are blocked rather than admitted, but
+  the table is locked for the duration.
+- **The migration fails if existing rows violate the new constraint.** Rows
+  written before boundary was introduced may carry a null tenant, or the same
+  tenant may already hold two rows with the value you are now making unique
+  within it. Find them first:
+
+  ```python
+  from django.db.models import Count
+
+  (Invoice.unscoped
+      .values("tenant_id", "reference")
+      .annotate(n=Count("id"))
+      .filter(n__gt=1))
+  ```
+
+  Resolve the duplicates in a data migration that runs before the constraint is
+  added, in the same migration file, so a deployment cannot land the constraint
+  without the cleanup.
+
+Going the other way, from per-tenant to global, is the same shape and fails on
+the same kind of data, so check for cross-tenant duplicates the same way.
+
 ## Common pitfalls
 
 - **Setting `BOUNDARY_TENANT_MODEL` to a class instead of a string.** It must be

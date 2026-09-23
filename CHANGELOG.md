@@ -4,6 +4,95 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`boundary.E008` system check** (issue #82, BR-CHK-001). A deployment
+  could turn off either half of boundary's isolation and ship to production
+  with nothing louder than a warning: `boundary.W001` has always warned when
+  `BOUNDARY_STRICT_MODE` is `False`, and `boundary.W009` when
+  `BOUNDARY_SET_DB_SESSION_VAR` is `False` with Row Level Security live, but
+  a Warning fails no gate and stops no deploy. `boundary.E008` reports an
+  **Error**, one per offending setting, when `settings.DEBUG` is `False` and
+  either setting is `False`. With strict mode off, a queryset run with no
+  active tenant returns every tenant's rows instead of raising, a
+  cross-tenant read nothing logs; with the session variable off, nothing
+  writes the value every RLS policy reads, so a deployment carrying live
+  policies has them all evaluating against an empty tenant. Both default to
+  the safe value, so reaching this state takes an explicit opt-out, and
+  `DEBUG` is the discriminator that leaves a developer's local loop alone:
+  turning off strict mode while poking at a shell is legitimate, doing it
+  with `DEBUG = False` is not. The check is settings-only, issuing no query
+  and opening no connection, so unlike `E006`, `W003` and `W009` it is not
+  gated on database vendor or availability and cannot be silently skipped.
+  `W001` and `W009` are unchanged at every `DEBUG` value, so the pairing is a
+  warning in development and an Error in production rather than a
+  replacement. Each Error's hint names the remedy, the fact that the check
+  fires wherever `DEBUG` is `False` including under the test runner, and
+  `SILENCED_SYSTEM_CHECKS` as the reviewed, greppable way to record a
+  deliberate choice.
+
+- **`boundary.models.tenant_unique(*fields, name=None)`** (issue #72,
+  BR-ORM-015). `unique=True` on a field of a tenant-scoped model is enforced
+  across every tenant rather than within one, so two tenants cannot both hold
+  an invoice with reference `INV-001`, and the second one to try gets an
+  `IntegrityError` naming a constraint that mentions neither tenancy nor the
+  other tenant, for a row they cannot see. Boundary offered no affordance for
+  saying what the model author almost always meant.
+  `tenant_unique("reference")` goes in `Meta.constraints` and returns a
+  `UniqueConstraint` whose columns are the model's tenant foreign key
+  followed by the given fields. The tenant field is resolved when Django
+  prepares the model rather than when the `Meta` body runs, so the same call
+  resolves to `("merchant", "reference")` on a model built from
+  `make_tenant_mixin("merchant")` without the author naming the field twice.
+  Without an explicit `name`, the constraint name is derived deterministically
+  from the model and the field list, so two calls on one model cannot collide.
+  A path-scoped model (`make_tenant_path_mixin()`) has no local tenant column
+  to lead a constraint with, so the helper raises when that model class is
+  prepared, naming the model, rather than producing a constraint on a column
+  that does not exist. The `boundary.W010` warning proposed alongside the
+  helper is **not shipped**: BR-ORM-015 made it conditional on a prototype
+  finding more genuine hits than spurious ones, and the prototype recorded on
+  issue #72 found one genuine against twenty spurious, so the ID is reserved
+  and unimplemented. Documented as
+  [Uniqueness within a tenant](docs/how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant),
+  including the migration consequences of converting an existing global
+  constraint.
+
+### Behaviour change for existing consumers
+
+**`boundary.E008` can turn a passing `manage.py check` into a failing one.**
+If you run with `DEBUG = False` and have set either `BOUNDARY_STRICT_MODE` or
+`BOUNDARY_SET_DB_SESSION_VAR` to `False`, this upgrade makes `manage.py
+check` fail, and with it `runserver`, `migrate` and every other management
+command. Nothing about isolation has changed; what changed is that a
+condition that was previously reported as a Warning is now reported as an
+Error. The remedy is either to restore the setting to `True`, or to record
+the deliberate choice by adding `"boundary.E008"` to `SILENCED_SYSTEM_CHECKS`.
+
+**It will most likely reach you through your test suite first, not through
+production.** Django's test runner sets `DEBUG = False` for the duration of a
+run, and `migrate` runs the system checks when it creates the test database.
+If your test settings module sets either flag to `False`, which was a common
+and previously harmless thing to do, your suite now fails at test-database
+creation before a single test runs. Put the `SILENCED_SYSTEM_CHECKS` entry in
+the **test settings module**, the one that disables the flag, not in your
+production settings:
+
+```python
+# myproject/settings/test.py
+BOUNDARY_STRICT_MODE = False
+SILENCED_SYSTEM_CHECKS = ["boundary.E008"]
+```
+
+If only some tests need the flag off, remove the module-level line and use
+`@override_settings(BOUNDARY_STRICT_MODE=False)` on those tests instead; the
+surrounding check run has already happened by then, so per-test overrides
+never trip E008. Silencing the ID in production settings to fix a CI failure
+would hide the production case the check exists for.
+
+`tenant_unique()` changes nothing for an existing consumer: it is a new
+surface, and no existing model gains or loses a constraint.
+
 ## [0.9.0] - 2026-09-21
 
 ### Added
