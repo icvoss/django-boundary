@@ -48,8 +48,7 @@ hold the tenant model) and `bookings` (which will hold tenant-scoped data).
 
 ## Step 2: Point Django at PostgreSQL and register the apps
 
-Open `config/settings.py`. Replace the default SQLite `DATABASES` block with a
-PostgreSQL connection, and add the three apps plus `boundary` to
+Open `config/settings.py` and add the two apps plus `boundary` to
 `INSTALLED_APPS`.
 
 ```python
@@ -65,23 +64,46 @@ INSTALLED_APPS = [
     "clubs",
     "bookings",
 ]
+```
 
+Now create the database and the role the app will connect as. Do not use the
+`postgres` superuser here. PostgreSQL exempts superusers from every Row Level
+Security policy, including tables under `FORCE ROW LEVEL SECURITY`, so an app
+connected as one gets the policies you add in Step 10 and none of their
+enforcement. Creating the right role now is cheaper than discovering that
+later.
+
+Run these once, as `postgres`:
+
+```bash
+createdb courts
+psql -d courts -c "CREATE ROLE courts_app LOGIN PASSWORD 'courts_dev' NOSUPERUSER NOBYPASSRLS;"
+psql -d courts -c "GRANT CONNECT ON DATABASE courts TO courts_app;"
+psql -d courts -c "GRANT USAGE, CREATE ON SCHEMA public TO courts_app;"
+```
+
+`NOSUPERUSER NOBYPASSRLS` is the whole point: it is what makes the policies
+apply to this connection. The two grants are what this one role needs to run
+both `migrate` and the app itself, which is the simplest arrangement and the
+one this tutorial uses. For what each grant is for, why ownership of the
+tables matters in Step 10, and how production deployments usually split this
+into separate migrating and runtime roles, see
+[Grants for the role that migrates](../how-to/add-rls-policies-with-migrations.md#grants-for-the-role-that-migrates).
+
+Point Django at that role:
+
+```python
+# config/settings.py
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": "courts",
-        "USER": "postgres",
-        "PASSWORD": "postgres",
+        "USER": "courts_app",
+        "PASSWORD": "courts_dev",
         "HOST": "localhost",
         "PORT": "5432",
     }
 }
-```
-
-Create the database if it does not already exist:
-
-```bash
-createdb courts
 ```
 
 **Checkpoint:** `python manage.py check` runs. You will see boundary system
@@ -166,9 +188,11 @@ MIDDLEWARE = [
 ]
 ```
 
-**Checkpoint:** `python manage.py check` passes with no boundary errors. If
-you see `boundary.E006` errors about missing Row Level Security, ignore them
-for now: we have not created any tenant-scoped tables yet.
+**Checkpoint:** `python manage.py check` passes with no boundary errors.
+`boundary.E006` reports a tenant-scoped table that does not have Row Level
+Security enabled and forced; no tenant-scoped table exists yet, so it has
+nothing to report, and Step 10 turns RLS on for the table you are about to
+create.
 
 ## Step 6: Create a tenant-scoped model
 
@@ -318,6 +342,72 @@ print("All bookings, all clubs:", Booking.unscoped.count())   # -> 3
 
 You should see `3`. Exit the shell with `exit()`.
 
+## Step 10: Turn on Row Level Security
+
+Everything so far is the ORM layer. It filters queries that go through the
+tenant manager, and nothing else: raw SQL, a `.extra()` call, a third-party
+package writing its own queries, or a bug in boundary itself all bypass it.
+Row Level Security is the second layer, enforced by PostgreSQL on every
+statement regardless of what issued it. Add it now, while the app is still
+small.
+
+Boundary does not generate this migration for you. Write it by hand, in the
+app that owns the tenant-scoped model. Here that is `bookings`, and `Booking`
+is the only tenant-scoped model the tutorial has created.
+
+```bash
+python manage.py makemigrations bookings --empty --name rls
+```
+
+Open the file Django just created in `bookings/migrations/` and set its
+`operations` list to the two boundary operations. `EnableRLS` must come
+first, and both must run after the table and its tenant column exist, which
+the `dependencies` entry guarantees.
+
+```python
+# bookings/migrations/0002_rls.py
+from django.db import migrations
+
+from boundary.migrations_ops import CreateTenantPolicy, EnableRLS
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("bookings", "0001_initial"),
+    ]
+
+    operations = [
+        EnableRLS("Booking"),
+        CreateTenantPolicy("Booking"),
+    ]
+```
+
+The argument is the bare model name, `"Booking"`, not the app label and not a
+dotted path. Apply it:
+
+```bash
+python manage.py migrate bookings
+```
+
+**Checkpoint:** `python manage.py check` reports no `boundary.E006`. That
+check inspects each tenant-scoped table in PostgreSQL and reports one when
+the table does not have Row Level Security enabled and forced, so its silence
+here is a positive result: `bookings_booking` now carries RLS. Because the app
+role you created in Step 2 is `NOSUPERUSER NOBYPASSRLS`, those policies
+enforce for it rather than being quietly exempted, and `boundary.W003` is the
+check that reports a connecting role which bypasses RLS, so its silence here
+is the second half of the result.
+
+One caveat on database support. Row Level Security is PostgreSQL-only, and
+these operations refuse anywhere else: on a non-PostgreSQL alias `EnableRLS`
+and `CreateTenantPolicy` raise an error naming the backend vendor rather than
+part-applying their DDL. `boundary.E006` and `boundary.W003` are silent on
+those backends by design, so a clean check there tells you nothing about the
+database layer. If you have an alias that is not PostgreSQL, keep it off this
+migration's graph with a database router's `allow_migrate()`; otherwise run
+the tutorial on PostgreSQL, as Step 2 does, and you get the second layer for
+real.
+
 ## You did it
 
 You now have a working multi-tenant Django app:
@@ -327,6 +417,12 @@ You now have a working multi-tenant Django app:
 - Middleware that resolves the tenant per request.
 - Two tenants whose data is isolated at the ORM layer, with strict mode
   catching unscoped queries.
+
+If you ran Step 10 against PostgreSQL, that isolation now rests on **two
+layers**: the ORM manager, and RLS policies the database applies to every
+statement. If you skipped Step 10, or ran the tutorial on a database other
+than PostgreSQL, you have **one layer**: the ORM. That is enough to build on,
+and it is not enough for production.
 
 ## Where to go next
 
@@ -346,8 +442,9 @@ Now that the basics work, layer in the production concerns:
   tenant's data to a geographically distinct database for residency
   compliance.
 
-For database-level enforcement (Row Level Security), the full settings table,
-and the complete API surface, see the
-[README](../../README.md). RLS is the second layer of defence that catches
-raw SQL and ORM bugs the application layer might miss; add it before going to
-production.
+For the full treatment of the RLS step you just ran, including the operation
+reference, the non-superuser role requirement, a custom tenant column, and how
+to verify the policies from `psql`, see
+[Add RLS policies with migrations](../how-to/add-rls-policies-with-migrations.md).
+For the full settings table and the complete API surface, see the
+[README](../../README.md).

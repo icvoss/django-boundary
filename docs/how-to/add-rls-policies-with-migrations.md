@@ -11,6 +11,7 @@ The ORM layer (the tenant manager and middleware) works on any database. RLS enf
 - A model that is already tenant-scoped (it has a tenant foreign key, the column is `tenant_id` by default). See the [README](../../README.md) for how models acquire the tenant FK.
 - `BOUNDARY_TENANT_MODEL` configured in settings.
 - PostgreSQL 14+. On any other database, do not add these operations: they emit PostgreSQL-specific DDL.
+- A migrating role that owns the tables and can create in the schema, and a non-superuser application role. See [Grants for the role that migrates](#grants-for-the-role-that-migrates).
 - The migration that creates the table (or adds the tenant FK column) already exists, or is created in the same file before the RLS operations.
 
 ## Steps
@@ -100,6 +101,27 @@ The policies read two PostgreSQL session variables at query time:
 
 PostgreSQL superusers bypass RLS even with `FORCE ROW LEVEL SECURITY`. Run your application on a **non-superuser** database role so the policies actually apply. Verify enforcement using that role, not a superuser connection.
 
+### Grants for the role that migrates
+
+The note above rules out a superuser, which raises the question it does not answer: what does a non-superuser role need in order to apply these operations at all? Three things.
+
+| Needed | Why |
+| --- | --- |
+| `CONNECT` on the database | To connect at all. |
+| `USAGE` and `CREATE` on the schema | `CREATE` is the privilege PostgreSQL requires to create an object in a schema. `CreateTenantPolicy` emits `CREATE OR REPLACE FUNCTION boundary_current_tenant_id()` unqualified, so it lands in the first schema on the role's `search_path`, and the role must be able to create there. `CREATE` is also what lets `migrate` create the tables themselves when the same role runs the whole migration. |
+| Ownership of each table the operations touch | `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY` and `CREATE POLICY` are owner-restricted: PostgreSQL permits them to the table's owner (or a superuser), and no grantable privilege substitutes. A role that created the table is its owner, so a role that runs the whole migration satisfies this automatically. |
+
+Everything in that table is PostgreSQL's documented privilege model, checked against the statements these operations actually emit (`boundary/migrations_ops.py`). Granting `CREATE` on the schema does **not** confer ownership of tables someone else created: if another role owns the tables, `EnableRLS` fails on ownership no matter what schema privileges the migrating role holds. Transfer ownership (`ALTER TABLE ... OWNER TO`) or run the policy migration as the owner.
+
+On **PostgreSQL 15 and later the grant must be explicit**, because 15 removed the default `CREATE` that the `public` schema previously granted to `PUBLIC`. On 14 the grant is redundant but harmless, so writing it unconditionally is correct across every version this package supports:
+
+```sql
+GRANT CONNECT ON DATABASE myproject TO myproject_app;
+GRANT USAGE, CREATE ON SCHEMA public TO myproject_app;
+```
+
+One role that both migrates and serves traffic is the simplest arrangement and the one the [tutorial](../tutorial/first-multi-tenant-app.md) uses, since it is enough to get both isolation layers working. Production deployments commonly split it: a migrating role that owns the schema and its tables, and a narrower runtime role that only reads and writes. Both must be non-superuser and non-`BYPASSRLS`; ownership matters for the migrating role, and RLS enforcement matters for both.
+
 ## Verify it worked
 
 1. Confirm RLS is enabled and forced on the table:
@@ -161,6 +183,7 @@ Use `DropTenantPolicy` when you want to remove the policies but keep RLS enabled
 - **`only superuser can define a leakproof function` on managed Postgres.** `LEAKPROOF` may only be declared by a superuser, which DigitalOcean, RDS, Cloud SQL, Azure, Heroku, and Supabase do not grant. This is off by default (`BOUNDARY_FUNCTION_LEAKPROOF = False`), so managed Postgres works out of the box; the optimisation only affects planner qualifier ordering, not isolation. Set `BOUNDARY_FUNCTION_LEAKPROOF = True` only on a self-managed cluster where the migrating role is a superuser.
 - **Changing `BOUNDARY_DB_SESSION_VAR` or `BOUNDARY_ADMIN_FLAG_VAR` after the policies exist.** The names are baked into the policy SQL at migration time. If you change either setting later, re-run the policy migration so the database picks up the new name, otherwise the runtime variable and the policy disagree and isolation breaks.
 - **Querying outside a transaction.** `set_config(..., true)` is transaction-scoped. Outside a transaction the tenant variable is not applied, so a non-superuser sees zero rows. `TenantMiddleware` and `TenantContext.using()` (which underlies `tenant_scoped`, `boundary_run`, `boundary_run_all`, and the Celery worker restoration) both open a transaction for you automatically when `BOUNDARY_WRAP_ATOMIC` is `True` (the default) and none is already active, so this normally cannot happen through boundary's own APIs. It remains a risk if you call `_set_db_session()` directly, disable `BOUNDARY_WRAP_ATOMIC`, or run raw SQL outside any of boundary's context helpers, in which case wrap the work in `transaction.atomic()` yourself.
+- **A migrating role that does not own the tables.** `EnableRLS` and `CreateTenantPolicy` emit owner-restricted statements, so they fail for a role holding every grantable privilege on a table it does not own. See [Grants for the role that migrates](#grants-for-the-role-that-migrates).
 - **Wrong `model_name`.** Pass the bare model name (`"Booking"`), not the app label or a dotted path. The wrong name raises a lookup error during migration.
 - **Forgetting the `_id` suffix in `tenant_column`.** The argument is the database column name; for a foreign key that is `tenant_id`, `org_id`, and so on, not `tenant` or `org`.
 - **Wrong ordering.** `CreateTenantPolicy` after `EnableRLS`, and both after the table and tenant FK column exist. Reorder or add a `dependencies` entry if the column is added in a later migration.
