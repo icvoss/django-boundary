@@ -2,13 +2,40 @@
 
 These operations are included in auto-generated migrations for TenantModel
 subclasses, or can be added manually by developers.
+
+**Backend behaviour** (BR-RLS-021; icvoss/django-boundary#86, ruled
+2026-09-23). Every operation applies two gates, in this order:
+
+1. **The router.** ``router.allow_migrate_model(alias, model)`` for the model
+   it resolved. A denial returns without DDL and without logging: an alias a
+   consumer's router keeps off this graph receives nothing at all.
+2. **The vendor.** Only once the router has admitted the model.
+
+What gate 2 does differs between the column-bearing operations and adoption,
+and the difference is the isolation consequence rather than a taste:
+
+- :class:`EnableRLS`, :class:`CreateTenantPolicy` and
+  :class:`DropTenantPolicy` are a **logged no-op** off PostgreSQL. They act on
+  a model that carries boundary's managers, so it keeps its ORM-layer tenant
+  filtering on SQLite; skipping the policy leaves the model scoped, which is
+  what BR-ENV-002 promises for that backend. The practical point: the same
+  migration file runs unchanged on a SQLite development database and a
+  PostgreSQL production one, with no backend conditional in the consumer's
+  migration.
+- :class:`AdoptTenantApp` still **refuses** off PostgreSQL, with
+  :class:`~boundary.exceptions.AdoptionRefusedError`. An adopted table has no
+  ORM layer beneath the policy, so a silent skip would leave it with no
+  isolation at all rather than reduced isolation.
 """
 
+import logging
 from dataclasses import dataclass
 
 from django.db import migrations
 
 from boundary.conf import boundary_settings
+
+logger = logging.getLogger("boundary.migrations")
 
 
 def _sql_string_literal(value: str) -> str:
@@ -226,37 +253,67 @@ def _router_allows(schema_editor, model) -> bool:
     return router.allow_migrate_model(schema_editor.connection.alias, model)
 
 
-def _require_postgresql(schema_editor, operation: str, model) -> None:
-    """Refuse a non-PostgreSQL connection the router did admit (BR-RLS-021 gate 2).
+def _postgresql_or_logged_noop(schema_editor, operation: str, model) -> bool:
+    """Whether to proceed, logging a no-op off PostgreSQL (BR-RLS-021 gate 2).
 
-    Raises :class:`~boundary.exceptions.RLSOperationRefusedError` naming
-    *operation*, the alias and the observed vendor, before any statement
-    runs. *operation* is the class name of the operation raising, so a
-    consumer reading the traceback is told which of the three refused rather
-    than being told about adoption, which is a different operation raising a
-    different exception.
+    Returns ``True`` on PostgreSQL, so the caller emits its DDL. On any other
+    vendor it emits ONE ``logger.info`` line naming the operation,
+    ``app_label.ModelName``, the alias and the observed vendor, and returns
+    ``False`` so the caller returns without issuing a statement.
 
-    Only PostgreSQL has Row Level Security. On SQLite or MySQL the generated
-    ``ENABLE ROW LEVEL SECURITY`` and ``CREATE POLICY`` statements are a
-    syntax error, so the migration fails either way and what differs is the
-    message: the backend's own parser error names a fragment of generated SQL
-    and leaves the consumer to infer that this layer is PostgreSQL-only.
+    **A logged no-op, not a refusal** (icvoss/django-boundary#86, ruled
+    2026-09-23). Until that ruling this raised an RLS-operation-refused error,
+    on the reasoning that a consumer who wrote ``EnableRLS`` and pointed it at
+    SQLite had asked for something the backend cannot do. The reality test
+    overturned it: a consumer runs SQLite locally and PostgreSQL in
+    production from the SAME migration files, so a refusal forces every one of
+    them to hand-wrap the RLS migration in a backend conditional. Both the
+    ADR-027 smoke consumer and the icvlocal.com rehearsal had to do exactly
+    that, and the refusal's own message advised a router that cannot work for
+    a model in the consumer's own app: the router gate is asked about the
+    resolved model, which is the same ``allow_migrate_model`` question
+    Django's ``CreateModel`` asks, so denying that app denies its table too.
+
+    Why a skip is safe HERE and not for adoption. These three operations act
+    on a column-bearing model, which keeps its ORM-layer filtering on every
+    backend, so a skipped policy leaves the model scoped by its manager, which
+    is precisely what BR-ENV-002 promises on SQLite. An adopted table
+    (BR-RLS-015) has no ORM layer beneath the policy, so skipping there would
+    leave it with no isolation at all; that is why
+    :meth:`AdoptTenantApp._require_postgresql` still refuses and this does
+    not. ``boundary.E006`` already returns quietly on SQLite on the same
+    reasoning.
+
+    Info, not warning: on the backend a consumer deliberately develops
+    against, this is the designed outcome rather than a problem to flag, and a
+    warning on every migrate would train them to ignore it. One line per
+    operation, so a migration carrying ``EnableRLS`` and
+    ``CreateTenantPolicy`` says so twice and the consumer can see which parts
+    of the layer were skipped.
 
     Reached only after :func:`_router_allows` has admitted the model, so an
-    alias the router denies is never asked about its vendor at all.
+    alias the router denies is never asked about its vendor and logs nothing:
+    a router denial is a deliberate per-alias exclusion, and narrating it
+    would be noise about a decision the consumer already made explicitly.
     """
-    from boundary.exceptions import RLSOperationRefusedError
-
     vendor = schema_editor.connection.vendor
     if vendor == "postgresql":
-        return
-    raise RLSOperationRefusedError(
-        f"{operation} cannot run against model '{model._meta.label}' on database alias "
-        f"'{schema_editor.connection.alias}': its backend vendor is '{vendor}', and this "
-        f"operation emits PostgreSQL Row Level Security, which no other backend has. Keep "
-        f"this alias off the operation's graph with a router's allow_migrate(), or run the "
-        f"migration against PostgreSQL."
+        return True
+    logger.info(
+        "Skipping %s on %s: alias %r has vendor %r, which has no Row Level Security. "
+        "The model keeps its ORM-layer tenant filtering; the RLS layer applies on PostgreSQL.",
+        operation,
+        model._meta.label,
+        schema_editor.connection.alias,
+        vendor,
+        extra={
+            "operation": operation,
+            "model": model._meta.label,
+            "using": schema_editor.connection.alias,
+            "vendor": vendor,
+        },
     )
+    return False
 
 
 class EnableRLS(migrations.operations.base.Operation):
@@ -270,6 +327,15 @@ class EnableRLS(migrations.operations.base.Operation):
     ``MIGRATION_MODULES``. It is omitted from ``deconstruct()`` when unset,
     so every migration written before the keyword existed serialises
     byte-identically to what it serialised before.
+
+    **Backends.** Applies on PostgreSQL. On any other backend it is a logged
+    no-op: one ``logger.info`` line on ``boundary.migrations`` naming this
+    operation, the model, the alias and the vendor, and no DDL (BR-RLS-021,
+    icvoss/django-boundary#86). The same migration file therefore runs
+    unchanged against a SQLite development database and a PostgreSQL
+    production one, with no backend conditional in the migration. The model
+    keeps its ORM-layer tenant filtering on SQLite either way; it is the RLS
+    layer, and only that, which is absent there.
     """
 
     reduces_to_sql = True
@@ -285,12 +351,13 @@ class EnableRLS(migrations.operations.base.Operation):
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         model = to_state.apps.get_model(self.app_label or app_label, self.model_name)
         # The two gates, in BR-RLS-021's order: the router first, whose denial
-        # is a silent per-alias skip, then the vendor, whose mismatch on an
-        # alias the router admitted is named rather than left to the backend's
-        # parser. Both run before any statement is issued.
+        # is a silent per-alias skip, then the vendor, which on a non-
+        # PostgreSQL alias the router admitted logs one line and skips (#86).
+        # Both run before any statement is issued.
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "EnableRLS", model)
+        if not _postgresql_or_logged_noop(schema_editor, "EnableRLS", model):
+            return
 
         table = model._meta.db_table
         schema_editor.execute(f'ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY')
@@ -298,12 +365,14 @@ class EnableRLS(migrations.operations.base.Operation):
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
-        # Both gates apply on reverse too. A guard on the forward alone would
-        # let the reverse disable RLS on an alias the router keeps off this
-        # graph, which never had it enabled there in the first place.
+        # Both gates apply on reverse too. A gate on the forward alone would
+        # let the reverse try to undo an RLS layer that was never applied on
+        # this alias, either because the router keeps it off this graph or
+        # because the backend has no Row Level Security to undo.
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "EnableRLS", model)
+        if not _postgresql_or_logged_noop(schema_editor, "EnableRLS", model):
+            return
 
         table = model._meta.db_table
         # Drop all boundary policies first
@@ -345,6 +414,15 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
     ``app_label`` overrides the app the model is resolved from (BR-RLS-019),
     and is omitted from ``deconstruct()`` when unset so pre-existing
     migrations serialise byte-identically.
+
+    **Backends.** Applies on PostgreSQL. On any other backend it is a logged
+    no-op: one ``logger.info`` line on ``boundary.migrations`` naming this
+    operation, the model, the alias and the vendor, and no DDL (BR-RLS-021,
+    icvoss/django-boundary#86). The same migration file therefore runs
+    unchanged against a SQLite development database and a PostgreSQL
+    production one, with no backend conditional in the migration. The model
+    keeps its ORM-layer tenant filtering on SQLite either way; it is the RLS
+    layer, and only that, which is absent there.
     """
 
     reduces_to_sql = True
@@ -365,7 +443,8 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
         # nothing from the model either.
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "CreateTenantPolicy", model)
+        if not _postgresql_or_logged_noop(schema_editor, "CreateTenantPolicy", model):
+            return
 
         table = model._meta.db_table
 
@@ -388,7 +467,8 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
         model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "CreateTenantPolicy", model)
+        if not _postgresql_or_logged_noop(schema_editor, "CreateTenantPolicy", model):
+            return
 
         table = model._meta.db_table
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_tenant_isolation ON "{table}"')
@@ -424,6 +504,15 @@ class DropTenantPolicy(migrations.operations.base.Operation):
     ``app_label`` overrides the app the model is resolved from (BR-RLS-019),
     and is omitted from ``deconstruct()`` when unset so pre-existing
     migrations serialise byte-identically.
+
+    **Backends.** Applies on PostgreSQL. On any other backend it is a logged
+    no-op: one ``logger.info`` line on ``boundary.migrations`` naming this
+    operation, the model, the alias and the vendor, and no DDL (BR-RLS-021,
+    icvoss/django-boundary#86). The same migration file therefore runs
+    unchanged against a SQLite development database and a PostgreSQL
+    production one, with no backend conditional in the migration. The model
+    keeps its ORM-layer tenant filtering on SQLite either way; it is the RLS
+    layer, and only that, which is absent there.
     """
 
     reduces_to_sql = True
@@ -441,7 +530,8 @@ class DropTenantPolicy(migrations.operations.base.Operation):
         model = to_state.apps.get_model(self.app_label or app_label, self.model_name)
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "DropTenantPolicy", model)
+        if not _postgresql_or_logged_noop(schema_editor, "DropTenantPolicy", model):
+            return
 
         table = model._meta.db_table
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_tenant_isolation ON "{table}"')
@@ -453,11 +543,13 @@ class DropTenantPolicy(migrations.operations.base.Operation):
         #
         # Gated here as well as inside the delegate, and deliberately so. The
         # delegate carries its own copy of both gates, but it reports them as
-        # CreateTenantPolicy, and a consumer reversing DropTenantPolicy on a
-        # non-PostgreSQL alias must be told which operation in their migration
-        # refused. Gating first means the refusal names DropTenantPolicy and
-        # the delegate is never reached; the router half is idempotent, so
-        # asking twice on an admitted alias changes nothing.
+        # CreateTenantPolicy, and a consumer reading the log after reversing
+        # DropTenantPolicy on a non-PostgreSQL alias should see the operation
+        # their migration actually names. Gating first means the skip line
+        # names DropTenantPolicy and the delegate is never reached, so exactly
+        # one line is logged rather than two naming different operations; the
+        # router half is idempotent, so asking twice on an admitted alias
+        # changes nothing.
         #
         # Resolved from ``from_state`` here, which is the state a reverse
         # reads (BR-RLS-019) and what the other five gated methods use in
@@ -468,7 +560,8 @@ class DropTenantPolicy(migrations.operations.base.Operation):
         model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
         if not _router_allows(schema_editor, model):
             return
-        _require_postgresql(schema_editor, "DropTenantPolicy", model)
+        if not _postgresql_or_logged_noop(schema_editor, "DropTenantPolicy", model):
+            return
 
         create_op = CreateTenantPolicy(self.model_name, self.tenant_column, app_label=self.app_label)
         create_op.database_forwards(app_label, schema_editor, from_state, to_state)

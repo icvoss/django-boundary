@@ -81,35 +81,3 @@ class AdoptionRefusedError(BoundaryError):
     decide between excluding that model, splitting the operation, or
     supplying a backfill tenant.
     """
-
-
-class RLSOperationRefusedError(BoundaryError):
-    """An RLS migration operation refused to run, naming itself and the reason.
-
-    Raised by :class:`~boundary.migrations_ops.EnableRLS`,
-    :class:`~boundary.migrations_ops.CreateTenantPolicy` and
-    :class:`~boundary.migrations_ops.DropTenantPolicy` when the database
-    router admitted an alias whose backend is not PostgreSQL (BR-RLS-021
-    gate 2).
-
-    A sibling of :class:`AdoptionRefusedError` in behaviour, deliberately not
-    a reuse of it. The two operations fail for the same underlying reason and
-    on the same terms, but a consumer reading a traceback from ``EnableRLS``
-    must not be told about app adoption, which is a different operation they
-    may not have written into any migration at all. The message always names
-    the operation that raised it, the alias, and the vendor observed, so the
-    refusal identifies its own source without the consumer reading the
-    package to work out which operation adoption refers to.
-
-    Refusing rather than proceeding is the whole point: on SQLite or MySQL the
-    generated ``ALTER TABLE ... ENABLE ROW LEVEL SECURITY`` and
-    ``CREATE POLICY`` statements are a syntax error, so the migration fails
-    either way and only the message differs. The backend's own parser error
-    names a fragment of generated SQL and leaves the consumer to infer that
-    the RLS layer is PostgreSQL-only; this names it.
-
-    Not raised for a router denial. An alias a consumer's router keeps off
-    the operation's graph is a legitimate per-alias skip and returns silently
-    (BR-RLS-021 gate 1), because that router is the documented remedy this
-    exception's own message points at and so cannot itself raise.
-    """
