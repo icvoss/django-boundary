@@ -517,6 +517,7 @@ class TestW003RlsBypassableRole:
     catch, not an artefact to work around.
     """
 
+    @pytest.mark.rls
     def test_w003_fires_for_the_default_test_connection(self, settings):
         """The stock test-suite connection (icv_test) is bootstrap-superuser
         by default in the CI postgres:16 service and in a typical local
@@ -526,6 +527,7 @@ class TestW003RlsBypassableRole:
         w003 = [e for e in errors if e.id == "boundary.W003"]
         assert w003, "expected boundary.W003 to fire against the default (superuser) test connection"
 
+    @pytest.mark.rls
     def test_w003_message_names_consequence_remedy_and_escape_hatch(self, settings):
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         errors = check_boundary_configuration(None)
@@ -539,6 +541,7 @@ class TestW003RlsBypassableRole:
         assert "SILENCED_SYSTEM_CHECKS" in w003.msg
         assert "boundary.W003" in w003.msg
 
+    @pytest.mark.rls
     def test_w003_absent_for_a_non_bypassing_role(self, settings):
         """Proven silent: a plain NOSUPERUSER NOBYPASSRLS role must not warn."""
         import psycopg
@@ -581,6 +584,7 @@ class TestW003RlsBypassableRole:
         assert _check_rls_bypassable() == []
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestW003ReproducesTheConsumerProof:
     """Issue #21: reproduce Magmify's raw proof that FORCE ROW LEVEL SECURITY
@@ -633,6 +637,7 @@ class TestW003ReproducesTheConsumerProof:
                 cursor.execute(f'ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY')
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006SkipsPathScopedModels:
     """Issue #14: _check_rls_enabled() must not flag path-scoped models.
@@ -689,6 +694,7 @@ def _remove_rls_from_booking():
         EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006FiresOnMissingRls:
     """Issue #34: boundary.E006 must be proven to actually fire.
@@ -760,6 +766,7 @@ class TestE006FiresOnMissingRls:
             _remove_rls_from_booking()
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestE006CannotDetermineRlsState:
     """Issue #34: E006's exception handling must not fail open.
@@ -867,6 +874,7 @@ class TestE006CannotDetermineRlsState:
         assert errors == []
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestE006QualifiesTableLookupByOid:
     """Issue #34: the pg_class lookup must resolve the model's real table,
@@ -970,6 +978,7 @@ class TestE006QualifiesTableLookupByOid:
         assert resolved is None
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestW009SetDbSessionVarDisabledWithRlsEnabled:
     """Issue #53: boundary.W009 fires only for the opt-out-plus-RLS-enabled
@@ -1038,3 +1047,199 @@ class TestW009SetDbSessionVarDisabledWithRlsEnabled:
             )
         finally:
             _remove_rls_from_booking()
+
+
+class TestE008ProductionPosture:
+    """AC-CTX-012 (BR-CHK-001, issue #82): boundary.E008 refuses an unsafe
+    production posture.
+
+    Every test that calls ``_check_production_posture()`` directly runs with
+    no ``django_db`` marker, deliberately. E008 is settings-only: it reads
+    ``settings`` and issues no query, so a test that needed the database to
+    reach E008 would mean the check had grown a connection it must not have.
+    The two tests that drive the full check pipeline through a management
+    command are marked, because the pipeline's other checks (E006, W003, W009)
+    do touch the database.
+    """
+
+    def test_e008_fires_for_strict_mode_false_with_debug_false(self, settings):
+        from boundary.checks import _check_production_posture
+
+        settings.DEBUG = False
+        settings.BOUNDARY_STRICT_MODE = False
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+
+        errors = _check_production_posture()
+
+        assert len(errors) == 1, f"expected exactly one E008; got {[e.msg for e in errors]}"
+        assert errors[0].id == "boundary.E008"
+        assert "BOUNDARY_STRICT_MODE" in errors[0].msg
+        assert "BOUNDARY_SET_DB_SESSION_VAR" not in errors[0].msg, (
+            "the Error must name only the setting that tripped it"
+        )
+        assert "BOUNDARY_STRICT_MODE = True" in errors[0].hint
+        assert "SILENCED_SYSTEM_CHECKS" in errors[0].hint
+
+    def test_e008_fires_for_session_var_false_with_debug_false(self, settings):
+        from boundary.checks import _check_production_posture
+
+        settings.DEBUG = False
+        settings.BOUNDARY_STRICT_MODE = True
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        errors = _check_production_posture()
+
+        assert len(errors) == 1, f"expected exactly one E008; got {[e.msg for e in errors]}"
+        assert errors[0].id == "boundary.E008"
+        assert "BOUNDARY_SET_DB_SESSION_VAR" in errors[0].msg
+        assert "BOUNDARY_STRICT_MODE" not in errors[0].msg
+
+    def test_e008_reports_one_error_per_offending_setting(self, settings):
+        from boundary.checks import _check_production_posture
+
+        settings.DEBUG = False
+        settings.BOUNDARY_STRICT_MODE = False
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        errors = [e for e in _check_production_posture() if e.id == "boundary.E008"]
+
+        assert len(errors) == 2, f"expected two E008 Errors, one per setting; got {[e.msg for e in errors]}"
+        named = sorted(
+            "BOUNDARY_STRICT_MODE" if "BOUNDARY_STRICT_MODE" in e.msg else "BOUNDARY_SET_DB_SESSION_VAR" for e in errors
+        )
+        assert named == ["BOUNDARY_SET_DB_SESSION_VAR", "BOUNDARY_STRICT_MODE"]
+
+    def test_e008_silent_with_debug_true_while_w001_still_fires(self, settings):
+        """The pairing: a warning in development, an Error in production.
+        Positive control on the same settings that produce two Errors above,
+        so a check that had stopped firing entirely could not pass this."""
+        from boundary.checks import _check_production_posture, _check_strict_mode
+
+        settings.DEBUG = True
+        settings.BOUNDARY_STRICT_MODE = False
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+
+        assert not any(e.id == "boundary.E008" for e in _check_production_posture())
+        assert any(e.id == "boundary.W001" for e in _check_strict_mode()), (
+            "W001 must be unchanged at DEBUG = True (BR-CHK-001)"
+        )
+
+    def test_e008_silent_at_the_safe_defaults_with_debug_false(self, settings):
+        """The control: DEBUG = False is not itself the offence."""
+        from boundary.checks import _check_production_posture
+
+        settings.DEBUG = False
+        settings.BOUNDARY_STRICT_MODE = True
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+
+        assert _check_production_posture() == []
+
+    def test_e008_issues_no_query_with_an_unreachable_database(self, settings):
+        """AC-CTX-012's no-database half. The default alias is pointed at an
+        unreachable host; a settings-only check returns the same single Error
+        with no OperationalError escaping and no boundary.W007, which is what
+        every database-touching check in this module degrades to."""
+        from boundary.checks import _check_production_posture
+
+        settings.DEBUG = False
+        settings.BOUNDARY_STRICT_MODE = False
+        settings.BOUNDARY_SET_DB_SESSION_VAR = True
+        settings.DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": "boundary_unreachable",
+                "HOST": "203.0.113.1",
+                "PORT": "1",
+                "USER": "nobody",
+                "PASSWORD": "nobody",
+            }
+        }
+
+        errors = _check_production_posture()
+
+        assert [e.id for e in errors] == ["boundary.E008"]
+        assert not any(e.id == "boundary.W007" for e in errors)
+
+    @pytest.mark.django_db
+    def test_e008_silenced_by_id_reports_nothing_through_call_command(self, settings):
+        """SILENCED_SYSTEM_CHECKS is the documented, greppable escape hatch,
+        so it must work through the real check pipeline, not just the private
+        function. call_command('check') exits without raising."""
+        from django.core.management import call_command
+
+        settings.DEBUG = False
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_STRICT_MODE = False
+        settings.BOUNDARY_SET_DB_SESSION_VAR = False
+        # E004 and E006 are silenced alongside it because tests/settings.py
+        # deliberately sets no MIDDLEWARE (so E004 always fires) and the test
+        # app ships no migrations, so its tables are created by run_syncdb
+        # without RLS (so E006 always fires). Neither is what this test is
+        # about, and leaving them live would make call_command("check") raise
+        # whatever E008 did, so the silence of E008 would prove nothing.
+        settings.SILENCED_SYSTEM_CHECKS = ["boundary.E008", "boundary.E004", "boundary.E006"]
+
+        call_command("check")
+
+    @pytest.mark.django_db
+    def test_e008_fires_through_the_migrate_path_at_the_test_runner_debug_value(self, settings):
+        """AC-CTX-012's test-runner half. Shaped as a consumer's test settings
+        are: BOUNDARY_STRICT_MODE = False and DEBUG left at the False value the
+        test runner already set, never assigned here. The checks run the way
+        test-database creation runs them, through `migrate` rather than
+        `call_command("check")`: BaseCommand.execute() runs the system checks
+        before handle(), so SystemCheckError is raised and no migration
+        touches the database.
+        """
+        from django.core.management import call_command
+        from django.core.management.base import SystemCheckError
+
+        assert settings.DEBUG is False, (
+            "the test runner is expected to have set DEBUG False; this test asserts "
+            "the check fires at that value without setting it"
+        )
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_STRICT_MODE = False
+        # The ambient errors this suite's settings always produce, silenced for
+        # the same reason as the test above: E008 must be the error that raises
+        # here, not one of E004/E006 raising while E008 goes unchecked.
+        settings.SILENCED_SYSTEM_CHECKS = ["boundary.E004", "boundary.E006"]
+
+        # skip_checks=False explicitly: call_command() defaults it to True
+        # (django/core/management/__init__.py), so a plain call_command("migrate")
+        # runs NO system checks and this test would pass vacuously by never
+        # reaching the check pipeline it exists to exercise. Real test-database
+        # creation reaches BaseCommand.execute() through the argv path, where
+        # the default is the opposite.
+        with pytest.raises(SystemCheckError) as excinfo:
+            call_command("migrate", run_syncdb=False, verbosity=0, skip_checks=False)
+
+        message = str(excinfo.value)
+        assert "boundary.E008" in message
+        assert "BOUNDARY_STRICT_MODE" in message
+        assert "including under the test runner, where DEBUG is False" in message, (
+            f"the hint must name the test-runner case in those terms (BR-CHK-001); got {message}"
+        )
+        assert "SILENCED_SYSTEM_CHECKS" in message
+
+    def test_boundary_own_test_settings_do_not_trip_e008(self):
+        """BR-CHK-001: boundary's own suite needs no SILENCED_SYSTEM_CHECKS
+        entry because tests/settings.py sets BOUNDARY_STRICT_MODE = True and
+        leaves BOUNDARY_SET_DB_SESSION_VAR at its True default. Asserted
+        against the settings module directly rather than against the live
+        settings object, which other tests in this file mutate, so a future
+        change to either line fails this test rather than the whole suite's
+        database creation.
+        """
+        import settings as test_settings
+
+        assert getattr(test_settings, "BOUNDARY_STRICT_MODE", True) is True, (
+            "tests/settings.py must not set BOUNDARY_STRICT_MODE = False without "
+            "adding 'boundary.E008' to SILENCED_SYSTEM_CHECKS in the same change "
+            "(BR-CHK-001); the suite would otherwise fail test-database creation"
+        )
+        assert getattr(test_settings, "BOUNDARY_SET_DB_SESSION_VAR", True) is True, (
+            "tests/settings.py must not set BOUNDARY_SET_DB_SESSION_VAR = False "
+            "without adding 'boundary.E008' to SILENCED_SYSTEM_CHECKS in the same "
+            "change (BR-CHK-001)"
+        )

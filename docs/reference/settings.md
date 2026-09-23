@@ -88,7 +88,7 @@ When `True`, any queryset evaluated against a `TenantModel` without an active te
 
 **Trade-off:** Disabling strict mode means unscoped queries return all rows filtered only by the ORM -- if the ORM layer is the only enforcement in place (i.e. RLS is not enabled), this risks data leakage between tenants.
 
-**System check:** `boundary.W001` (Warning) fires if this is `False`.
+**System checks:** `boundary.W001` (Warning) fires if this is `False`, at any `DEBUG` value. `boundary.E008` (Error) additionally fires if this is `False` while `settings.DEBUG` is `False`, so the pairing is a warning in development and a hard error in production. **`DEBUG` is `False` under the test runner too**, so a test settings module that disables this setting fails at test-database creation; see the **Posture** section at the end of this file.
 
 ---
 
@@ -315,6 +315,23 @@ This matters well beyond requests: management commands (`boundary_run`, `boundar
 
 ---
 
+### `BOUNDARY_SET_DB_SESSION_VAR`
+
+| | |
+|---|---|
+| **Type** | `bool` |
+| **Default** | `True` |
+
+Whether to write the PostgreSQL session variable named by `BOUNDARY_DB_SESSION_VAR` on every tenant-context entry and exit. Every RLS policy boundary generates reads that variable, so this is what makes the database layer work at all.
+
+**When to change it:** Only for a deployment using boundary for ORM-layer scoping alone, with no RLS policies enabled anywhere, where skipping the `set_config()` round trip per context entry is worth the loss. If RLS is enabled on any tenant table, this must stay `True`.
+
+**Trade-off:** With this `False` and RLS live, the policies still exist and still run, but every one of them evaluates against an empty tenant, so the table is not isolated by the database at all. A mixin-scoped table still has its `TenantManager` filtering rows; an adopted table (see `BOUNDARY_TENANT_APPS`) has no ORM layer beneath it and is left with no isolation whatsoever.
+
+**System checks:** `boundary.W009` (Warning) fires when this is `False` and a tenant table has RLS enabled and forced. `boundary.E008` (Error) fires when this is `False` while `settings.DEBUG` is `False`, regardless of any table's RLS state, including under the test runner; see the **Posture** section at the end of this file.
+
+---
+
 ### `BOUNDARY_TENANT_APPS`
 
 | | |
@@ -449,6 +466,30 @@ def before_tenant_deleted(tenant):
 
 ---
 
+## Posture
+
+### `boundary.E008`: unsafe production posture
+
+Not a setting, but the check that governs the two above. `boundary.E008` reports an **Error**, one per offending setting, when `settings.DEBUG` is `False` and either `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`.
+
+Each of those settings alone leaves a deployment with a category of isolation it believes it has. With `BOUNDARY_STRICT_MODE = False`, a queryset run with no active tenant returns every tenant's rows instead of raising, a cross-tenant read nothing logs. With `BOUNDARY_SET_DB_SESSION_VAR = False`, nothing writes the variable every RLS policy reads. Both are legitimate deliberate choices; neither is a safe default to arrive at by inheriting a settings module, which is why `DEBUG` is the discriminator. `boundary.W001` and `boundary.W009` are unchanged, so at `DEBUG = True` a developer sees exactly what they saw before.
+
+E008 is settings-only: it issues no query, opens no connection, and is not gated on database vendor or availability, so it reports identically on SQLite, on PostgreSQL, and with no database configured at all.
+
+**It fires under the test runner.** Django's test runner sets `DEBUG = False` for the run, and `migrate` runs the system checks when it creates the test database, so a test settings module that disables either flag fails at test-database creation before a single test runs. For most projects this is where E008 is met first.
+
+**The remedy is naming the choice, not reversing it.** Either restore the default, or record the deliberate choice by adding the ID to `SILENCED_SYSTEM_CHECKS` **in the settings module that disables the flag**, which for a test-only posture is the test settings module rather than the production one:
+
+```python
+# myproject/settings/test.py
+BOUNDARY_STRICT_MODE = False
+SILENCED_SYSTEM_CHECKS = ["boundary.E008"]
+```
+
+Silencing by ID is the documented way to record this, because it is a line in a settings module a reviewer can see and grep for, which an inherited `False` is not.
+
+---
+
 ## Quick Reference
 
 | Setting | Default | Required |
@@ -470,6 +511,7 @@ def before_tenant_deleted(tenant):
 | `BOUNDARY_ADMIN_FLAG_VAR` | `"app.boundary_admin"` | No |
 | `BOUNDARY_FUNCTION_LEAKPROOF` | `False` | No |
 | `BOUNDARY_WRAP_ATOMIC` | `True` | No |
+| `BOUNDARY_SET_DB_SESSION_VAR` | `True` | No |
 | `BOUNDARY_TENANT_APPS` | `[]` | No |
 | `BOUNDARY_ADOPT_EXCLUDE` | `[]` | No |
 | `BOUNDARY_REGIONS` | `None` | No |

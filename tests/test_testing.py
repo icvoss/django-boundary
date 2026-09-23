@@ -163,6 +163,7 @@ class TestProvisionRLSTestRole:
         monkeypatch.setattr(connection, "vendor", "sqlite")
         assert provision_rls_test_role(bootstrap_connection_params={"dbname": "irrelevant"}) == {}
 
+    @pytest.mark.rls
     def test_idempotent_against_an_existing_role(self, settings):
         """The role CI provisions in ci.yml already exists in this suite's
         environment; provisioning it again must not error, and must return
@@ -186,6 +187,7 @@ class TestProvisionRLSTestRole:
         assert result_again == result
 
 
+@pytest.mark.rls
 @pytest.mark.django_db
 class TestAssertRLSEnforced:
     """Issue #55: the fail-closed half. Proven both ways: it passes for the
@@ -298,6 +300,7 @@ class TestAssertRLSEnforced:
         assert "No registered tenant-scoped table has Row Level Security" in message
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAcTest005AssertRlsEnforcedCoversAnAdoptedTable:
     """AC-TEST-005 (BR-PRV-010): assert_rls_enforced covers an adopted table.
@@ -488,3 +491,252 @@ class TestAcTest005AssertRlsEnforcedCoversAnAdoptedTable:
         with override_settings(BOUNDARY_TENANT_APPS=[]):
             tables = {table for _model, table, _adopted in _rls_probe_targets(apps)}
         assert "thirdparty_widget" not in tables
+
+
+@pytest.mark.django_db(databases=["default", "eu-west"])
+class TestAcTest006TheVendorGuardPrecedesThePsycopgImport:
+    """AC-TEST-006 (BR-PRV-010): ``assert_rls_enforced()`` returns on a
+    non-PostgreSQL backend without opening a connection, and without importing
+    psycopg.
+
+    Until 1.0 the early return was promised in the docstring and absent from
+    the body: the function's first action was
+    ``psycopg.connect(**connection_params)``, so a consumer calling it on a
+    SQLite deployment got a connection error, or an ``ImportError`` where
+    psycopg was not installed at all, rather than the documented quiet return
+    (icvoss/django-boundary#77). That is BR-ENV-002's quiet-on-SQLite
+    guarantee failing at the one helper whose whole purpose is to prove RLS is
+    enforced.
+
+    **Asserted through the alias keyword against the suite's real SQLite
+    ``eu-west`` alias**, rather than by monkeypatching ``connection.vendor``
+    on ``default``. The vendor string is then the one a real backend reports,
+    and the same test exercises the other half of the rule: that the keyword
+    selects which alias's vendor is read. AC-TEST-006's own wording describes
+    a deployment whose ``default`` is SQLite; this suite's ``default`` is
+    PostgreSQL by necessity (every RLS test needs it), so the alias under test
+    is named explicitly and the guard exercised is the identical one.
+
+    The ``psycopg`` assertions are the load-bearing half. A test that only
+    asserted "returns None" would pass against an implementation that
+    connected successfully and found nothing to check, which is a different
+    outcome reached by a different path and would leave #77 open.
+    """
+
+    def test_it_returns_none_on_a_sqlite_alias_with_unusable_connection_params(self):
+        """Given a SQLite alias, when ``assert_rls_enforced()`` is called with
+        any connection_params mapping, including an empty one and one naming an
+        unreachable host, then it returns None without raising.
+
+        The deliberately unusable params are the instrument: params that would
+        connect could not distinguish a guard that fired from a connection that
+        happened to succeed. An empty mapping and an unreachable host both fail
+        loudly if psycopg is ever reached.
+        """
+        from boundary.testing import assert_rls_enforced
+
+        unusable = (
+            {},
+            {"host": "boundary-test-no-such-host.invalid", "port": 1, "dbname": "x", "user": "x", "password": "x"},
+        )
+        for params in unusable:
+            assert assert_rls_enforced(params, alias="eu-west") is None, (
+                f"the vendor guard must return quietly for params {params!r}"
+            )
+
+    # Marked rls: this test patches psycopg.connect, so psycopg must be
+    # importable. The SQLite leg deliberately omits psycopg to prove the
+    # import guard; its sibling below covers that case.
+    @pytest.mark.rls
+    def test_no_psycopg_connection_is_attempted(self, monkeypatch):
+        """And no psycopg connection was attempted, proven by patching
+        ``psycopg.connect`` to raise and observing the call still return
+        cleanly.
+
+        This catches the narrower regression the import test cannot: an
+        implementation that imported psycopg at function top but guarded the
+        connect would pass the import assertion and fail here.
+        """
+        import psycopg
+
+        from boundary.testing import assert_rls_enforced
+
+        def _explode(*args, **kwargs):
+            raise AssertionError("assert_rls_enforced opened a connection on a non-PostgreSQL alias")
+
+        monkeypatch.setattr(psycopg, "connect", _explode)
+        assert assert_rls_enforced({}, alias="eu-west") is None
+
+    def test_it_returns_cleanly_where_psycopg_is_not_installed_at_all(self, monkeypatch):
+        """And it returns cleanly in an environment where psycopg is not
+        installed at all, proven by removing psycopg from ``sys.modules`` and
+        blocking its import for the duration of the call, so the vendor check
+        precedes the import.
+
+        The strictest form of the rule, and the reason the guard sits above
+        the import rather than merely above the connect. A consumer running a
+        SQLite-only deployment has no reason to have psycopg installed, and an
+        ``ImportError`` from a helper documented to no-op is the same defect
+        as a connection error.
+        """
+        import builtins
+        import sys
+
+        from boundary.testing import assert_rls_enforced
+
+        real_import = builtins.__import__
+
+        def _blocked(name, *args, **kwargs):
+            if name == "psycopg" or name.startswith("psycopg."):
+                raise ImportError("No module named 'psycopg' (blocked for this test)")
+            return real_import(name, *args, **kwargs)
+
+        for module in [name for name in sys.modules if name == "psycopg" or name.startswith("psycopg.")]:
+            monkeypatch.delitem(sys.modules, module, raising=False)
+        monkeypatch.setattr(builtins, "__import__", _blocked)
+
+        assert assert_rls_enforced({}, alias="eu-west") is None
+
+        # The control: with the block still installed, importing psycopg does
+        # raise. Without this, a block that silently failed to take effect
+        # would make the assertion above prove nothing.
+        with pytest.raises(ImportError):
+            import psycopg  # noqa: F401
+
+    @pytest.mark.rls
+    def test_the_alias_keyword_selects_which_vendor_is_read(self):
+        """And the alias keyword is what selects the vendor read: the same
+        call against the PostgreSQL ``default`` alias proceeds past the guard
+        rather than returning quietly.
+
+        The discriminator. Every assertion above would also pass against an
+        implementation that returned unconditionally, which would make the
+        helper vacuous on the backend it exists for. Here the unreachable
+        connection params must produce a psycopg error, proving the guard did
+        NOT fire and the function went on to connect.
+
+        Marked ``rls``: the control needs ``default`` to BE PostgreSQL, which
+        it is not on the SQLite leg, where the guard fires correctly and there
+        is no non-PostgreSQL-vs-PostgreSQL contrast to draw in one process
+        (BR-ENV-006). The quiet-return assertions it discriminates against run
+        on every leg, so the pair is never both deselected.
+        """
+        import psycopg
+        from django.db import connection
+
+        from boundary.testing import assert_rls_enforced
+
+        assert connection.vendor == "postgresql", "this control needs the default alias on PostgreSQL"
+
+        with pytest.raises(psycopg.Error):
+            assert_rls_enforced(
+                {"host": "boundary-test-no-such-host.invalid", "port": 1, "dbname": "x", "user": "x", "password": "x"}
+            )
+
+    def test_the_default_alias_is_the_default_for_the_keyword(self):
+        """And the keyword defaults to "default", so every existing call site
+        keeps the behaviour it had: the signature change is compatible.
+        """
+        import inspect
+
+        from boundary.testing import assert_rls_enforced
+
+        signature = inspect.signature(assert_rls_enforced)
+        parameter = signature.parameters["alias"]
+        assert parameter.default == "default"
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
+            "alias must be keyword-only so a positional second argument cannot be mistaken for it"
+        )
+
+
+class TestRlsEnforcedPassesTheAliasThrough:
+    """``rls_enforced()`` forwards its ``alias`` keyword to
+    ``assert_rls_enforced()``.
+
+    ``rls_enforced()`` is the session-fixture wrapper: it calls
+    ``assert_rls_enforced()`` and converts ``RLSNotEnforcedError`` into
+    ``pytest.exit()`` so a run whose RLS is not enforced stops before
+    collecting rather than reporting one failure among thousands about to pass
+    vacuously. ``assert_rls_enforced()`` grew an ``alias`` keyword for the
+    consumer whose RLS-carrying alias is not ``default``; the wrapper did not,
+    so that consumer could reach the keyword only by bypassing the wrapper and
+    losing the fail-closed behaviour.
+
+    Why it matters more here than at the inner call: without the keyword the
+    wrapper pins the vendor read to ``default``, so a project with a SQLite
+    ``default`` beside a PostgreSQL tenant alias gets
+    ``assert_rls_enforced()``'s quiet non-PostgreSQL return, and the fixture
+    silently proves nothing. That is precisely the vacuous-pass outcome the
+    function exists to make impossible.
+    """
+
+    def test_the_alias_keyword_reaches_assert_rls_enforced(self, monkeypatch):
+        """The keyword is forwarded, proven by observing what
+        ``assert_rls_enforced`` was actually called with.
+
+        Patched on the module rather than asserted through behaviour, because
+        the observable effect of a correct and an incorrect alias is the same
+        on a suite whose ``default`` is already PostgreSQL: both return None.
+        The call record is the discriminator.
+        """
+        from boundary import testing
+
+        recorded = {}
+
+        def _fake(connection_params, *, alias="default"):
+            recorded["connection_params"] = connection_params
+            recorded["alias"] = alias
+
+        monkeypatch.setattr(testing, "assert_rls_enforced", _fake)
+        testing.rls_enforced({"host": "example.invalid"}, alias="eu-west")
+
+        assert recorded["alias"] == "eu-west", "rls_enforced() must forward its alias keyword, not drop it"
+        assert recorded["connection_params"] == {"host": "example.invalid"}
+
+    def test_it_defaults_to_the_default_alias(self, monkeypatch):
+        """Negative control for the test above, and the compatibility claim:
+        a call that passes no alias still reaches the inner function with
+        ``"default"``, so every existing consumer fixture is unchanged.
+
+        Without this, the forwarding test alone would also pass against an
+        implementation that hardcoded ``alias="eu-west"``.
+        """
+        from boundary import testing
+
+        recorded = {}
+
+        def _fake(connection_params, *, alias="default"):
+            recorded["alias"] = alias
+
+        monkeypatch.setattr(testing, "assert_rls_enforced", _fake)
+        testing.rls_enforced({})
+
+        assert recorded["alias"] == "default"
+
+    def test_the_keyword_is_keyword_only_and_defaults_to_default(self):
+        """The signature is compatible: ``alias`` is keyword-only, so a
+        positional second argument cannot be mistaken for it, and it defaults
+        to ``"default"``. Mirrors the same assertion on
+        ``assert_rls_enforced()``.
+        """
+        import inspect
+
+        from boundary.testing import rls_enforced
+
+        parameter = inspect.signature(rls_enforced).parameters["alias"]
+        assert parameter.default == "default"
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_a_non_postgresql_alias_still_returns_without_exiting(self):
+        """End to end through the real inner function: pointing the wrapper at
+        the suite's SQLite ``eu-west`` alias returns cleanly rather than
+        calling ``pytest.exit()``.
+
+        Unpatched, so it proves the forwarded alias actually reaches the vendor
+        guard: unusable connection params would raise from psycopg if the
+        guard did not fire on the alias named here, and a ``pytest.exit()``
+        would abort this run outright rather than fail this test.
+        """
+        from boundary.testing import rls_enforced
+
+        assert rls_enforced({"host": "boundary-test-no-such-host.invalid"}, alias="eu-west") is None

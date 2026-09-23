@@ -423,6 +423,7 @@ class _AdoptedModelRegionalRouter:
         return None
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestBoundaryDeprovisionAdoptedTables:
     """AC-CMD-008/009/010 (BR-PRV-003, BR-PRV-004, BR-PRV-009): the

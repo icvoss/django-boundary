@@ -172,6 +172,7 @@ class TestPathRegistry:
         assert get_tenant_lookup(Product) == "merchant"
 
 
+@pytest.mark.rls
 class TestRLSCheckSkipsPathModels:
     """The RLS system check must not flag path-scoped models (no column)."""
 

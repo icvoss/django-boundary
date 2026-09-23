@@ -4,6 +4,228 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`boundary.E008` system check** (issue #82, BR-CHK-001). A deployment
+  could turn off either half of boundary's isolation and ship to production
+  with nothing louder than a warning: `boundary.W001` has always warned when
+  `BOUNDARY_STRICT_MODE` is `False`, and `boundary.W009` when
+  `BOUNDARY_SET_DB_SESSION_VAR` is `False` with Row Level Security live, but
+  a Warning fails no gate and stops no deploy. `boundary.E008` reports an
+  **Error**, one per offending setting, when `settings.DEBUG` is `False` and
+  either setting is `False`. With strict mode off, a queryset run with no
+  active tenant returns every tenant's rows instead of raising, a
+  cross-tenant read nothing logs; with the session variable off, nothing
+  writes the value every RLS policy reads, so a deployment carrying live
+  policies has them all evaluating against an empty tenant. Both default to
+  the safe value, so reaching this state takes an explicit opt-out, and
+  `DEBUG` is the discriminator that leaves a developer's local loop alone:
+  turning off strict mode while poking at a shell is legitimate, doing it
+  with `DEBUG = False` is not. The check is settings-only, issuing no query
+  and opening no connection, so unlike `E006`, `W003` and `W009` it is not
+  gated on database vendor or availability and cannot be silently skipped.
+  `W001` and `W009` are unchanged at every `DEBUG` value, so the pairing is a
+  warning in development and an Error in production rather than a
+  replacement. Each Error's hint names the remedy, the fact that the check
+  fires wherever `DEBUG` is `False` including under the test runner, and
+  `SILENCED_SYSTEM_CHECKS` as the reviewed, greppable way to record a
+  deliberate choice.
+
+- **`boundary.models.tenant_unique(*fields, name=None)`** (issue #72,
+  BR-ORM-015). `unique=True` on a field of a tenant-scoped model is enforced
+  across every tenant rather than within one, so two tenants cannot both hold
+  an invoice with reference `INV-001`, and the second one to try gets an
+  `IntegrityError` naming a constraint that mentions neither tenancy nor the
+  other tenant, for a row they cannot see. Boundary offered no affordance for
+  saying what the model author almost always meant.
+  `tenant_unique("reference")` goes in `Meta.constraints` and returns a
+  `UniqueConstraint` whose columns are the model's tenant foreign key
+  followed by the given fields. The tenant field is resolved when Django
+  prepares the model rather than when the `Meta` body runs, so the same call
+  resolves to `("merchant", "reference")` on a model built from
+  `make_tenant_mixin("merchant")` without the author naming the field twice.
+  Without an explicit `name`, the constraint name is derived deterministically
+  from the model and the field list, so two calls on one model cannot collide.
+  A path-scoped model (`make_tenant_path_mixin()`) has no local tenant column
+  to lead a constraint with, so the helper raises when that model class is
+  prepared, naming the model, rather than producing a constraint on a column
+  that does not exist. The `boundary.W010` warning proposed alongside the
+  helper is **not shipped**: BR-ORM-015 made it conditional on a prototype
+  finding more genuine hits than spurious ones, and the prototype recorded on
+  issue #72 found one genuine against twenty spurious, so the ID is reserved
+  and unimplemented. Documented as
+  [Uniqueness within a tenant](docs/how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant),
+  including the migration consequences of converting an existing global
+  constraint.
+
+- **An `alias` keyword on `assert_rls_enforced()` and
+  `boundary.testing.rls_enforced()`** (issue #77, BR-PRV-010). Both helpers
+  read a connection's vendor to decide whether there is any RLS to assert
+  about, and both previously read the `default` alias with no way to say
+  otherwise. A deployment whose RLS-carrying database is not `default` could
+  not point them at the right one. `alias` is keyword-only and defaults to
+  `"default"`, so every existing call site keeps the behaviour it had.
+
+- **`boundary.schema_compat`** (BR-RLS-022). A small adapter module, now the
+  only place in the package that names a private Django schema-editor
+  attribute. Both wrapped attributes are private API that Django may rename or
+  re-signature in any feature release with no deprecation cycle; with the
+  calls spread across `migrations_ops.py`, such a rename surfaced as an
+  `AttributeError` inside a consumer's `migrate`. It is public because a
+  migration's `deconstruct()` path must be able to import it, not because
+  consumers are expected to call it; nothing about your own code needs to
+  change.
+
+- **Internal, not a consumer surface:** the package's own test suite gained an
+  `rls` pytest marker and a `BOUNDARY_TEST_DB` environment variable, which
+  select the SQLite leg of its CI matrix. They are mentioned only so a
+  contributor reading this file knows where they came from; they are not part
+  of boundary's API, they do not affect your test suite, and a consumer needs
+  neither.
+
+### Changed
+
+- **The three RLS operations now consult your database router before doing
+  anything** (issue #86, BR-RLS-021). `EnableRLS`, `CreateTenantPolicy` and
+  `DropTenantPolicy` each ask `router.allow_migrate_model()` for the target
+  model and the alias being migrated, and return without emitting DDL when a
+  router says no. **If you run a router that denies an alias, that alias now
+  receives no RLS DDL where it previously received it.** For nearly everyone
+  this is the fix they wanted: a router denial is how you keep an alias off
+  the RLS graph deliberately, and it previously did not work for these three
+  operations. But if you were relying on the operations ignoring your router,
+  the policies will stop being created on the denied alias, and nothing will
+  say so, because a router denial is silent by design. Check any alias your
+  router denies that you nonetheless expect to carry policies.
+
+- **`EnableRLS`, `CreateTenantPolicy` and `DropTenantPolicy` are a logged
+  no-op on a non-PostgreSQL database instead of an error** (issue #86,
+  BR-RLS-021). Row Level Security is PostgreSQL-only, so these three
+  operations could not do their work on any other backend, and previously
+  said so by failing the migration. The practical effect was that anyone
+  developing against SQLite and deploying to PostgreSQL, which is the common
+  local setup, had to keep the RLS operations out of their own migration
+  files: a backend conditional on `settings.DATABASES`, a second migration
+  module, or a router. You no longer need any of that. Write the migration
+  once and run it unchanged on both. On a non-PostgreSQL alias each operation
+  now emits one `INFO` line on the `boundary.migrations` logger, naming the
+  operation, the model, the alias and the vendor, then returns without
+  issuing DDL and without raising.
+
+  What you get on that backend is unchanged, and it is worth being plain
+  about: the model keeps its ORM-layer tenant filtering, and it does not get
+  the database-level layer. Nothing enforces isolation for a query that
+  bypasses the manager, and `boundary.E006` and `boundary.W003` stay silent
+  there as they always have, so a clean `manage.py check` on SQLite says
+  nothing about the database layer. The log line is there so this is visible
+  in a migrate log rather than inferred; it is `INFO` rather than a warning
+  because on a backend you have deliberately chosen for local development it
+  is the designed outcome, not a fault.
+
+  Your database router is still consulted first, and a router denial is still
+  entirely silent, logging nothing: keeping an alias off the RLS graph
+  deliberately is different from an alias that simply cannot carry it.
+
+  **`AdoptTenantApp` is unchanged and still refuses off PostgreSQL.** The
+  asymmetry is deliberate. A model using boundary's mixins keeps its ORM
+  filtering when the policy is skipped, so it is left with less isolation. An
+  adopted third-party table has no ORM layer beneath the policy, so skipping
+  there would leave it with none at all, silently.
+
+### Fixed
+
+- **`assert_rls_enforced()` no longer fails on a non-PostgreSQL backend**
+  (issue #77, BR-PRV-010). Its documented contract was always to return
+  quietly where there is no RLS to assert about, but the early return was
+  promised in the docstring and absent from the body: the function's first
+  action was `psycopg.connect(...)`, so calling it on a SQLite deployment gave
+  a connection error, or an `ImportError` where psycopg was not installed at
+  all. A suite that called it on SQLite failed for the wrong reason. The
+  vendor guard now really does precede the psycopg import.
+
+- **`TenantContext` and `admin_bypass()` no longer raise on a non-PostgreSQL
+  alias** (issue #85, BR-ENV-002, BR-CTX-002, BR-CTX-010). Entering a tenant
+  context issued `set_config()` unconditionally, which is a PostgreSQL
+  function no other backend has, so the first request that resolved a tenant
+  on SQLite died with `OperationalError: no such function: set_config`. That
+  made SQLite unusable for the ORM layer it is supposed to support, which is
+  the backend most consumers develop against. Both now check the alias's
+  vendor first and skip the session-variable work, per alias rather than per
+  deployment, so a PostgreSQL `default` beside a SQLite secondary keeps the
+  session variable on the former. `admin_bypass()` still yields, so `unscoped`
+  access inside it behaves the same. The ContextVar, ORM filtering and the
+  exit restore are unchanged on every backend.
+
+- **The RLS migration operations no longer fail a migration on a backend that
+  cannot carry policies** (issue #86, BR-RLS-021). Described under Changed
+  above, and listed here because for most consumers it arrives as the fix to a
+  migration that could not run on SQLite rather than as a behaviour change.
+
+### Behaviour change for existing consumers
+
+**`boundary.E008` can turn a passing `manage.py check` into a failing one.**
+If you run with `DEBUG = False` and have set either `BOUNDARY_STRICT_MODE` or
+`BOUNDARY_SET_DB_SESSION_VAR` to `False`, this upgrade makes `manage.py
+check` fail, and with it `runserver`, `migrate` and every other management
+command. Nothing about isolation has changed; what changed is that a
+condition that was previously reported as a Warning is now reported as an
+Error. The remedy is either to restore the setting to `True`, or to record
+the deliberate choice by adding `"boundary.E008"` to `SILENCED_SYSTEM_CHECKS`.
+
+**It will most likely reach you through your test suite first, not through
+production.** Django's test runner sets `DEBUG = False` for the duration of a
+run, and `migrate` runs the system checks when it creates the test database.
+If your test settings module sets either flag to `False`, which was a common
+and previously harmless thing to do, your suite now fails at test-database
+creation before a single test runs. Put the `SILENCED_SYSTEM_CHECKS` entry in
+the **test settings module**, the one that disables the flag, not in your
+production settings:
+
+```python
+# myproject/settings/test.py
+BOUNDARY_STRICT_MODE = False
+SILENCED_SYSTEM_CHECKS = ["boundary.E008"]
+```
+
+If only some tests need the flag off, remove the module-level line and use
+`@override_settings(BOUNDARY_STRICT_MODE=False)` on those tests instead; the
+surrounding check run has already happened by then, so per-test overrides
+never trip E008. Silencing the ID in production settings to fix a CI failure
+would hide the production case the check exists for.
+
+`tenant_unique()` changes nothing for an existing consumer: it is a new
+surface, and no existing model gains or loses a constraint.
+
+**A migration that already wraps the RLS operations keeps working, and can
+now be simplified.** If you kept `EnableRLS` or `CreateTenantPolicy` behind a
+backend conditional, a separate migration module, or a router, none of that
+breaks: the operations are a no-op on the backends your wrapper was excluding
+anyway. It is now redundant, and removing it leaves one migration file that
+runs on both backends. Nothing forces the change, and nothing depends on your
+doing it.
+
+The one case that changes materially is a migration you previously could NOT
+run on SQLite at all. It now applies, reporting as applied with the RLS
+operations skipped, so a SQLite test database or development environment that
+used to fail during `migrate` will now build. That is the point of the change,
+but note what it means for a test suite: a suite that was implicitly proving
+RLS by failing to migrate without it will now migrate and pass with no
+database-level isolation in place. Use `assert_rls_enforced()` (or
+`boundary.testing.rls_enforced()` as a session fixture) if you need that
+proven rather than assumed.
+
+**Your router is now consulted by the three RLS operations, and an alias it
+denies receives no DDL it previously received.** This is the one item here
+that can take something away rather than add it. Previously the operations
+emitted their DDL regardless of what `allow_migrate_model()` answered, so a
+router written to keep an alias off the RLS graph did not actually do so, and
+the policies were created anyway. They now are not. If that alias was relying
+on policies it was never supposed to get, it loses them at the next migrate,
+silently: a router denial logs nothing, deliberately, because an alias
+excluded on purpose is different from one that cannot carry the layer. Review
+any alias your router denies and confirm you did not want policies on it. For
+almost everyone the denial was the intent and this is the fix.
+
 ## [0.9.0] - 2026-09-21
 
 ### Added

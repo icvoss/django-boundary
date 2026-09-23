@@ -45,6 +45,11 @@ statements, matching how requests behave outside the test harness.
 import pytest
 from django.test import Client
 
+# The whole module asserts on the PostgreSQL session variable: the probe view
+# reads current_setting('app.current_tenant_id', true) directly, which SQLite
+# has no equivalent for (BR-ENV-006).
+pytestmark = pytest.mark.rls
+
 
 @pytest.fixture
 def client():

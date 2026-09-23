@@ -35,6 +35,7 @@ class TestTenantContextClear:
             TenantContext.clear(token_a)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextClearRestoresDbSessionVar:
     """Regression for issue #13: clear() must restore the previous tenant's
@@ -158,6 +159,7 @@ class TestTenantContextRequire:
             assert TenantContext.require() == tenant_a
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextDBSession:
     """AC-CTX-005/006: DB session variable set and cleared."""
@@ -188,6 +190,7 @@ class TestTenantContextDBSession:
             assert val == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestSetDbSessionVarOptOut:
     """Issue #53: BOUNDARY_SET_DB_SESSION_VAR gates whether the session
@@ -229,6 +232,7 @@ class TestSetDbSessionVarOptOut:
             assert self._get_session_var() == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextSavepointBehaviour:
     """AC-CTX-008: Nested context restores DB session variable after savepoint."""
@@ -255,6 +259,7 @@ class TestTenantContextSavepointBehaviour:
                 TenantContext.clear(token)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestTenantContextAutocommit:
     """Regression for #6: using() must not silently no-op in autocommit.
@@ -355,8 +360,19 @@ class TestSetClearDbSessionUnopenedConnection:
     is later opened without going through this call again. Driven by
     calling the methods directly against an alias whose connection is
     guaranteed unopened, rather than mocking the logger.
+
+    The three tests asserting the warning IS issued are marked ``rls``. The
+    ``unopened`` alias they build is a copy of ``default``, so on the SQLite
+    leg it is a SQLite alias, and BR-ENV-002's per-alias vendor gate then
+    correctly returns BEFORE the connection-open check, issuing nothing. That
+    is the specified behaviour, not a defect: the warning exists because a
+    missing session variable costs RLS its tenant, and an alias with no RLS
+    has nothing to lose. Asserting the warning there would assert against
+    BR-CTX-002. The opt-out test in this class needs no PostgreSQL, since it
+    asserts silence, and stays unmarked.
     """
 
+    @pytest.mark.rls
     def test_set_db_session_warns_naming_alias_and_tenant(self, caplog, settings):
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
@@ -383,6 +399,7 @@ class TestSetClearDbSessionUnopenedConnection:
             for r in records
         ), "expected a WARNING record naming the unopened alias and tenant id"
 
+    @pytest.mark.rls
     def test_clear_db_session_warns_naming_alias(self, caplog, settings):
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
@@ -435,6 +452,7 @@ class TestSetClearDbSessionUnopenedConnection:
         records = [r for r in caplog.records if r.name == "boundary.context"]
         assert records == [], f"expected no WARNING records with the opt-out set, got: {[r.message for r in records]}"
 
+    @pytest.mark.rls
     def test_default_still_warns_on_the_same_unopened_alias(self, caplog, settings):
         """Companion to test_opt_out_silences_the_unopened_connection_warning:
         with BOUNDARY_SET_DB_SESSION_VAR at its True default, the same
@@ -671,6 +689,7 @@ def _get_admin_flag():
         return cursor.fetchone()[0]
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassFlagLifecycle:
     """Issue #37 AC: the admin flag is set inside the block and cleared after.
@@ -721,6 +740,7 @@ class TestAdminBypassFlagLifecycle:
             assert cursor.fetchone()[0] == ""
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassTransactionLocal:
     """The flag does not survive past the block (transaction-local guarantee).
@@ -747,6 +767,7 @@ class TestAdminBypassTransactionLocal:
                 assert cur.fetchone()[0] is None, "flag must not leak onto an unrelated connection"
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassWrapAtomicFalse:
     """Issue #37: BOUNDARY_WRAP_ATOMIC=False with no ambient transaction.
@@ -781,6 +802,7 @@ class TestAdminBypassWrapAtomicFalse:
             assert _get_admin_flag() == "true"
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassCleanupExceptionSafety:
     """Issue #60: admin_bypass()'s finally cleanup must not mask the
@@ -828,6 +850,7 @@ class TestAdminBypassCleanupExceptionSafety:
         )
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassNesting:
     """Issue #37: reentrant use on the same alias is idempotent.
@@ -862,6 +885,7 @@ class TestAdminBypassNesting:
                 assert cursor.fetchone()[0] == str(tenant_a.pk)
 
 
+@pytest.mark.rls
 @pytest.mark.django_db(transaction=True)
 class TestAdminBypassSignal:
     """Issue #37: an auditable signal fires on entry with the expected payload."""
@@ -924,3 +948,181 @@ class TestAdminBypassSignal:
             admin_bypass_activated.disconnect(_receiver)
 
         assert received == []
+
+
+class TestContextLayerIsQuietOnNonPostgreSQL:
+    """icvoss/django-boundary#85: the context layer's own writes are gated
+    on the alias's vendor, not just on BOUNDARY_SET_DB_SESSION_VAR.
+
+    BR-ENV-002 makes SQLite a supported backend for the context layer and
+    requires the missing RLS layer to be quiet there: "no error, no warning
+    and no exception attributable to the missing RLS layer". The only writes
+    this layer makes are ``set_config()`` calls (BR-CTX-002), and
+    ``set_config`` is a PostgreSQL function, so on any other backend they
+    must not be issued at all. Before the fix, ``TenantContext.set()`` raised
+    ``OperationalError: no such function: set_config`` on the first request
+    that resolved a tenant, which put the ORM filtering layer BR-ENV-002
+    promises on SQLite out of reach behind it.
+
+    Unmarked deliberately, so these run on the SQLite leg too (where the
+    ``default`` alias is also SQLite and the assertions hold for the same
+    reason). They assert against ``eu-west``, which ``tests/settings.py``
+    configures as SQLite on BOTH legs, so the non-PostgreSQL alias under
+    test is a real one on either. That doubles as this rule's per-alias
+    coverage: on the PostgreSQL leg the same process holds a PostgreSQL
+    ``default`` and a SQLite ``eu-west``, which is BR-ENV-005's mixed-vendor
+    deployment shape, and the gate has to answer differently per alias
+    rather than once per process.
+    """
+
+    SQLITE_ALIAS = "eu-west"
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_using_issues_no_set_config_on_a_sqlite_alias(self, tenant_a, settings):
+        """Entering and leaving TenantContext.using() on a SQLite alias
+        raises nothing and issues no set_config()."""
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        with (
+            CaptureQueriesContext(sqlite_connection) as captured,
+            TenantContext.using(tenant_a, using=self.SQLITE_ALIAS) as active,
+        ):
+            assert active == tenant_a
+            assert TenantContext.get() == tenant_a
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_set_and_clear_issue_no_set_config_on_a_sqlite_alias(self, tenant_a, settings):
+        """The set()/clear() pair underneath using() is gated on both sides.
+
+        A gate on the set side alone would move the failure from context
+        entry to context exit rather than removing it.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        with CaptureQueriesContext(sqlite_connection) as captured:
+            token = TenantContext.set(tenant_a, using=self.SQLITE_ALIAS)
+            TenantContext.clear(token, using=self.SQLITE_ALIAS)
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_admin_bypass_yields_and_raises_nothing_on_a_sqlite_alias(self, settings):
+        """admin_bypass() on a SQLite alias yields, sets no flag and does not
+        perform the read-back assertion.
+
+        The read-back is the part that would otherwise turn this into a
+        refusal: ``current_setting()`` does not exist on SQLite either, so
+        without the vendor gate the block raises before the caller's body
+        runs, and the documented cross-tenant idiom (``.unscoped`` inside an
+        ``admin_bypass()`` block) is unusable on a supported backend.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        sqlite_connection = connections[self.SQLITE_ALIAS]
+        sqlite_connection.ensure_connection()
+
+        entered = False
+        with CaptureQueriesContext(sqlite_connection) as captured, admin_bypass(using=self.SQLITE_ALIAS):
+            entered = True
+
+        assert entered
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] == []
+        assert [q["sql"] for q in captured.captured_queries if "current_setting" in (q["sql"] or "")] == []
+
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_unscoped_reaches_other_tenants_rows_inside_the_bypass(self, tenant_a, tenant_b):
+        """The reason admin_bypass() yields rather than refusing: what the
+        block is FOR still works on a backend with no RLS.
+
+        Cross-tenant access is reached through ``.unscoped`` at the ORM
+        layer, which is backend-independent. This asserts the idiom the
+        how-to documents completes on SQLite rather than merely that the
+        context manager does not raise.
+        """
+        from boundary_testapp.models import Booking
+
+        Booking.unscoped.create(tenant=tenant_a, court=1)
+        Booking.unscoped.create(tenant=tenant_b, court=2)
+
+        with TenantContext.using(tenant_a):
+            assert Booking.objects.count() == 1
+            with admin_bypass(using=self.SQLITE_ALIAS):
+                assert Booking.unscoped.count() == 2
+
+    @pytest.mark.rls
+    @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+    def test_gate_is_per_alias_not_per_process(self, tenant_a, settings):
+        """Positive control for the per-alias claim, paired with the
+        negative above.
+
+        Needs a PostgreSQL ``default`` to contrast against the SQLite
+        ``eu-west``: on the SQLite leg ``default`` is SQLite too, so there is
+        no PostgreSQL alias in the process for the gate to answer differently
+        about. On the PostgreSQL leg this is the whole point of gating on
+        ``using``: the same process, the same call, one alias writing the
+        session variable and the other not.
+
+        Marked ``rls`` rather than skipping at runtime. BR-ENV-006 makes the
+        distinction load-bearing: a deselected test is a leg declining a test
+        that cannot apply, where a skipped one is indistinguishable from a leg
+        whose database or role never materialised, which is the failure the
+        zero-skipped rule exists to catch. The SQLite CI leg greps its pytest
+        summary for " skipped" and fails on a hit, so the previous
+        ``pytest.skip`` would have failed that leg.
+        """
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        settings.DEBUG = True
+        pg_connection = connections["default"]
+        pg_connection.ensure_connection()
+
+        with CaptureQueriesContext(pg_connection) as captured, TenantContext.using(tenant_a, using="default"):
+            pass
+
+        assert [q["sql"] for q in captured.captured_queries if "set_config" in (q["sql"] or "")] != []
+
+
+@pytest.mark.rls
+@pytest.mark.django_db(transaction=True)
+class TestContextLayerStillWritesOnPostgreSQL:
+    """The vendor gate must not have turned the PostgreSQL path off.
+
+    A gate that returned early everywhere would pass every assertion in
+    ``TestContextLayerIsQuietOnNonPostgreSQL`` while silently removing the
+    session variable RLS reads, which is an isolation failure rather than a
+    quiet backend. These pin the direction: on PostgreSQL the variable is
+    still set, still readable, and still cleared.
+    """
+
+    def test_session_variable_is_set_and_cleared_on_postgresql(self, tenant_a):
+        from boundary.conf import boundary_settings
+
+        with TenantContext.using(tenant_a), connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.DB_SESSION_VAR])
+            assert cursor.fetchone()[0] == str(tenant_a.pk)
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.DB_SESSION_VAR])
+            assert cursor.fetchone()[0] in ("", None)
+
+    def test_admin_bypass_still_sets_the_flag_on_postgresql(self):
+        from boundary.conf import boundary_settings
+
+        with admin_bypass(), connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting(%s, true)", [boundary_settings.ADMIN_FLAG_VAR])
+            assert cursor.fetchone()[0] == "true"

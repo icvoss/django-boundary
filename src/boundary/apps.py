@@ -13,8 +13,8 @@ class BoundaryConfig(AppConfig):
         # boundary.checks registers every boundary.* system check via the
         # @register decorator at import time. Nothing else in the package
         # imports that module, so without this import the whole check suite
-        # (E001, E003, E004, E005, E006, E007, W001, W002, W003, W006, W007,
-        # W009) never
+        # (E001, E003, E004, E005, E006, E007, E008, W001, W002, W003, W006,
+        # W007, W009) never
         # registers and `manage.py check`/`migrate`/runserver silently run
         # none of them; they had only ever appeared to work because
         # tests/test_checks.py imports the module directly.

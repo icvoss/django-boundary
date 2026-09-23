@@ -6,7 +6,7 @@ multi-tenancy with configurable FK field names.
 """
 
 import logging
-from typing import ClassVar
+from typing import ClassVar, Protocol, cast
 
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -26,6 +26,25 @@ logger = logging.getLogger("boundary.models")
 # so that checks, routing, and other internals can recognise them
 # without requiring a strict issubclass(model, TenantMixin) check.
 _tenant_model_registry: set[type] = set()
+
+
+class _HasUnscopedManager(Protocol):
+    """The one attribute a registered tenant model is read for structurally.
+
+    ``is_tenant_model()`` is a registry-plus-duck-type check rather than an
+    ``issubclass()`` test, deliberately (see the registry note above), so it
+    cannot be a ``TypeGuard`` onto a single nominal base: a model built by
+    ``make_tenant_mixin()`` gets its managers from a locally defined abstract
+    class that shares no base with ``TenantMixin``. Both paths do attach
+    ``unscoped`` as a real class attribute, which is what this records, so a
+    caller that has already passed ``is_tenant_model()`` can say what it
+    expects rather than silencing the resulting attribute error.
+    """
+
+    # Quoted: UnscopedManager is defined further down this module, and this
+    # module has no ``from __future__ import annotations``, so an unquoted
+    # forward reference would raise NameError at import time.
+    unscoped: ClassVar["UnscopedManager"]
 
 
 def is_tenant_model(model: type) -> bool:
@@ -174,6 +193,18 @@ def validate_cross_tenant_fks(instance) -> None:
             continue  # the model's own tenant FK, not a cross-reference
 
         target_model = field.related_model
+        if not isinstance(target_model, type):
+            # django-stubs types ``related_model`` as ``type[Model] |
+            # Literal["self"]``, because a self-referential FK declared with
+            # the string ``"self"`` carries that sentinel until Django
+            # resolves the relation. By the time an instance exists to
+            # validate, every relation on its concrete model is resolved and
+            # this is always a model class; a self-referential FK arrives
+            # here as its own model class, which the docstring above already
+            # records as needing no special case. Narrowed rather than cast
+            # because an unresolved sentinel reaching a validation path would
+            # be a real defect to skip, not a type to assert away.
+            continue
         if not (is_tenant_model(target_model) and has_tenant_column(target_model)):
             continue
 
@@ -182,9 +213,12 @@ def validate_cross_tenant_fks(instance) -> None:
             continue
 
         target_fk_field = get_tenant_fk_field(target_model)
-        target_tenant_id = (
-            target_model.unscoped.filter(pk=target_id).values_list(f"{target_fk_field}_id", flat=True).first()
-        )
+        # is_tenant_model() above established this model carries boundary's
+        # managers, but it is a registry/duck-type check rather than an
+        # issubclass() test (see _HasUnscopedManager), so the nominal type
+        # here is still a bare type[Model].
+        target_manager = cast(_HasUnscopedManager, target_model).unscoped
+        target_tenant_id = target_manager.filter(pk=target_id).values_list(f"{target_fk_field}_id", flat=True).first()
         if target_tenant_id is None:
             # Target row does not exist (dangling FK). Not this check's
             # concern; Django's own FK validation covers existence.
@@ -437,7 +471,12 @@ def make_tenant_mixin(
     # at import time. An explicit BOUNDARY_TENANT_MODEL always takes
     # precedence, and changing either setting afterwards requires new
     # migrations, exactly as it always has for BOUNDARY_TENANT_MODEL users.
-    fk = models.ForeignKey(
+    # Annotated because the target is a settings STRING resolved at import
+    # (``"app.Model"``), not a class, so django-stubs has no concrete model to
+    # infer the generic parameter from. ``models.Model`` is the honest
+    # parameter here: which model this points at is a consumer's choice, made
+    # by BOUNDARY_TENANT_MODEL, and is unknowable to this package statically.
+    fk: models.ForeignKey[models.Model] = models.ForeignKey(
         resolve_tenant_model_setting(),
         on_delete=on_delete,
         db_index=db_index,
@@ -616,3 +655,200 @@ class AbstractTenant(models.Model):
 
     def __str__(self):
         return self.name
+
+
+# -- Per-tenant uniqueness (BR-ORM-015) ----------------------
+
+
+class TenantUniqueConstraint(models.UniqueConstraint):
+    """A ``UniqueConstraint`` whose field list gains the model's tenant FK.
+
+    Do not instantiate this directly; call :func:`tenant_unique`. The class is
+    public only because a migration's ``deconstruct()`` path has to be able to
+    import it by name.
+
+    **Why the tenant field is resolved at class preparation, and how
+    (BR-ORM-015).** ``tenant_unique("reference")`` is evaluated while the
+    ``Meta`` class body is being built, so there is no model to ask: the
+    helper cannot read ``_boundary_fk_field`` at that moment. Django offers no
+    per-constraint ``contribute_to_class`` hook either, so the resolution has
+    to happen at the one point where both the constraint and the prepared
+    model are in hand. That point is the ``class_prepared`` signal, which
+    ``ModelBase.__new__`` sends at the end of model construction, after
+    ``Options.contribute_to_class`` has populated ``_meta.constraints`` and
+    after ``_boundary_fk_field`` has been inherited from the mixin.
+
+    A ``class_prepared`` receiver was chosen over reading
+    ``_boundary_fk_field`` inside a ``contribute_to_class`` on the constraint
+    because Django does not call one: ``Options.contribute_to_class`` treats
+    ``Meta.constraints`` as a plain list, and the only thing it does to each
+    member is ``clone()`` it for ``%(app_label)s``/``%(class)s`` name
+    interpolation. That clone matters and is the reason ``deconstruct()``
+    below carries ``tenant_fields``: ``BaseConstraint.clone()`` round-trips
+    through ``deconstruct()``, so the object that ends up in
+    ``_meta.constraints`` is a fresh instance rebuilt from those kwargs, not
+    the one the model author wrote. A subclass whose extra state is not in
+    ``deconstruct()`` would silently lose it on the way in.
+
+    The resolved field list is written onto the prepared model's own
+    constraint instance, so ``makemigrations`` serialises the resolved form
+    (this class with its ``fields`` already leading with the tenant column)
+    and the migration needs nothing from boundary at apply time beyond the
+    import.
+
+    **A migration state render prepares a model that has no tenant FK
+    field.** ``ModelState.render()`` rebuilds the model with
+    ``type(name, bases, body)`` on ``models.Model``, not on the tenant mixin,
+    so ``_boundary_fk_field`` is absent from the rendered class while the
+    constraint it carries is already resolved. That is why ``_resolve()``
+    checks for a resolved constraint before it checks for the FK field; see
+    its docstring.
+    """
+
+    def __init__(self, *, tenant_fields, **kwargs):
+        # ``fields`` is a placeholder until the receiver resolves it:
+        # UniqueConstraint refuses to be constructed with an empty field list,
+        # so the author's fields stand in until the tenant column can be
+        # prepended. ``tenant_fields`` is the author's list, kept separately
+        # so resolution is idempotent and cannot prepend twice.
+        self.tenant_fields = tuple(tenant_fields)
+        kwargs.setdefault("fields", self.tenant_fields)
+        super().__init__(**kwargs)
+
+    def deconstruct(self):
+        path, args, kwargs = super().deconstruct()
+        kwargs["tenant_fields"] = self.tenant_fields
+        return path, args, kwargs
+
+    def _resolve(self, model):
+        """Prepend *model*'s tenant FK field, or raise if it has no column.
+
+        **The already-resolved check runs before the raise, and must.** This
+        receiver fires for every ``class_prepared``, and a migration state
+        render is one of them: ``ModelState.render()`` rebuilds the model with
+        ``type(name, bases, body)`` on ``models.Model``, so the rendered class
+        carries the constraint but NOT ``_boundary_fk_field``, which lives on
+        the mixin the rendered class does not inherit. The constraint arriving
+        in state is nonetheless already resolved, having round-tripped through
+        ``deconstruct()`` with both ``fields=("tenant", "slug")`` and
+        ``tenant_fields=("slug",)`` written into the migration. Raising for a
+        missing FK field before asking whether there is anything left to do
+        made every state render fail, which is every ``migrate`` and every
+        ``makemigrations``: the test suite could not create its database at
+        all (BR-ORM-015).
+
+        Resolution is therefore detected by comparing the two field lists
+        rather than by a flag carried through ``deconstruct()``. A flag would
+        have to pick a default for the migrations consumers have already
+        written, which carry none: defaulting it to unresolved re-raises here
+        on exactly the rendered model that has no FK field, and defaulting it
+        to resolved leaves a genuinely fresh constraint unresolvable. The
+        comparison needs no default and no new serialised kwarg.
+        """
+        if self.fields != self.tenant_fields:
+            # Already resolved: the tenant column has been prepended, so the
+            # lists differ. A state-rendered model reaches here (and has no
+            # ``_boundary_fk_field`` to offer), as does a re-prepared model or
+            # a clone of one.
+            return
+        fk_field = getattr(model, "_boundary_fk_field", None)
+        if not fk_field:
+            raise ValueError(
+                f"tenant_unique() cannot be used on {model._meta.label}: it has no "
+                f"local tenant column. Per-tenant uniqueness needs a tenant column "
+                f"to lead the constraint with, so a path-scoped model "
+                f"(make_tenant_path_mixin) cannot express it. Use TenantMixin or "
+                f"make_tenant_mixin() if this model should own a tenant FK, or a "
+                f"plain UniqueConstraint if the uniqueness is genuinely global."
+            )
+        self.fields = (fk_field, *self.tenant_fields)
+
+
+def tenant_unique(*fields, name=None):
+    """Return a :class:`~django.db.models.UniqueConstraint` scoped to a tenant.
+
+    A field declared ``unique=True`` on a tenant-scoped model is unique across
+    every tenant, not within one: two tenants cannot both hold an invoice with
+    reference ``INV-001``, and the second one to try gets an ``IntegrityError``
+    naming a constraint that mentions neither tenancy nor the other tenant.
+    The model author almost always meant per-tenant uniqueness. This helper
+    expresses it (BR-ORM-015)::
+
+        class Invoice(TenantModel):
+            reference = models.CharField(max_length=32)
+
+            class Meta:
+                constraints = [tenant_unique("reference")]
+
+    The resulting constraint's fields are the model's tenant FK field followed
+    by *fields* in the order given, so the same call works unchanged on a model
+    built from ``make_tenant_mixin("merchant")``, where it resolves to
+    ``("merchant", "reference")``. The tenant field is resolved when Django
+    prepares the model, not when this function runs; see
+    :class:`TenantUniqueConstraint` for the mechanism and why it is the only
+    one Django supports cleanly.
+
+    Applied to a model with no local tenant column (``make_tenant_path_mixin``),
+    preparation raises naming that model, rather than producing a constraint on
+    a field that does not exist.
+
+    Args:
+        *fields: The model's own field names, in the order they should follow
+            the tenant column.
+        name: The constraint name. Defaults to a deterministic name derived
+            from the field list and interpolated with the model's app label and
+            class name, so two ``tenant_unique()`` calls on one model with
+            different field lists cannot collide. An explicitly passed name is
+            used verbatim.
+    """
+    if not fields:
+        raise ValueError("tenant_unique() requires at least one field name.")
+    if name is None:
+        name = _derive_constraint_name(fields)
+    return TenantUniqueConstraint(tenant_fields=fields, name=name)
+
+
+def _derive_constraint_name(fields) -> str:
+    """Derive a deterministic constraint name from *fields* (BR-ORM-015).
+
+    The name carries Django's own ``%(app_label)s``/``%(class)s``
+    placeholders, which ``Options.contribute_to_class`` interpolates when the
+    model is prepared, so the model half of the name comes from Django's
+    existing mechanism rather than being guessed here: at the point this runs
+    there is no model to read it from.
+
+    The field half is a digest rather than the joined field names, computed
+    through the same ``names_digest`` helper Django's
+    ``BaseDatabaseSchemaEditor._create_index_name`` uses (the naming path
+    BR-RLS-012 also routes through). A digest is what keeps the result inside
+    PostgreSQL's 63-character identifier limit for any field list at all,
+    which joined names do not: the model half's length is not known until
+    interpolation, so a length-dependent scheme could not be resolved here.
+    """
+    # django-stubs does not declare names_digest, though Django has exported
+    # it from this module since 3.0 and still does on every version in
+    # BR-ENV-004's supported set (verified against the installed 5.2). A
+    # public name the stubs omit, not a private API: BR-RLS-022's
+    # schema_compat.py rule governs underscore-prefixed schema-editor
+    # attributes and does not reach this one.
+    from django.db.backends.utils import names_digest  # type: ignore[attr-defined]
+
+    digest = names_digest(*fields, length=8)
+    return f"%(app_label)s_%(class)s_tenant_uniq_{digest}"
+
+
+def _resolve_tenant_unique_constraints(sender, **kwargs):
+    """``class_prepared`` receiver: resolve every TenantUniqueConstraint.
+
+    Connected at import time of this module rather than in ``AppConfig.ready``
+    because a consumer model carrying ``tenant_unique()`` must import this
+    module to get the helper, which guarantees this receiver is connected
+    before that model class is built. ``ready()`` runs after the app registry
+    has prepared every model, which would be too late.
+    """
+    for constraint in getattr(sender._meta, "constraints", ()):
+        if isinstance(constraint, TenantUniqueConstraint):
+            constraint._resolve(sender)
+
+
+models.signals.class_prepared.connect(_resolve_tenant_unique_constraints)

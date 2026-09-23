@@ -55,7 +55,9 @@ exposure during development.
   `AbstractTenant` convenience base.
 - **Non-PostgreSQL Row Level Security.** The ORM filtering layer works on
   any Django-supported database, but RLS enforcement requires PostgreSQL
-  14+, with no database-level backstop elsewhere.
+  14+, with no database-level backstop elsewhere. The RLS migration
+  operations are a logged no-op there rather than an error, so the same
+  migration files run on a SQLite development database.
 - **Cross-region data migration.** Moving a tenant's data from one regional
   database to another is your own operational tooling.
 - **Frontend, API or Django admin components.** You wire your own admin and
@@ -152,8 +154,43 @@ class Booking(TenantModel):
     start_time = models.DateTimeField()
 ```
 
-That's it. `Booking.objects.all()` now automatically filters by the active
-tenant. Creating a booking auto-populates the `tenant` field from context.
+`Booking.objects.all()` now automatically filters by the active tenant.
+Creating a booking auto-populates the `tenant` field from context. That is
+the ORM layer. Add the database layer before you ship.
+
+### 5. Turn on Row Level Security (PostgreSQL)
+
+Write the migration by hand, in the app owning the model
+(`python manage.py makemigrations bookings --empty --name rls`):
+
+```python
+from boundary.migrations_ops import CreateTenantPolicy, EnableRLS
+
+operations = [
+    EnableRLS("Booking"),
+    CreateTenantPolicy("Booking"),
+]
+```
+
+Apply it, then confirm `python manage.py check` reports neither
+`boundary.E006` nor `boundary.W003`. Connect as a `NOSUPERUSER NOBYPASSRLS`
+role: superusers and BYPASSRLS roles are exempt from every policy, so the
+layer exists but enforces nothing for them.
+
+**The same migration runs on SQLite.** `EnableRLS`, `CreateTenantPolicy` and
+`DropTenantPolicy` apply on PostgreSQL and are a logged no-op on any other
+backend: one `logger.info` line each on the `boundary.migrations` logger
+naming the operation, the model, the alias and the vendor, then no DDL and no
+error. So you write this migration once and run it unchanged against a SQLite
+development database and a PostgreSQL production one, with no backend
+conditional and no router. Your model keeps its ORM-layer tenant filtering on
+SQLite; it is the RLS layer, and only that, which is absent there.
+
+`AdoptTenantApp` is the one operation that still refuses off PostgreSQL,
+because an adopted table has no ORM layer beneath the policy and would be
+left with no isolation at all rather than reduced isolation. See
+[Add RLS policies with migrations](docs/how-to/add-rls-policies-with-migrations.md)
+for the migrating-role caveats and verification.
 
 ---
 
@@ -500,6 +537,36 @@ get_tenant_fk_field(Booking)   # "tenant"
 System checks, regional routing, and RLS verification all use
 `is_tenant_model()` internally, so custom FK models are automatically
 recognised.
+
+### Per-tenant uniqueness: `tenant_unique()`
+
+`unique=True` on a field of a tenant-scoped model is enforced across every
+tenant, not within one, so two tenants cannot both hold an invoice with
+reference `INV-001`. `tenant_unique()` returns a `UniqueConstraint` whose
+columns are the model's tenant foreign key followed by the fields you give:
+
+```python
+from boundary.models import TenantModel, tenant_unique
+
+
+class Invoice(TenantModel):
+    reference = models.CharField(max_length=32)     # not unique=True
+
+    class Meta:
+        constraints = [tenant_unique("reference")]
+```
+
+The tenant field is read off the model when Django prepares it, not when the
+`Meta` body runs, so the same call resolves to `("merchant", "reference")` on a
+model built from `make_tenant_mixin("merchant")` without naming the field
+twice. Pass `name=` to control the constraint name; without one, boundary
+derives a deterministic name from the model and the field list. A path-scoped
+model (`make_tenant_path_mixin()`) has no tenant column to lead with, so the
+helper raises when that model class is prepared.
+
+See
+[Uniqueness within a tenant](docs/how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant)
+for the migration consequences of converting an existing global constraint.
 
 ### Cross-tenant foreign key validation
 
@@ -859,6 +926,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
 | `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models, and adopted tables |
 | `boundary.E007` | Error | An expected-adopted table (a concrete model of an app in `BOUNDARY_TENANT_APPS`, not excluded, not already mixin- or path-scoped, and not the tenant model) is missing its `tenant_id` column, carries one of an unexpected type, lacks enabled-and-forced RLS, is missing either policy, or carries a unique constraint that is not composite leading with `tenant_id`. Also reports a deny-listed or uninstalled app label in the setting, the one condition needing no database connection. The expected set is derived from the live app registry, so a model added by an upstream upgrade is reported; the remedy is a second `AdoptTenantApp` migration (issues #69, #71) |
+| `boundary.E008` | Error | `settings.DEBUG` is `False` and `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`, one Error per offending setting. Each removes a category of isolation the deployment believes it has, and both default to the safe value, so reaching this state takes an explicit opt-out. Settings-only: no query, no connection, no vendor gate, so it is the one check that cannot be silently skipped. **It fires under the test runner too**, which sets `DEBUG = False`; record a deliberate choice with `"boundary.E008"` in `SILENCED_SYSTEM_CHECKS` (issue #82) |
 | `boundary.W001` | Warning | STRICT_MODE is False |
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
@@ -974,9 +1042,78 @@ fixture among a wall of now-meaningless downstream test results.
 
 ## Requirements
 
-- Python 3.12+
-- Django 5.2+ (5.2 LTS and 6.0 supported)
-- PostgreSQL 14+ (for RLS; ORM layer works with any database)
+- Python 3.12 and 3.13
+- Django 5.2 (LTS), 6.0 and 6.1
+- PostgreSQL 14 to 16 for the RLS layer; the ORM layer also runs on SQLite
+
+See [Supported environments](#supported-environments) below for what each of
+those means in practice, and for the isolation consequence of running on
+SQLite.
+
+---
+
+## Supported environments
+
+Every combination below is exercised by a CI leg. Anything not listed is
+untested rather than actively blocked: boundary adds no refusal for it, and
+running outside this matrix is at your own risk.
+
+### Databases
+
+| Backend | Support |
+|---|---|
+| PostgreSQL 14, 15, 16 | Fully supported, both isolation layers. A release above 16 is not refused and is expected to work, since nothing in the generated DDL uses a feature newer than 14, but it is outside the verified matrix until a leg runs it. |
+| SQLite | Supported as an **ORM-only** backend, for local development and CI. |
+| MySQL, MariaDB | **Unsupported and untested.** Neither has Row Level Security, so the RLS layer cannot exist there, and no CI leg exercises the ORM layer on them. |
+
+**What SQLite gives you, and what it does not.** The ORM filtering layer, the
+context layer, resolution, Celery propagation and the management commands all
+work. Row Level Security does not exist on SQLite, and boundary keeps that
+absence quiet rather than noisy: `boundary.E006`, `boundary.W003`,
+`boundary.W007` and `boundary.W009` return nothing, `assert_rls_enforced()`
+returns without raising, `TenantContext` issues no session variable, and the
+three RLS migration operations log one line each and apply no DDL. You can run
+the same migration files on both backends.
+
+**The consequence, stated plainly: an adopted table has no isolation at all on
+SQLite.** A model using boundary's mixins keeps its ORM-layer filtering when
+the policy is skipped, so it is left with less isolation. An adopted
+third-party table (`AdoptTenantApp`) has no ORM layer beneath the policy, so
+on SQLite it has none whatsoever. `AdoptTenantApp` therefore still refuses to
+run off PostgreSQL, where the other three operations skip quietly.
+
+More generally on a non-PostgreSQL alias, a mixin-scoped model has ORM-layer
+isolation only: `TenantManager` filtering and `BOUNDARY_STRICT_MODE` behave
+exactly as on PostgreSQL, but `raw()`, `extra()`, hand-built SQL and any
+third-party package writing directly have no backstop, because the backstop is
+RLS. Use PostgreSQL wherever isolation matters.
+
+### Python and Django
+
+| | Supported |
+|---|---|
+| Python | 3.12, 3.13 |
+| Django | 5.2 (LTS), 6.0, 6.1 |
+
+Every combination of the two is supported and runs in CI. Python 3.14 is not
+supported in the 1.0 line.
+
+### Deployment shapes
+
+- **ASGI.** Context propagation is `contextvars` throughout, and
+  `TenantMiddleware` is a `MiddlewareMixin` serving both WSGI and ASGI. An
+  async view, async middleware downstream of boundary's, and a sync view in
+  the same process all see the same tenant context semantics.
+- **Celery.** Tenant context crosses a task dispatch through the shipped
+  signal handlers and the `tenant_task` decorator or `TenantTask` base class,
+  once you wire them. Boundary does not auto-install them into your Celery
+  app.
+- **Multiple database aliases.** More than one alias is supported through
+  `RegionalRouter` and, for migration-time DDL, through the router gates. A
+  deployment may hold a PostgreSQL alias carrying the RLS layer beside a
+  non-PostgreSQL alias carrying none, in one process, provided its router
+  keeps the RLS migrations off the second alias. The vendor gates are applied
+  per alias, not per deployment.
 
 ---
 

@@ -19,7 +19,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
@@ -35,6 +34,10 @@ dev = [
     "psycopg[binary]>=3.1",
     "ruff>=0.5.0",
     "django-stubs[compatible-mypy]>=5.1,<6",
+    # AC-TEST-008 parses .github/workflows/*.yml as YAML rather than
+    # pattern-matching them as text, so tests/test_environment_matrix.py
+    # needs a parser. Test-only: nothing in src/boundary imports yaml.
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -53,6 +56,44 @@ boundary = ["py.typed"]
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "settings"
 pythonpath = ["src", "tests"]
+markers = [
+    # A test that cannot apply on a backend without Row Level Security, so
+    # the SQLite leg of the CI matrix deselects it with -m "not rls"
+    # (BR-ENV-006). Deselection, not pytest.skip: a skipped test is
+    # indistinguishable from a leg whose database or role never materialised,
+    # which is the failure the zero-skipped rule exists to catch.
+    "rls: requires a PostgreSQL RLS backend (deselected on the SQLite leg)",
+]
+
+[tool.mypy]
+python_version = "3.12"
+# ADR-027 declares the exact pair the package typechecks clean against, and
+# the dev extra pins it: mypy 1.19.x with django-stubs[compatible-mypy] 5.2.x.
+plugins = ["mypy_django_plugin.main"]
+# The plugin needs a Django settings module it can import and call
+# django.setup() with. tests/settings.py is the one this repo already has;
+# mypy_path puts tests/ on the path so "settings" resolves, matching
+# DJANGO_SETTINGS_MODULE elsewhere in the repo.
+mypy_path = "tests"
+
+# The plugin calls django.setup(), so it loads every app in INSTALLED_APPS,
+# which pulls the test project's own models into the check. Those are test
+# fixtures, not shipped code, and ADR-027's criterion is "mypy src/boundary
+# reports no error on the package itself"; silence them so the job's exit
+# status is about src/boundary.
+[[tool.mypy.overrides]]
+module = ["boundary_testapp.*", "boundary_consumer.*", "thirdparty.*", "settings", "urls", "sqlite_leg"]
+follow_imports = "silent"
+ignore_errors = true
+
+# celery is an optional integration (boundary.celery guards its import), so a
+# checkout without celery installed must not fail on a missing stub.
+[[tool.mypy.overrides]]
+module = ["celery", "celery.*"]
+ignore_missing_imports = true
+
+[tool.django-stubs]
+django_settings_module = "settings"
 
 [tool.coverage.run]
 source = ["src"]
@@ -71,6 +112,12 @@ exclude_lines = [
 target-version = "py312"
 line-length = 120
 src = ["src"]
+extend-exclude = [
+    # Django wrote these, and `makemigrations --check` in the ADR-027 smoke
+    # gate compares against what Django would write, so reformatting them
+    # would put the formatter and the gate in permanent disagreement.
+    "smoke/consumer/*/migrations/",
+]
 
 [tool.ruff.lint]
 select = [
