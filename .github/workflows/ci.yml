@@ -327,3 +327,106 @@ jobs:
 
       - name: Run mypy on the package
         run: mypy src/boundary
+
+  smoke-test:
+    # ADR-027's consumer smoke gate, blocking on pull_request and push to
+    # main. Stands up the throwaway consumer in smoke/consumer/ against the
+    # package as an INSTALLED DISTRIBUTION (a built wheel in a clean venv,
+    # never editable and never boundary's own bundled test app), and runs
+    # what a real consumer runs. Both backends, because a migration or
+    # typing defect can appear on only one.
+    name: Consumer smoke test (ADR-027)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: icv_test
+          POSTGRES_PASSWORD: icv_test_password
+          POSTGRES_DB: boundary_smoke
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel the consumer will install
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist/
+
+      - name: Confirm the smoke consumer is not in the wheel
+        # The consumer is a CI fixture, not shipped code. setuptools finds
+        # packages under src/ only, so smoke/ should never appear, but the
+        # cost of proving it is one unzip and the cost of missing it is a
+        # published wheel carrying a Django project.
+        run: |
+          unzip -l dist/*.whl | tee wheel-contents.txt
+          if grep -qE "(^| )smoke/" wheel-contents.txt; then
+            echo "ERROR: the smoke consumer is inside the built wheel."
+            exit 1
+          fi
+          echo "The wheel does not carry smoke/."
+
+      - name: Provision the non-superuser icv_app role
+        # `manage.py check` runs boundary.W003, which reports when the
+        # connecting role bypasses RLS. Connecting as the bootstrap
+        # superuser would make the consumer's check output unrepresentative
+        # of a real deployment, so the PostgreSQL pass connects as icv_app.
+        run: |
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_smoke -c \
+            "CREATE ROLE icv_app LOGIN PASSWORD 'icv_dev' NOSUPERUSER NOBYPASSRLS;"
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_smoke -c \
+            "GRANT CONNECT ON DATABASE boundary_smoke TO icv_app;
+             GRANT USAGE, CREATE ON SCHEMA public TO icv_app;"
+
+      # ADR-027 steps 1 and 2, blocking on both backends: a migration defect
+      # that appears on only one is the case the two passes exist for.
+      - name: Smoke consumer on SQLite (makemigrations --check, migrate, check)
+        run: smoke/run.sh sqlite
+        env:
+          BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
+
+      - name: Smoke consumer on PostgreSQL (makemigrations --check, migrate, check)
+        run: smoke/run.sh postgresql
+        env:
+          BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGDATABASE: boundary_smoke
+          PGUSER: icv_app
+          PGPASSWORD: icv_dev
+
+      # ADR-027 step 3, in its own step so the advisory marking below cannot
+      # also make the migration steps advisory. Advisory until
+      # icvoss/django-boundary#81's typing fix lands; ADR-027 requires the
+      # advisory-vs-blocking state to be recorded rather than left implicit.
+      # Added 2026-09-23; delete continue-on-error and this comment in the
+      # change that makes src/boundary clean.
+      - name: Smoke consumer typing on SQLite (mypy, advisory until #81)
+        continue-on-error: true
+        run: smoke/run.sh sqlite --mypy-only
+        env:
+          BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
+
+      - name: Smoke consumer typing on PostgreSQL (mypy, advisory until #81)
+        continue-on-error: true
+        run: smoke/run.sh postgresql --mypy-only
+        env:
+          BOUNDARY_SMOKE_WHEEL_GLOB: dist/*.whl
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGDATABASE: boundary_smoke
+          PGUSER: icv_app
+          PGPASSWORD: icv_dev

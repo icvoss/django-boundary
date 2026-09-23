@@ -28,3 +28,7 @@ venv*/
 # uv lockfile: boundary is a library, not an application. Pinning
 # transitive deps here would not bind consumers and only churns.
 uv.lock
+
+# The ADR-027 smoke consumer writes here when run without
+# BOUNDARY_SMOKE_SQLITE_PATH (smoke/run.sh always sets it to a temp path).
+smoke/consumer/*.sqlite3
