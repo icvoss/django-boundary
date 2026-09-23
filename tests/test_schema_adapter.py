@@ -28,6 +28,8 @@ specific failure BR-RLS-022 exists to prevent.
 """
 
 import inspect
+import io
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,33 @@ def _boundary_source_files():
     """Every ``.py`` file shipped under ``src/boundary/``."""
     package_root = Path(schema_compat.__file__).parent
     return sorted(path for path in package_root.rglob("*.py") if "__pycache__" not in path.parts)
+
+
+def _code_lines(source):
+    """Return *source*'s lines with string literals and comments blanked out.
+
+    BR-RLS-022 forbids a private schema-editor CALL SITE outside the adapter,
+    not a mention of one in prose: ``models.py`` names
+    ``BaseDatabaseSchemaEditor._create_index_name`` in a docstring explaining
+    which Django helper a digest is computed through, and a raw line scan
+    cannot tell that apart from a call. Tokenising and blanking every STRING
+    and COMMENT token leaves executable code only, so the scan reads what the
+    rule is about. The positive control below is unaffected: the adapter's own
+    matches at its two ``return`` statements are code.
+    """
+    lines = source.splitlines()
+    blanked = list(lines)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except tokenize.TokenError:  # pragma: no cover - a syntax error fails elsewhere
+        return lines
+    for token in tokens:
+        if token.type not in (tokenize.STRING, tokenize.COMMENT):
+            continue
+        (start_row, _), (end_row, _) = token.start, token.end
+        for row in range(start_row, end_row + 1):
+            blanked[row - 1] = ""
+    return blanked
 
 
 class TestOnlyTheAdapterNamesPrivateSchemaEditorApi:
@@ -76,7 +105,7 @@ class TestOnlyTheAdapterNamesPrivateSchemaEditorApi:
                 continue
             matching = [
                 f"{path.name}:{number}"
-                for number, line in enumerate(path.read_text().splitlines(), 1)
+                for number, line in enumerate(_code_lines(path.read_text()), 1)
                 if pattern.search(line)
             ]
             if matching:
@@ -95,8 +124,10 @@ class TestOnlyTheAdapterNamesPrivateSchemaEditorApi:
         import re
 
         pattern = re.compile(r"schema_editor\._|SchemaEditor\._")
-        adapter = Path(schema_compat.__file__).read_text()
-        assert pattern.search(adapter), "the scan pattern no longer matches the adapter; the scan above proves nothing"
+        adapter = _code_lines(Path(schema_compat.__file__).read_text())
+        assert any(pattern.search(line) for line in adapter), (
+            "the scan pattern no longer matches the adapter's own CODE; the scan above proves nothing"
+        )
 
     def test_migrations_ops_matches_nothing(self):
         """And ``migrations_ops.py`` specifically matches nothing, named
@@ -106,7 +137,7 @@ class TestOnlyTheAdapterNamesPrivateSchemaEditorApi:
 
         pattern = re.compile(r"schema_editor\._|SchemaEditor\._")
         path = Path(schema_compat.__file__).parent / "migrations_ops.py"
-        assert not pattern.search(path.read_text())
+        assert not any(pattern.search(line) for line in _code_lines(path.read_text()))
 
 
 class TestTheAdapterAssertsItsDjangoVersion:
@@ -115,6 +146,7 @@ class TestTheAdapterAssertsItsDjangoVersion:
     the adapter passes it.
     """
 
+    @pytest.mark.django_db
     @pytest.mark.parametrize("attribute", sorted(WRAPPED_ATTRIBUTES))
     def test_the_wrapped_attribute_exists_on_the_schema_editor_class(self, attribute):
         """Given the Django version under test, when the adapter's wrapped
@@ -136,6 +168,7 @@ class TestTheAdapterAssertsItsDjangoVersion:
                 f"the {connection.vendor} schema editor has no {attribute}; boundary.schema_compat wraps it"
             )
 
+    @pytest.mark.django_db
     @pytest.mark.parametrize(("attribute", "expected_parameters"), sorted(WRAPPED_ATTRIBUTES.items()))
     def test_the_wrapped_attribute_still_accepts_the_parameters_the_adapter_passes(
         self, attribute, expected_parameters
@@ -220,11 +253,16 @@ class TestTheAdapterAssertsItsDjangoVersion:
         """
         with connection.schema_editor() as editor:
             editor_class = type(editor)
-            monkeypatch.delattr(editor_class, attribute, raising=False)
-            # The attribute may be inherited rather than defined on the
-            # concrete class, in which case deleting it from the concrete class
-            # is a no-op; block the base as well so the lookup genuinely fails.
-            monkeypatch.delattr(BaseDatabaseSchemaEditor, attribute, raising=False)
+            # Delete the attribute from every class in the MRO that DEFINES it,
+            # which is what makes the lookup genuinely fail. ``__dict__`` rather
+            # than ``hasattr``, because monkeypatch.delattr calls ``delattr`` on
+            # the object it is given even under ``raising=False``: handed a
+            # subclass that merely INHERITS the attribute, ``hasattr`` is true,
+            # the delete raises ``AttributeError`` from the patch call itself,
+            # and undo then fails in teardown as well.
+            for klass in (*editor_class.__mro__, BaseDatabaseSchemaEditor):
+                if attribute in vars(klass):
+                    monkeypatch.delattr(klass, attribute)
 
             with pytest.raises(AttributeError):
                 if attribute == "_create_index_name":

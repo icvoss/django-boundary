@@ -1171,7 +1171,13 @@ class TestE008ProductionPosture:
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         settings.BOUNDARY_STRICT_MODE = False
         settings.BOUNDARY_SET_DB_SESSION_VAR = False
-        settings.SILENCED_SYSTEM_CHECKS = ["boundary.E008"]
+        # E004 and E006 are silenced alongside it because tests/settings.py
+        # deliberately sets no MIDDLEWARE (so E004 always fires) and the test
+        # app ships no migrations, so its tables are created by run_syncdb
+        # without RLS (so E006 always fires). Neither is what this test is
+        # about, and leaving them live would make call_command("check") raise
+        # whatever E008 did, so the silence of E008 would prove nothing.
+        settings.SILENCED_SYSTEM_CHECKS = ["boundary.E008", "boundary.E004", "boundary.E006"]
 
         call_command("check")
 
@@ -1194,9 +1200,19 @@ class TestE008ProductionPosture:
         )
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         settings.BOUNDARY_STRICT_MODE = False
+        # The ambient errors this suite's settings always produce, silenced for
+        # the same reason as the test above: E008 must be the error that raises
+        # here, not one of E004/E006 raising while E008 goes unchecked.
+        settings.SILENCED_SYSTEM_CHECKS = ["boundary.E004", "boundary.E006"]
 
+        # skip_checks=False explicitly: call_command() defaults it to True
+        # (django/core/management/__init__.py), so a plain call_command("migrate")
+        # runs NO system checks and this test would pass vacuously by never
+        # reaching the check pipeline it exists to exercise. Real test-database
+        # creation reaches BaseCommand.execute() through the argv path, where
+        # the default is the opposite.
         with pytest.raises(SystemCheckError) as excinfo:
-            call_command("migrate", run_syncdb=False, verbosity=0)
+            call_command("migrate", run_syncdb=False, verbosity=0, skip_checks=False)
 
         message = str(excinfo.value)
         assert "boundary.E008" in message
