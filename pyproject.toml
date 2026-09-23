@@ -19,7 +19,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
@@ -35,6 +34,10 @@ dev = [
     "psycopg[binary]>=3.1",
     "ruff>=0.5.0",
     "django-stubs[compatible-mypy]>=5.1,<6",
+    # AC-TEST-008 parses .github/workflows/*.yml as YAML rather than
+    # pattern-matching them as text, so tests/test_environment_matrix.py
+    # needs a parser. Test-only: nothing in src/boundary imports yaml.
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
