@@ -265,7 +265,7 @@ jobs:
         # is visible in the log and not only in the count.
         run: |
           set -o pipefail
-          pytest tests/ -v --tb=short --color=yes -rs -m "not rls" | tee pytest-sqlite.log
+          pytest tests/ -v --tb=short --color=no -rs -m "not rls" | tee pytest-sqlite.log
         env:
           BOUNDARY_TEST_DB: sqlite
           DJANGO_SETTINGS_MODULE: settings

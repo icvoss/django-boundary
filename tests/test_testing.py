@@ -544,7 +544,11 @@ class TestAcTest006TheVendorGuardPrecedesThePsycopgImport:
                 f"the vendor guard must return quietly for params {params!r}"
             )
 
+    @pytest.mark.rls
     def test_no_psycopg_connection_is_attempted(self, monkeypatch):
+        # Marked rls: this test patches psycopg.connect, so psycopg must be
+        # importable. The SQLite leg deliberately omits psycopg to prove the
+        # import guard; its sibling below covers that case.
         """And no psycopg connection was attempted, proven by patching
         ``psycopg.connect`` to raise and observing the call still return
         cleanly.
