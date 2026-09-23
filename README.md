@@ -526,6 +526,36 @@ System checks, regional routing, and RLS verification all use
 `is_tenant_model()` internally, so custom FK models are automatically
 recognised.
 
+### Per-tenant uniqueness: `tenant_unique()`
+
+`unique=True` on a field of a tenant-scoped model is enforced across every
+tenant, not within one, so two tenants cannot both hold an invoice with
+reference `INV-001`. `tenant_unique()` returns a `UniqueConstraint` whose
+columns are the model's tenant foreign key followed by the fields you give:
+
+```python
+from boundary.models import TenantModel, tenant_unique
+
+
+class Invoice(TenantModel):
+    reference = models.CharField(max_length=32)     # not unique=True
+
+    class Meta:
+        constraints = [tenant_unique("reference")]
+```
+
+The tenant field is read off the model when Django prepares it, not when the
+`Meta` body runs, so the same call resolves to `("merchant", "reference")` on a
+model built from `make_tenant_mixin("merchant")` without naming the field
+twice. Pass `name=` to control the constraint name; without one, boundary
+derives a deterministic name from the model and the field list. A path-scoped
+model (`make_tenant_path_mixin()`) has no tenant column to lead with, so the
+helper raises when that model class is prepared.
+
+See
+[Uniqueness within a tenant](docs/how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant)
+for the migration consequences of converting an existing global constraint.
+
 ### Cross-tenant foreign key validation
 
 A row correctly scoped to tenant A can still hold a foreign key pointing at
@@ -884,6 +914,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
 | `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models, and adopted tables |
 | `boundary.E007` | Error | An expected-adopted table (a concrete model of an app in `BOUNDARY_TENANT_APPS`, not excluded, not already mixin- or path-scoped, and not the tenant model) is missing its `tenant_id` column, carries one of an unexpected type, lacks enabled-and-forced RLS, is missing either policy, or carries a unique constraint that is not composite leading with `tenant_id`. Also reports a deny-listed or uninstalled app label in the setting, the one condition needing no database connection. The expected set is derived from the live app registry, so a model added by an upstream upgrade is reported; the remedy is a second `AdoptTenantApp` migration (issues #69, #71) |
+| `boundary.E008` | Error | `settings.DEBUG` is `False` and `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`, one Error per offending setting. Each removes a category of isolation the deployment believes it has, and both default to the safe value, so reaching this state takes an explicit opt-out. Settings-only: no query, no connection, no vendor gate, so it is the one check that cannot be silently skipped. **It fires under the test runner too**, which sets `DEBUG = False`; record a deliberate choice with `"boundary.E008"` in `SILENCED_SYSTEM_CHECKS` (issue #82) |
 | `boundary.W001` | Warning | STRICT_MODE is False |
 | `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |

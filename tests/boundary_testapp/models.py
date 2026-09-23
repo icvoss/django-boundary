@@ -10,6 +10,7 @@ from boundary.models import (
     TenantQuerySet,
     make_tenant_mixin,
     make_tenant_path_mixin,
+    tenant_unique,
 )
 
 
@@ -139,3 +140,53 @@ class AssetVariant(AssetVariantMixin):
 
     class Meta:
         app_label = "boundary_testapp"
+
+
+# -- Per-tenant uniqueness fixtures (BR-ORM-015, AC-ORM-016) --
+
+
+class UniqueDoc(TenantModel):
+    """TenantMixin-flavoured model carrying tenant_unique("slug").
+
+    The auto-derived name is exercised here; UniqueLabel below exercises an
+    explicit one, so both halves of the naming rule have a concrete model.
+    """
+
+    slug = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "boundary_testapp"
+        constraints = [tenant_unique("slug")]
+
+
+class UniqueLabel(TenantModel):
+    """Two tenant_unique() calls on one model, one explicitly named.
+
+    Proves the two auto-derived names on different field lists do not
+    collide, and that an explicit name is used verbatim.
+    """
+
+    slug = models.CharField(max_length=50)
+    year = models.IntegerField(default=2026)
+
+    class Meta:
+        app_label = "boundary_testapp"
+        constraints = [
+            tenant_unique("slug"),
+            tenant_unique("slug", "year", name="boundary_testapp_uniquelabel_slug_year"),
+        ]
+
+
+class UniqueProduct(MerchantMixin):
+    """make_tenant_mixin("merchant") model carrying tenant_unique("slug").
+
+    The point of the fixture: the helper must resolve to ("merchant", "slug")
+    without the author naming the field, which is what would break if the
+    tenant field were hardcoded to "tenant" or read at call time.
+    """
+
+    slug = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "boundary_testapp"
+        constraints = [tenant_unique("slug")]

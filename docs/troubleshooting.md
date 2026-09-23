@@ -23,7 +23,9 @@ All boundary exceptions subclass `boundary.exceptions.BoundaryError`, so you can
 | `boundary.E004` at startup | `TenantMiddleware` not in `MIDDLEWARE` | Add `boundary.middleware.TenantMiddleware` to `MIDDLEWARE` |
 | `boundary.E006` at startup | A tenant-scoped table is missing forced RLS | Run the `EnableRLS` migration operation for that model |
 | `boundary.E007` at startup | An expected-adopted table is missing its `tenant_id` column, its RLS state, a policy, or its composite unique constraints | Apply an `AdoptTenantApp` migration for that app, or exclude the model |
+| `boundary.E008` at startup or at test-database creation | `DEBUG` is `False` and `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`. The test runner sets `DEBUG = False`, so a test settings module trips this too | Restore the setting to `True`, or add `"boundary.E008"` to `SILENCED_SYSTEM_CHECKS` in the settings module that disables it |
 | `IntegrityError` on `tenant_id` with no tenant | A write to an adopted table with no active tenant context | Wrap the write in `TenantContext.using(tenant)`; `admin_bypass()` does not help |
+| `IntegrityError` on a value another tenant already uses | `unique=True` on a tenant-scoped model is global, not per-tenant | Replace it with `tenant_unique("field")` in `Meta.constraints` |
 | `boundary.W001` at startup | `BOUNDARY_STRICT_MODE` is off | Set `BOUNDARY_STRICT_MODE = True` |
 
 ---
@@ -174,6 +176,53 @@ operations = [
 
 The operation is idempotent per table: a table already carrying a `tenant_id` column of the expected type is skipped unchanged, so this adopts only the newly added tables and re-establishes the constraints that drifted. If the new table already holds rows, supply `backfill_tenant` with the tenant those rows belong to, or the operation refuses (see the how-to). A table carrying a `tenant_id` column of a **different** type is refused rather than altered: boundary cannot tell its own column from one the package now genuinely declares.
 
+### `boundary.E008`: unsafe posture with `DEBUG = False`
+
+**Triggers when:** `settings.DEBUG` is `False` and `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`. One Error per offending setting, each naming its own.
+
+Both settings default to the safe value, so reaching this state took an explicit opt-out somewhere. The check exists because an opt-out set during development and never revisited is precisely how a deployment reaches production with no enforced boundary: `BOUNDARY_STRICT_MODE = False` means a query with no active tenant returns every tenant's rows instead of raising, and `BOUNDARY_SET_DB_SESSION_VAR = False` means nothing writes the variable every RLS policy reads.
+
+**Fix:** set the named setting back to `True`. If the choice is deliberate (a genuinely ORM-only deployment), record it by adding `"boundary.E008"` to `SILENCED_SYSTEM_CHECKS` in the settings module that disables the flag.
+
+#### `boundary.E008` at test-database creation
+
+You upgraded, and now `pytest` or `manage.py test` fails before a single test runs, with `SystemCheckError` naming `boundary.E008`:
+
+```
+SystemCheckError: System check identified some issues:
+
+ERRORS:
+?: (boundary.E008) BOUNDARY_STRICT_MODE is False with DEBUG = False. ...
+```
+
+**Cause:** Django's test runner sets `DEBUG = False` for the duration of the run, and `migrate` runs the system checks when it creates the test database. Your test settings module sets `BOUNDARY_STRICT_MODE = False` or `BOUNDARY_SET_DB_SESSION_VAR = False`, which was previously harmless because both conditions were only warnings. This is the first place most projects meet E008; it is not telling you anything about your production settings.
+
+**Fix:** decide which one you meant.
+
+If the test suite genuinely needs strict mode off (tests that query without a tenant on purpose, for example), keep it and record the choice in the **test** settings module:
+
+```python
+# myproject/settings/test.py
+from .base import *          # noqa: F403
+
+BOUNDARY_STRICT_MODE = False
+SILENCED_SYSTEM_CHECKS = ["boundary.E008"]
+```
+
+If only a handful of tests need it, prefer removing the module-level line and overriding per test instead, which keeps the rest of the suite honest. The surrounding check run has already happened by then, so `override_settings` never trips E008:
+
+```python
+from django.test import override_settings
+
+@override_settings(BOUNDARY_STRICT_MODE=False)
+def test_unscoped_query_returns_everything():
+    ...
+```
+
+Note that `SILENCED_SYSTEM_CHECKS` in your production settings does not help here, and silencing it there to fix a CI failure would hide the production case the check exists for. Put the entry in the module that sets the flag.
+
+---
+
 ### `boundary.W001`: strict mode off
 
 **Triggers when:** `BOUNDARY_STRICT_MODE` is `False`.
@@ -232,6 +281,29 @@ with TenantContext.using(tenant):
 Unlike a mixin-scoped model, there is no `TenantNotSetError` and no strict-mode branch to catch this earlier: an adopted table has no ORM layer at all, so the database is the first thing that notices.
 
 The paths that commonly hit this are `createsuperuser` and `loaddata` (both fixable by wrapping them in a tenant context), plus `post_migrate` handlers and an adopted app's own data migrations, which run inside `migrate` with no tenant and no call site to wrap. Those last two have no remedy: exclude the model via `BOUNDARY_ADOPT_EXCLUDE`, or seed the rows per tenant from your own code. See [Adopt a third-party app into your tenancy](./how-to/adopt-a-third-party-app.md) and [Run cross-tenant admin operations](./how-to/cross-tenant-admin-operations.md).
+
+### `IntegrityError` on a value another tenant already holds
+
+**Cause:** `unique=True` on a field of a tenant-scoped model is enforced across **every** tenant, not within one. Django built a single global unique index, so the second tenant to use `INV-001` collides with the first tenant's row, which is one they cannot see. `Meta.unique_together` and a hand-written `UniqueConstraint` whose fields do not lead with the tenant column behave the same way.
+
+The symptom is distinctive: the constraint name in the error mentions neither tenancy nor the other tenant, and the offending row is invisible to the user, the view and the form that produced it. If a user tells you "it says this reference already exists but I have never used it", this is why.
+
+**Fix:** drop the `unique=True` and express the constraint per tenant:
+
+```python
+from boundary.models import TenantModel, tenant_unique
+
+
+class Invoice(TenantModel):
+    reference = models.CharField(max_length=32)
+
+    class Meta:
+        constraints = [tenant_unique("reference")]
+```
+
+Changing an existing constraint is a drop and a create, and it fails if current rows already violate the new form, so read [Uniqueness within a tenant](./how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant) before running the migration in production.
+
+If the field really is meant to be globally unique (the tenant model's own `slug`, an external reference issued by a third party), leave it alone; global is correct there.
 
 ### Regional queries all hit the default database
 
