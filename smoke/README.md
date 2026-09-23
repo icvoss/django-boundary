@@ -79,16 +79,34 @@ migration.
 
 `smokerls/migrations/0001_rls.py` builds its `operations` list conditionally
 on the configured engine, rather than letting a router keep it off SQLite.
-That is not the pattern a consumer should want, and it is here because of
-icvoss/django-boundary#75: `EnableRLS` and `CreateTenantPolicy` emit
-PostgreSQL DDL unconditionally and never consult `router.allow_migrate()`,
-and Django's executor does not consult it on their behalf either, because it
-only does so for operations that go through `allow_migrate_model`. A router
-therefore cannot gate them today, and pointing the migration at SQLite fails
-with `OperationalError: near "ENABLE": syntax error`.
+That is not the pattern a consumer should want, and it stays for a reason
+that outlived the one it was written for.
 
-When #75 lands, the condition collapses into an ordinary router and the
-comment in that file goes with it.
+It was originally here because of icvoss/django-boundary#75: `EnableRLS` and
+`CreateTenantPolicy` consulted no router at all, so nothing could keep them
+off a SQLite alias. #75 has now landed, and BR-RLS-021 gives all four RLS
+operations the router and vendor gates. The condition still cannot collapse
+into a router, because of **which model the router is asked about**.
+
+Gate 1 asks `router.allow_migrate_model(alias, model)` about the *resolved*
+model, which under this migration's `app_label="smokeapp"` override is
+`smokeapp.Booking`, not `smokerls`. So both available router keys fail:
+
+- Denying `smokerls` does nothing, because the router is never asked about
+  it. Gate 2 then refuses by name with `RLSOperationRefusedError`, whose
+  message advises the very thing that does not work here.
+- Denying `smokeapp` denies the **table** too, because Django's own
+  `CreateModel` makes the identical `allow_migrate_model(alias, model)` call
+  and boundary passes no hint distinguishing its RLS gate from it. Verified
+  on SQLite: `migrate` reports everything applied, exits 0, and the database
+  ends up with no smoke tables at all. The gate would pass while proving
+  nothing.
+
+The router shape BR-RLS-013 and BR-RLS-021 describe works for **adopted**
+apps, where denying the target app correctly denies both its DDL and its RLS
+layer. It does not reach a column-bearing model in the consumer's own app.
+That is icvoss/django-boundary#86, and this condition stays until it is
+resolved.
 
 ## Adding to it
 
