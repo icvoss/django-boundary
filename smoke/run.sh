@@ -57,7 +57,22 @@ fi
 
 VENV_DIR="$(mktemp -d)/venv"
 SQLITE_DB="$(mktemp -d)/smoke.sqlite3"
+
+# AC-TEST-007's negative control edits this file and must put it back exactly.
+# The pristine copy is taken before anything runs and restored by the EXIT
+# trap as well as inline, so an interrupted or failing run cannot leave a
+# checkout carrying the deliberate defect.
+NEGATIVE_CONTROL_MODEL="${CONSUMER_DIR}/smokeapp/models.py"
+NEGATIVE_CONTROL_BACKUP="$(mktemp -d)/models.py.orig"
+cp "${NEGATIVE_CONTROL_MODEL}" "${NEGATIVE_CONTROL_BACKUP}"
+
 cleanup() {
+    # Restore first: the model file lives in the repository, unlike the
+    # temporary directories below, so losing it matters and rm does not.
+    if [[ -f "${NEGATIVE_CONTROL_BACKUP}" ]]; then
+        cp "${NEGATIVE_CONTROL_BACKUP}" "${NEGATIVE_CONTROL_MODEL}"
+        rm -rf "$(dirname "${NEGATIVE_CONTROL_BACKUP}")"
+    fi
     rm -rf "$(dirname "${VENV_DIR}")" "$(dirname "${SQLITE_DB}")"
 }
 trap cleanup EXIT
@@ -139,6 +154,43 @@ if [[ "${MODE}" == "all" ]]; then
     # The consumer cannot self-remedy one, because Django wants to write the
     # migration into site-packages, which is unwritable.
     "${PY}" manage.py makemigrations --check --dry-run
+
+    echo
+    echo "--- Step 1b: negative control, the check must FAIL on an unmigrated change"
+    # AC-TEST-007's negative control. Step 1 passing proves nothing on its own:
+    # a step wired to the wrong directory, the wrong settings, or an app with
+    # no models would pass unconditionally and report a green gate forever.
+    # This appends a genuinely unmigrated field to the consumer's own model and
+    # asserts the same command now exits non-zero, then restores the file and
+    # asserts it exits zero again. Both halves are needed: the failure proves
+    # the step is wired to the consumer's state, and the recovery proves the
+    # failure came from the edit rather than from anything this script broke
+    # on its way past.
+    printf '\n    unmigrated_negative_control = models.CharField(max_length=8, default="x")\n' \
+        >>"${NEGATIVE_CONTROL_MODEL}"
+
+    if "${PY}" manage.py makemigrations --check --dry-run >/dev/null 2>&1; then
+        # Restore before failing, so a failure here does not also leave the
+        # checkout dirty. The EXIT trap would catch it, but not before the
+        # error message is read.
+        cp "${NEGATIVE_CONTROL_BACKUP}" "${NEGATIVE_CONTROL_MODEL}"
+        echo "ERROR: makemigrations --check passed with a deliberately unmigrated field." >&2
+        echo "The step is not wired to the consumer's model state, so step 1 above is" >&2
+        echo "passing unconditionally and has never proved anything (AC-TEST-007)." >&2
+        exit 1
+    fi
+    echo "the unmigrated field was detected, as it must be"
+
+    # Byte for byte: the same bytes that were read at startup, not a sed
+    # undo of the append, so nothing about the file can drift across a run.
+    cp "${NEGATIVE_CONTROL_BACKUP}" "${NEGATIVE_CONTROL_MODEL}"
+    if ! cmp -s "${NEGATIVE_CONTROL_BACKUP}" "${NEGATIVE_CONTROL_MODEL}"; then
+        echo "ERROR: failed to restore ${NEGATIVE_CONTROL_MODEL} byte for byte." >&2
+        exit 1
+    fi
+
+    "${PY}" manage.py makemigrations --check --dry-run
+    echo "the restored model passes the check again"
 
     echo
     echo "--- Step 2 of 3: manage.py migrate on a fresh database, then manage.py check"
