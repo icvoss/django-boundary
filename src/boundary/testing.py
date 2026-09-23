@@ -348,7 +348,7 @@ def assert_rls_enforced(connection_params: dict, *, alias: str = "default") -> N
         # own pre-migrate skip.
 
 
-def rls_enforced(connection_params: dict) -> None:
+def rls_enforced(connection_params: dict, *, alias: str = "default") -> None:
     """Session-fixture body: fail the pytest run closed if RLS is not enforced.
 
     Not decorated with ``@pytest.fixture`` itself, because the connection
@@ -381,10 +381,26 @@ def rls_enforced(connection_params: dict) -> None:
     failure among possibly thousands of collected tests, each of which is
     about to pass vacuously; ``pytest.exit`` makes that unmissable instead
     of scrollable.
+
+    Args:
+        connection_params: connection kwargs passed through to
+            ``assert_rls_enforced()``, as returned by
+            :func:`provision_rls_test_role`.
+        alias: the Django database alias whose vendor decides whether the
+            underlying assertion proceeds, passed straight through to
+            :func:`assert_rls_enforced`. Default ``"default"``. Keyword-only,
+            and added compatibly: every existing call keeps working
+            unchanged. A consumer whose RLS-carrying alias is not
+            ``default`` needs this, because without it the wrapper pins the
+            vendor read to ``default`` and a project with, say, a SQLite
+            ``default`` beside a PostgreSQL tenant alias would get
+            ``assert_rls_enforced()``'s quiet non-PostgreSQL return and a
+            silently vacuous fixture, which is the exact failure this
+            function exists to make impossible.
     """
     import pytest
 
     try:
-        assert_rls_enforced(connection_params)
+        assert_rls_enforced(connection_params, alias=alias)
     except RLSNotEnforcedError as exc:
         pytest.exit(f"boundary: RLS is not enforced for this test run: {exc}", returncode=1)

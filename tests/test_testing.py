@@ -636,3 +636,96 @@ class TestAcTest006TheVendorGuardPrecedesThePsycopgImport:
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
             "alias must be keyword-only so a positional second argument cannot be mistaken for it"
         )
+
+
+class TestRlsEnforcedPassesTheAliasThrough:
+    """``rls_enforced()`` forwards its ``alias`` keyword to
+    ``assert_rls_enforced()``.
+
+    ``rls_enforced()`` is the session-fixture wrapper: it calls
+    ``assert_rls_enforced()`` and converts ``RLSNotEnforcedError`` into
+    ``pytest.exit()`` so a run whose RLS is not enforced stops before
+    collecting rather than reporting one failure among thousands about to pass
+    vacuously. ``assert_rls_enforced()`` grew an ``alias`` keyword for the
+    consumer whose RLS-carrying alias is not ``default``; the wrapper did not,
+    so that consumer could reach the keyword only by bypassing the wrapper and
+    losing the fail-closed behaviour.
+
+    Why it matters more here than at the inner call: without the keyword the
+    wrapper pins the vendor read to ``default``, so a project with a SQLite
+    ``default`` beside a PostgreSQL tenant alias gets
+    ``assert_rls_enforced()``'s quiet non-PostgreSQL return, and the fixture
+    silently proves nothing. That is precisely the vacuous-pass outcome the
+    function exists to make impossible.
+    """
+
+    def test_the_alias_keyword_reaches_assert_rls_enforced(self, monkeypatch):
+        """The keyword is forwarded, proven by observing what
+        ``assert_rls_enforced`` was actually called with.
+
+        Patched on the module rather than asserted through behaviour, because
+        the observable effect of a correct and an incorrect alias is the same
+        on a suite whose ``default`` is already PostgreSQL: both return None.
+        The call record is the discriminator.
+        """
+        from boundary import testing
+
+        recorded = {}
+
+        def _fake(connection_params, *, alias="default"):
+            recorded["connection_params"] = connection_params
+            recorded["alias"] = alias
+
+        monkeypatch.setattr(testing, "assert_rls_enforced", _fake)
+        testing.rls_enforced({"host": "example.invalid"}, alias="eu-west")
+
+        assert recorded["alias"] == "eu-west", "rls_enforced() must forward its alias keyword, not drop it"
+        assert recorded["connection_params"] == {"host": "example.invalid"}
+
+    def test_it_defaults_to_the_default_alias(self, monkeypatch):
+        """Negative control for the test above, and the compatibility claim:
+        a call that passes no alias still reaches the inner function with
+        ``"default"``, so every existing consumer fixture is unchanged.
+
+        Without this, the forwarding test alone would also pass against an
+        implementation that hardcoded ``alias="eu-west"``.
+        """
+        from boundary import testing
+
+        recorded = {}
+
+        def _fake(connection_params, *, alias="default"):
+            recorded["alias"] = alias
+
+        monkeypatch.setattr(testing, "assert_rls_enforced", _fake)
+        testing.rls_enforced({})
+
+        assert recorded["alias"] == "default"
+
+    def test_the_keyword_is_keyword_only_and_defaults_to_default(self):
+        """The signature is compatible: ``alias`` is keyword-only, so a
+        positional second argument cannot be mistaken for it, and it defaults
+        to ``"default"``. Mirrors the same assertion on
+        ``assert_rls_enforced()``.
+        """
+        import inspect
+
+        from boundary.testing import rls_enforced
+
+        parameter = inspect.signature(rls_enforced).parameters["alias"]
+        assert parameter.default == "default"
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_a_non_postgresql_alias_still_returns_without_exiting(self):
+        """End to end through the real inner function: pointing the wrapper at
+        the suite's SQLite ``eu-west`` alias returns cleanly rather than
+        calling ``pytest.exit()``.
+
+        Unpatched, so it proves the forwarded alias actually reaches the vendor
+        guard: unusable connection params would raise from psycopg if the
+        guard did not fire on the alias named here, and a ``pytest.exit()``
+        would abort this run outright rather than fail this test.
+        """
+        from boundary.testing import rls_enforced
+
+        assert rls_enforced({"host": "boundary-test-no-such-host.invalid"}, alias="eu-west") is None
