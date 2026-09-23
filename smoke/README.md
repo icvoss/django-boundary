@@ -75,38 +75,51 @@ concrete tenant inheriting `AbstractTenant` and named by
 `TenantMiddleware` mounted, and `EnableRLS` plus `CreateTenantPolicy` in a
 migration.
 
-## The one piece of scaffolding, and why
+## No scaffolding: the same migration runs on both backends
 
-`smokerls/migrations/0001_rls.py` builds its `operations` list conditionally
-on the configured engine, rather than letting a router keep it off SQLite.
-That is not the pattern a consumer should want, and it stays for a reason
-that outlived the one it was written for.
+`smokerls/migrations/0001_rls.py` is two plain operations, with no backend
+conditional and no router. That is the point of it, and it is what a consumer
+writes: `EnableRLS` and `CreateTenantPolicy` apply on PostgreSQL and are a
+**logged no-op** anywhere else (BR-RLS-021, icvoss/django-boundary#86), so one
+migration file serves a SQLite development database and a PostgreSQL
+production one.
 
-It was originally here because of icvoss/django-boundary#75: `EnableRLS` and
-`CreateTenantPolicy` consulted no router at all, so nothing could keep them
-off a SQLite alias. #75 has now landed, and BR-RLS-021 gives all four RLS
-operations the router and vendor gates. The condition still cannot collapse
-into a router, because of **which model the router is asked about**.
+The gate therefore proves the ruled behaviour on both legs from the same file:
 
-Gate 1 asks `router.allow_migrate_model(alias, model)` about the *resolved*
-model, which under this migration's `app_label="smokeapp"` override is
-`smokeapp.Booking`, not `smokerls`. So both available router keys fail:
+- **PostgreSQL**: both operations apply, and `smokeapp_booking` comes out with
+  row security enabled and forced, carrying `boundary_tenant_isolation` and
+  `boundary_admin_bypass`.
+- **SQLite**: both return after one `logger.info` line each on
+  `boundary.migrations` naming the operation, the model, the alias and the
+  vendor. No DDL, no error, `migrate` reports the migration applied, and the
+  smoke tables exist. `Booking` keeps its ORM-layer tenant filtering, which is
+  what BR-ENV-002 promises there.
 
-- Denying `smokerls` does nothing, because the router is never asked about
-  it. Gate 2 then refuses by name with `RLSOperationRefusedError`, whose
-  message advises the very thing that does not work here.
-- Denying `smokeapp` denies the **table** too, because Django's own
-  `CreateModel` makes the identical `allow_migrate_model(alias, model)` call
-  and boundary passes no hint distinguishing its RLS gate from it. Verified
-  on SQLite: `migrate` reports everything applied, exits 0, and the database
-  ends up with no smoke tables at all. The gate would pass while proving
-  nothing.
+`smokerls` stays a separate app because the RLS layer is the part a
+non-PostgreSQL deployment does not get and it reads more clearly on its own.
+Nothing keys on that app boundary any more.
 
-The router shape BR-RLS-013 and BR-RLS-021 describe works for **adopted**
-apps, where denying the target app correctly denies both its DDL and its RLS
-layer. It does not reach a column-bearing model in the consumer's own app.
-That is icvoss/django-boundary#86, and this condition stays until it is
-resolved.
+### Why this file used to be scaffolding
+
+Worth keeping, because this fixture was the evidence in two rulings.
+
+It first carried a `settings.DATABASES[...]["ENGINE"]` conditional because the
+operations consulted no router at all, so nothing could keep them off a SQLite
+alias (#75). After #75 landed it still could not use a router, because gate 1
+asks `router.allow_migrate_model(alias, model)` about the *resolved* model
+(`smokeapp.Booking` under this migration's `app_label` override, not
+`smokerls`). Denying `smokerls` did nothing, and denying `smokeapp` denied the
+**table** too, since Django's own `CreateModel` makes the identical call and
+boundary passes no distinguishing hint. Verified at the time on SQLite:
+`migrate` reported everything applied, exited 0, and the database ended up
+with no smoke tables at all, so the gate passed while proving nothing.
+
+That is what #86 resolved, by making the vendor gate a logged no-op rather
+than a refusal. The router shape BR-RLS-013 describes still applies to
+**adopted** apps, where denying the target app correctly denies both its DDL
+and its RLS layer; `AdoptTenantApp` is also the one operation that still
+refuses off PostgreSQL, because an adopted table has no ORM layer beneath the
+policy.
 
 ## Adding to it
 
