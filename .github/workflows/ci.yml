@@ -38,7 +38,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        # BR-ENV-004: every supported Python against every supported Django.
+        # Both axes are read by AC-TEST-008, which parses this file and
+        # compares them against the rule, so adding a version here without
+        # adding it to BR-ENV-004 (or the reverse) fails the suite.
+        python-version: ["3.12", "3.13"]
         django-version: ["5.2", "6.0", "6.1"]
 
     services:
@@ -94,3 +98,232 @@ jobs:
           POSTGRES_DB: boundary_test
           POSTGRES_HOST: localhost
           POSTGRES_PORT: "5432"
+
+  test-postgres-14:
+    # BR-ENV-001 supports PostgreSQL 14, 15 and 16, and a supported major
+    # with no leg is an unverified claim rather than a supported
+    # environment. 16 is covered by every leg of `test` above; this job and
+    # the next cover the other two, on the oldest supported Django so the
+    # oldest supported things are exercised together.
+    #
+    # Written as two jobs with literal image tags rather than one job with a
+    # postgres-version matrix, because AC-TEST-008 reads the set of
+    # postgres:<major> service images straight out of this file: a matrix
+    # would leave "postgres:${{ matrix.postgres-version }}" there, which
+    # names no major at all.
+    name: Test (PostgreSQL 14, Python 3.12, Django 5.2)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: icv_test
+          POSTGRES_PASSWORD: icv_test_password
+          POSTGRES_DB: boundary_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Django~=5.2.0"
+          pip install pytest pytest-django pytest-cov factory-boy psycopg[binary]
+          pip install -e .
+
+      - name: Provision the non-superuser icv_app role for RLS enforcement tests
+        # Same reason as the `test` job: without it the role-dependent tests
+        # skip, and BR-ENV-006 requires zero skipped tests on every leg.
+        run: |
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "CREATE ROLE icv_app LOGIN PASSWORD 'icv_dev' NOSUPERUSER NOBYPASSRLS;"
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "GRANT CONNECT ON DATABASE boundary_test TO icv_app; GRANT USAGE ON SCHEMA public TO icv_app;"
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --color=yes
+        env:
+          DJANGO_SETTINGS_MODULE: settings
+          PYTHONPATH: src:tests
+          POSTGRES_USER: icv_test
+          POSTGRES_PASSWORD: icv_test_password
+          POSTGRES_DB: boundary_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+
+  test-postgres-15:
+    # BR-ENV-001's middle supported major. See test-postgres-14 above for
+    # why these are two jobs with literal image tags rather than a matrix.
+    name: Test (PostgreSQL 15, Python 3.12, Django 5.2)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: icv_test
+          POSTGRES_PASSWORD: icv_test_password
+          POSTGRES_DB: boundary_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Django~=5.2.0"
+          pip install pytest pytest-django pytest-cov factory-boy psycopg[binary]
+          pip install -e .
+
+      - name: Provision the non-superuser icv_app role for RLS enforcement tests
+        # Same reason as the `test` job: without it the role-dependent tests
+        # skip, and BR-ENV-006 requires zero skipped tests on every leg.
+        run: |
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "CREATE ROLE icv_app LOGIN PASSWORD 'icv_dev' NOSUPERUSER NOBYPASSRLS;"
+          PGPASSWORD=icv_test_password psql -h localhost -p 5432 -U icv_test -d boundary_test -c \
+            "GRANT CONNECT ON DATABASE boundary_test TO icv_app; GRANT USAGE ON SCHEMA public TO icv_app;"
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --color=yes
+        env:
+          DJANGO_SETTINGS_MODULE: settings
+          PYTHONPATH: src:tests
+          POSTGRES_USER: icv_test
+          POSTGRES_PASSWORD: icv_test_password
+          POSTGRES_DB: boundary_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+
+  test-sqlite:
+    # BR-ENV-006: the suite runs with SQLite as the `default` alias, proving
+    # BR-ENV-002's quiet returns on a backend with no Row Level Security at
+    # all. This is the backend consumers develop against locally, and until
+    # this leg existed nothing had ever run there.
+    #
+    # The leg's test database builds only because tests/settings.py installs
+    # a router denying allow_migrate() for thirdparty and boundary_consumer
+    # on this alias. That is the live exercise of BR-RLS-013 and BR-RLS-021's
+    # "a denied alias receives no DDL and no error", on a real migration
+    # graph: remove the router and the consumer's adoption migration refuses
+    # the SQLite alias by name and no test runs at all.
+    name: Test (SQLite default, Python 3.12, Django 5.2)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # No psycopg: the point of this leg is a consumer's ordinary SQLite
+        # checkout, and a missing driver is part of that shape.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Django~=5.2.0"
+          pip install pytest pytest-django pytest-cov factory-boy
+          pip install -e .
+
+      - name: Run tests
+        # -m "not rls" DESELECTS the tests that need a PostgreSQL RLS
+        # backend, before collection finishes, rather than skipping them at
+        # runtime. BR-ENV-006 makes that distinction load-bearing: a skipped
+        # test is indistinguishable from a leg whose database or role never
+        # materialised, which is the failure the zero-skipped rule exists to
+        # catch, while a deselected test is named on the command line and
+        # counted in the summary below.
+        #
+        # -rs prints the reason for any skip, so a reintroduced pytest.skip
+        # is visible in the log and not only in the count.
+        run: |
+          set -o pipefail
+          pytest tests/ -v --tb=short --color=yes -rs -m "not rls" | tee pytest-sqlite.log
+        env:
+          BOUNDARY_TEST_DB: sqlite
+          DJANGO_SETTINGS_MODULE: settings
+          PYTHONPATH: src:tests
+
+      - name: Report collected, deselected and passed counts, and fail on any skip
+        # BR-ENV-006: every leg reports zero skipped tests, read from the
+        # pytest summary rather than from the exit code, because a leg whose
+        # tests were collected and skipped has verified nothing. Deselected
+        # is counted separately and is expected to be non-zero here; skipped
+        # is not, and a single " skipped" in the summary line fails the leg.
+        if: always()
+        run: |
+          echo "--- collection and outcome, from the pytest summary"
+          grep -E "tests? collected|deselected" pytest-sqlite.log || true
+          SUMMARY="$(grep -E "^=+ .*(passed|failed|error).* =+$" pytest-sqlite.log | tail -1)"
+          echo "summary: ${SUMMARY}"
+          if [[ -z "${SUMMARY}" ]]; then
+            echo "ERROR: no pytest summary line found; the run did not complete."
+            exit 1
+          fi
+          if [[ "${SUMMARY}" == *" skipped"* ]]; then
+            echo "ERROR: this leg skipped tests. A skipped test has verified nothing and is"
+            echo "indistinguishable from a leg whose environment never materialised"
+            echo "(BR-ENV-006). Deselect it with the rls marker if it cannot apply on"
+            echo "SQLite, or fix what made it skip."
+            exit 1
+          fi
+          echo "Zero skipped tests on the SQLite leg."
+
+  mypy:
+    # ADR-027's typing leg, run against the package itself under the exact
+    # mypy and django-stubs pair the dev extra declares.
+    #
+    # continue-on-error until icvoss/django-boundary#81's typing fix lands
+    # (7 errors in src/boundary at 3fdc7bf under mypy 1.19.1 with
+    # django-stubs 5.2.9). ADR-027 names this advisory-vs-blocking state
+    # explicitly and requires it be recorded rather than left implicit.
+    # Added 2026-09-23; flip to blocking in the same change that makes
+    # src/boundary clean, and delete this comment with it.
+    name: Typecheck (mypy, advisory until #81)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the declared mypy and django-stubs pair
+        # From the dev extra, so the pair stays a single source of truth
+        # rather than a hand-list here that can rot away from it.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run mypy on the package
+        run: mypy src/boundary
