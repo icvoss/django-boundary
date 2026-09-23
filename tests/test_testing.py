@@ -599,6 +599,7 @@ class TestAcTest006TheVendorGuardPrecedesThePsycopgImport:
         with pytest.raises(ImportError):
             import psycopg  # noqa: F401
 
+    @pytest.mark.rls
     def test_the_alias_keyword_selects_which_vendor_is_read(self):
         """And the alias keyword is what selects the vendor read: the same
         call against the PostgreSQL ``default`` alias proceeds past the guard
@@ -609,6 +610,12 @@ class TestAcTest006TheVendorGuardPrecedesThePsycopgImport:
         helper vacuous on the backend it exists for. Here the unreachable
         connection params must produce a psycopg error, proving the guard did
         NOT fire and the function went on to connect.
+
+        Marked ``rls``: the control needs ``default`` to BE PostgreSQL, which
+        it is not on the SQLite leg, where the guard fires correctly and there
+        is no non-PostgreSQL-vs-PostgreSQL contrast to draw in one process
+        (BR-ENV-006). The quiet-return assertions it discriminates against run
+        on every leg, so the pair is never both deselected.
         """
         import psycopg
         from django.db import connection

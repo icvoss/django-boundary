@@ -548,6 +548,7 @@ class TestAcRls017AppLabelOverride:
             assert "thirdparty.Widget" not in plain, op_class.__name__
 
     @pytest.mark.django_db
+    @pytest.mark.rls
     def test_ac_rls_017_the_override_resolves_the_model_from_the_named_app(self, tenant_a):
         """Given a migration in the consumer's app containing
         EnableRLS(..., app_label=...) followed by CreateTenantPolicy(...,
@@ -557,6 +558,11 @@ class TestAcRls017AppLabelOverride:
         The owning app label passed to database_forwards() is deliberately
         one that holds no such model, so the assertion fails with LookupError
         rather than passing vacuously if the override were ignored.
+
+        Marked ``rls``: it applies real RLS DDL through the schema editor and
+        reads ``pg_policy`` back, neither of which SQLite has (BR-ENV-006).
+        The serialisation and description halves of AC-RLS-017, in the sibling
+        tests of this class, need no database and run on every leg.
         """
         state = _get_fake_state()
         owning_app = "boundary"  # the consumer's own app: it has no Booking
@@ -909,6 +915,7 @@ class TestAcRls019RouterAndVendorGates:
             )
             assert model_name == "booking"
 
+    @pytest.mark.rls
     def test_the_default_alias_is_processed_normally_in_the_same_run(self):
         """And ``default`` is processed normally by the same router in the same
         run, proving the gate discriminates by alias rather than suppressing
@@ -924,7 +931,10 @@ class TestAcRls019RouterAndVendorGates:
         nothing" assertion above would also hold for an implementation that
         had stopped emitting DDL anywhere at all. This is the test that
         catches that, and it is the only one here that reads real RLS state
-        out of a real PostgreSQL database.
+        out of a real PostgreSQL database. That is also why it is marked
+        ``rls``: it needs ``default`` to BE PostgreSQL, so on the SQLite leg
+        it is deselected rather than run against a backend that cannot hold
+        the state it reads (BR-ENV-006).
         """
         from django.db import connections
         from django.test import override_settings
@@ -963,6 +973,7 @@ class TestAcRls019RouterAndVendorGates:
                 with connection.schema_editor() as editor:
                     EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
 
+    @pytest.mark.rls
     def test_the_postgresql_alias_logs_no_skip_line(self, caplog):
         """And the admitted PostgreSQL alias logs no skip line, so the log is
         evidence about the vendor rather than noise on every migrate.
@@ -970,6 +981,11 @@ class TestAcRls019RouterAndVendorGates:
         The negative control for the log assertions above. Without it, they
         would all pass against an implementation that logged the line
         unconditionally and emitted its DDL anyway.
+
+        Marked ``rls`` because the assertion IS "the PostgreSQL alias is
+        quiet": on the SQLite leg ``default`` is SQLite, so the skip line is
+        correctly emitted and the test would fail for the right behaviour
+        (BR-ENV-006). The PostgreSQL legs are where this control has teeth.
         """
         import logging
 

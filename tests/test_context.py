@@ -360,8 +360,19 @@ class TestSetClearDbSessionUnopenedConnection:
     is later opened without going through this call again. Driven by
     calling the methods directly against an alias whose connection is
     guaranteed unopened, rather than mocking the logger.
+
+    The three tests asserting the warning IS issued are marked ``rls``. The
+    ``unopened`` alias they build is a copy of ``default``, so on the SQLite
+    leg it is a SQLite alias, and BR-ENV-002's per-alias vendor gate then
+    correctly returns BEFORE the connection-open check, issuing nothing. That
+    is the specified behaviour, not a defect: the warning exists because a
+    missing session variable costs RLS its tenant, and an alias with no RLS
+    has nothing to lose. Asserting the warning there would assert against
+    BR-CTX-002. The opt-out test in this class needs no PostgreSQL, since it
+    asserts silence, and stays unmarked.
     """
 
+    @pytest.mark.rls
     def test_set_db_session_warns_naming_alias_and_tenant(self, caplog, settings):
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
@@ -388,6 +399,7 @@ class TestSetClearDbSessionUnopenedConnection:
             for r in records
         ), "expected a WARNING record naming the unopened alias and tenant id"
 
+    @pytest.mark.rls
     def test_clear_db_session_warns_naming_alias(self, caplog, settings):
         settings.DATABASES = {**settings.DATABASES, "unopened": dict(settings.DATABASES["default"])}
         from django.db import connections
@@ -440,6 +452,7 @@ class TestSetClearDbSessionUnopenedConnection:
         records = [r for r in caplog.records if r.name == "boundary.context"]
         assert records == [], f"expected no WARNING records with the opt-out set, got: {[r.message for r in records]}"
 
+    @pytest.mark.rls
     def test_default_still_warns_on_the_same_unopened_alias(self, caplog, settings):
         """Companion to test_opt_out_silences_the_unopened_connection_warning:
         with BOUNDARY_SET_DB_SESSION_VAR at its True default, the same
@@ -1050,22 +1063,29 @@ class TestContextLayerIsQuietOnNonPostgreSQL:
             with admin_bypass(using=self.SQLITE_ALIAS):
                 assert Booking.unscoped.count() == 2
 
+    @pytest.mark.rls
     @pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
     def test_gate_is_per_alias_not_per_process(self, tenant_a, settings):
         """Positive control for the per-alias claim, paired with the
         negative above.
 
-        Skipped on the SQLite leg, where ``default`` is SQLite too and there
-        is no PostgreSQL alias in the process for the gate to answer
-        differently about. On the PostgreSQL leg this is the whole point of
-        gating on ``using``: the same process, the same call, one alias
-        writing the session variable and the other not.
+        Needs a PostgreSQL ``default`` to contrast against the SQLite
+        ``eu-west``: on the SQLite leg ``default`` is SQLite too, so there is
+        no PostgreSQL alias in the process for the gate to answer differently
+        about. On the PostgreSQL leg this is the whole point of gating on
+        ``using``: the same process, the same call, one alias writing the
+        session variable and the other not.
+
+        Marked ``rls`` rather than skipping at runtime. BR-ENV-006 makes the
+        distinction load-bearing: a deselected test is a leg declining a test
+        that cannot apply, where a skipped one is indistinguishable from a leg
+        whose database or role never materialised, which is the failure the
+        zero-skipped rule exists to catch. The SQLite CI leg greps its pytest
+        summary for " skipped" and fails on a hit, so the previous
+        ``pytest.skip`` would have failed that leg.
         """
         from django.db import connections
         from django.test.utils import CaptureQueriesContext
-
-        if connections["default"].vendor != "postgresql":
-            pytest.skip("needs a PostgreSQL default alias to contrast against eu-west")
 
         settings.DEBUG = True
         pg_connection = connections["default"]

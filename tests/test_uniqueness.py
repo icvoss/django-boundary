@@ -282,10 +282,19 @@ class TestPerTenantUniquenessIsEnforced:
         with set_tenant(tenant_a), pytest.raises(IntegrityError), transaction.atomic():
             UniqueProduct.objects.create(slug="widget")
 
+    @pytest.mark.rls
     def test_the_constraint_columns_in_the_database_lead_with_the_tenant(self):
         """Read from ``pg_constraint`` rather than from ``_meta``: the ORM
         view of the constraint and the constraint PostgreSQL actually built
-        are different facts, and only the second one isolates anything."""
+        are different facts, and only the second one isolates anything.
+
+        Marked ``rls``: the query is PostgreSQL catalogue SQL, which SQLite
+        answers with ``no such table: pg_class`` (BR-ENV-006). The behavioural
+        assertions in this class, that two tenants may hold the same slug and
+        one may not hold it twice, run on both backends and are where SQLite
+        proves the constraint exists; this test is where PostgreSQL proves the
+        column ORDER is right.
+        """
         from django.db import connection
 
         for table, expected in (
