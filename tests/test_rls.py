@@ -574,3 +574,334 @@ class TestAcRls017AppLabelOverride:
         finally:
             with connection.schema_editor() as editor:
                 EnableRLS("Booking", app_label="boundary_testapp").database_backwards(owning_app, editor, state, state)
+
+
+# ── AC-RLS-019: the router and vendor gates (BR-RLS-021) ─────
+
+
+class _DenyingRouter:
+    """A router that refuses every migration on every alias."""
+
+    def allow_migrate(self, db, app_label, **hints):
+        return False
+
+
+class _RecordingRouter:
+    """A router that allows everything and records what it was asked.
+
+    Written to Django's documented ``allow_migrate(db, app_label,
+    model_name=None, **hints)`` signature, which is the shape a consumer's
+    router has, so what it records is what a real router would receive.
+    """
+
+    calls: list = []
+
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        type(self).calls.append((db, app_label, model_name, hints))
+        return True
+
+
+class _AliasDenyingRouter:
+    """A router that denies one named alias and allows every other.
+
+    The discriminator for AC-RLS-019: the same router, in the same run, must
+    deny ``eu-west`` and admit ``default``. A gate that suppressed the
+    operation outright on any denial would pass the denied half and fail
+    here.
+    """
+
+    denied_alias = "eu-west"
+
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        return db != self.denied_alias
+
+
+def _sqlite_rls_state(alias="eu-west"):
+    """Return what the SQLite alias can be asked about RLS, which is nothing.
+
+    SQLite has no ``pg_class``, no policies and no notion of row security, so
+    "the alias is untouched" cannot be asserted by reading RLS state out of
+    it the way the PostgreSQL assertions do. The instrument is
+    ``collect_sql=True`` instead: the schema editor appends every statement
+    it is handed to a list rather than executing it, so an empty list is
+    positive evidence the operation emitted nothing, rather than evidence it
+    emitted something the connection silently swallowed.
+    """
+    from django.db import connections
+
+    return connections[alias].vendor
+
+
+@pytest.mark.django_db(transaction=True, databases=["default", "eu-west"])
+class TestAcRls019RouterAndVendorGates:
+    """AC-RLS-019 (BR-RLS-021): ``EnableRLS``, ``CreateTenantPolicy`` and
+    ``DropTenantPolicy`` each apply the router gate then the vendor gate, in
+    that order, in both directions.
+
+    The ordering is the whole point of having two gates. A router denial is a
+    legitimate per-alias skip and stays silent, because a router's
+    ``allow_migrate()`` is the documented way to keep a non-PostgreSQL alias
+    off the RLS graph and so cannot itself raise; a vendor mismatch on an
+    alias the router DID admit is a consumer error and is named, rather than
+    surfacing as SQLite's own parser error on a fragment of generated SQL
+    (icvoss/django-boundary#75).
+
+    Asserted against the suite's real SQLite ``eu-west`` alias rather than a
+    stub connection, so the vendor string is the one a real backend reports.
+    """
+
+    #: The three operations under test, each constructed against the
+    #: unmigrated ``boundary_testapp.Booking``, whose table the test runner
+    #: creates on every alias including ``eu-west``.
+    OPERATIONS = (
+        ("EnableRLS", EnableRLS),
+        ("CreateTenantPolicy", CreateTenantPolicy),
+        ("DropTenantPolicy", DropTenantPolicy),
+    )
+
+    def test_a_denying_router_emits_nothing_on_eu_west_in_both_directions(self):
+        """Given a router denying the SQLite ``eu-west`` alias, when each of
+        the three operations runs forwards and backwards against it, then no
+        DDL is emitted and nothing is raised.
+
+        ``collect_sql=True`` is the instrument rather than an after-the-fact
+        read of the alias: an empty collected list is evidence the operation
+        emitted nothing, where reading state back from SQLite could not
+        distinguish "emitted nothing" from "emitted something the backend
+        ignored". The forward and the reverse each need their own assertion,
+        since a guard on the forward alone would let a reverse strip RLS from
+        an alias that never had it.
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        assert _sqlite_rls_state() == "sqlite", "the eu-west alias must be the SQLite one"
+
+        state = _get_fake_state()
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking")
+            with (
+                override_settings(DATABASE_ROUTERS=[_DenyingRouter()]),
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
+            ):
+                operation.database_forwards("boundary_testapp", editor, state, state)
+                assert list(editor.collected_sql) == [], f"{name}.database_forwards emitted DDL on a denied alias"
+                operation.database_backwards("boundary_testapp", editor, state, state)
+                assert list(editor.collected_sql) == [], f"{name}.database_backwards emitted DDL on a denied alias"
+
+    def test_an_allowing_router_on_eu_west_is_refused_naming_operation_alias_and_vendor(self):
+        """When the router is changed to admit ``eu-west`` and the same
+        operations are applied to it, then each raises a ``BoundaryError``
+        subclass whose message names that operation, the alias and the vendor.
+
+        Three separate assertions on one message, all load-bearing. Naming the
+        vendor is what tells the consumer the layer is PostgreSQL-only; naming
+        the alias is what tells them WHICH of their databases refused, which a
+        multi-alias project needs; naming the operation is what keeps a
+        consumer reading an ``EnableRLS`` traceback from being told about app
+        adoption, a different operation they may not have written at all
+        (BR-RLS-021: the error is ``AdoptionRefusedError``'s sibling, not its
+        reuse).
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        from boundary.exceptions import BoundaryError
+
+        state = _get_fake_state()
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking")
+            with (
+                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+                connections["eu-west"].schema_editor() as editor,
+                pytest.raises(BoundaryError) as caught,
+            ):
+                operation.database_forwards("boundary_testapp", editor, state, state)
+
+            message = str(caught.value)
+            assert name in message, f"the refusal must name the operation; got {message!r}"
+            assert "eu-west" in message, f"the refusal must name the alias; got {message!r}"
+            assert "sqlite" in message, f"the refusal must name the vendor; got {message!r}"
+            assert "Row Level Security" in message
+            assert "allow_migrate" in message, "the refusal must point at the documented remedy"
+
+    def test_the_reverse_refuses_the_admitted_non_postgresql_alias_too(self):
+        """And the same two gates apply in the same order on reverse: an
+        admitted non-PostgreSQL alias is refused by name there as well.
+
+        Its own test rather than a second assertion in the forward's, because
+        ``DropTenantPolicy.database_backwards()`` delegates to
+        ``CreateTenantPolicy.database_forwards()``. A reverse gated only
+        inside the delegate would refuse with the delegate's name, telling the
+        consumer ``CreateTenantPolicy`` refused when their migration contains
+        ``DropTenantPolicy``, so the operation name is asserted here
+        specifically.
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        from boundary.exceptions import BoundaryError
+
+        state = _get_fake_state()
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking")
+            with (
+                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+                connections["eu-west"].schema_editor() as editor,
+                pytest.raises(BoundaryError) as caught,
+            ):
+                operation.database_backwards("boundary_testapp", editor, state, state)
+
+            message = str(caught.value)
+            assert name in message, f"the reverse refusal must name the operation; got {message!r}"
+            assert "eu-west" in message
+            assert "sqlite" in message
+
+    def test_the_router_is_asked_through_allow_migrate_model_for_the_resolved_model(self):
+        """And the router was asked through ``allow_migrate_model``, receiving
+        the resolved model's own app label and model name.
+
+        This is the half a consumer's router depends on. A router is written
+        to ``allow_migrate(db, app_label, model_name=None, **hints)``,
+        boundary's own ``RegionalRouter`` included, so an operation calling
+        the bare app-level ``allow_migrate()`` (which is what ``RunSQL``
+        does) would hand a router no model to key on at all, and a
+        hand-built call passing an app label in the ``model_name`` position
+        would make a model-keyed router match the wrong thing.
+
+        The ``hints["model"]`` cross-check is what distinguishes
+        ``allow_migrate_model`` from a hand-rolled ``allow_migrate`` call
+        with the same two positional arguments: only the model-level form
+        passes the model object itself as a hint.
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        from boundary.exceptions import BoundaryError
+
+        state = _get_fake_state()
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking")
+            _RecordingRouter.calls = []
+            with (
+                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
+                pytest.raises(BoundaryError),
+            ):
+                # The vendor gate raises immediately after the router gate on
+                # this alias; the router call is what is being asserted, and
+                # it happened before the raise.
+                operation.database_forwards("boundary_testapp", editor, state, state)
+
+            assert _RecordingRouter.calls, f"{name} must ask the router at all"
+            alias, app_label, model_name, hints = _RecordingRouter.calls[0]
+            assert alias == "eu-west"
+            assert app_label == "boundary_testapp", (
+                f"{name} must pass the resolved model's app label; got {app_label!r}"
+            )
+            assert model_name == "booking", f"{name} must pass the model name, not an app label; got {model_name!r}"
+            assert hints["model"]._meta.model_name == "booking", (
+                f"{name} must ask through allow_migrate_model, which passes the model as a hint"
+            )
+            assert len(_RecordingRouter.calls) == 1, (
+                f"{name} acts on exactly one model and must ask once; got {len(_RecordingRouter.calls)} calls"
+            )
+
+    def test_an_app_label_override_makes_the_router_asked_about_the_overridden_app(self):
+        """And with an ``app_label`` override set, the router was asked about
+        the overridden app's model rather than the migration's own app, so the
+        gate follows BR-RLS-019's resolution.
+
+        The owning app label passed to ``database_forwards()`` is deliberately
+        one that holds no ``Booking``, so a gate resolving from the
+        migration's own app would raise ``LookupError`` rather than pass
+        vacuously.
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        from boundary.exceptions import BoundaryError
+
+        state = _get_fake_state()
+        owning_app = "boundary"  # holds no Booking
+        for name, op_class in self.OPERATIONS:
+            operation = op_class("Booking", app_label="boundary_testapp")
+            _RecordingRouter.calls = []
+            with (
+                override_settings(DATABASE_ROUTERS=[_RecordingRouter()]),
+                connections["eu-west"].schema_editor(collect_sql=True) as editor,
+                pytest.raises(BoundaryError),
+            ):
+                operation.database_forwards(owning_app, editor, state, state)
+
+            assert _RecordingRouter.calls, f"{name} must ask the router at all"
+            _, app_label, model_name, _ = _RecordingRouter.calls[0]
+            assert app_label == "boundary_testapp", (
+                f"{name} must ask about the OVERRIDDEN app, not the migration's; got {app_label!r}"
+            )
+            assert model_name == "booking"
+
+    def test_the_default_alias_is_processed_normally_in_the_same_run(self):
+        """And ``default`` is processed normally by the same router in the same
+        run, proving the gate discriminates by alias rather than suppressing
+        the operation outright.
+
+        The positive control, and the assertion that fails if the gates were
+        implemented as an unconditional skip. One router instance denies
+        ``eu-west`` and admits ``default``; the PostgreSQL alias must come out
+        with RLS enabled, forced, and both boundary policies present.
+        """
+        from django.db import connections
+        from django.test import override_settings
+
+        state = _get_fake_state()
+        with override_settings(DATABASE_ROUTERS=[_AliasDenyingRouter()]):
+            # The denied alias first, so the run really is the same one.
+            with connections["eu-west"].schema_editor(collect_sql=True) as editor:
+                EnableRLS("Booking").database_forwards("boundary_testapp", editor, state, state)
+                CreateTenantPolicy("Booking").database_forwards("boundary_testapp", editor, state, state)
+                assert list(editor.collected_sql) == [], "the denied alias must receive nothing"
+
+            try:
+                with connection.schema_editor() as editor:
+                    EnableRLS("Booking").database_forwards("boundary_testapp", editor, state, state)
+                    CreateTenantPolicy("Booking").database_forwards("boundary_testapp", editor, state, state)
+
+                enabled, forced = _has_rls("boundary_testapp_booking")
+                assert enabled is True, "the admitted alias must have RLS enabled"
+                assert forced is True, "the admitted alias must have RLS forced"
+
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT polname FROM pg_policy WHERE polrelid = 'boundary_testapp_booking'::regclass"
+                    )
+                    policies = {row[0] for row in cursor.fetchall()}
+                assert policies == {"boundary_tenant_isolation", "boundary_admin_bypass"}
+
+                # And the reverse likewise discriminates: the admitted alias
+                # is cleaned up through the gated reverse itself, so a reverse
+                # that refused an admitted PostgreSQL alias would fail here.
+                with connection.schema_editor() as editor:
+                    EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
+                assert _has_rls("boundary_testapp_booking") == (False, False)
+            finally:
+                with connection.schema_editor() as editor:
+                    EnableRLS("Booking").database_backwards("boundary_testapp", editor, state, state)
+
+    def test_deconstruct_is_byte_identical_for_all_three_operations(self):
+        """And ``deconstruct()`` emits exactly ``{"model_name": "Booking"}``
+        for each of the three, byte-identical to its output before this rule,
+        proving the gates added no constructor argument.
+
+        BR-RLS-021's compatibility clause: the gates are runtime behaviour of
+        ``database_forwards()`` and ``database_backwards()``, so every
+        migration a consumer has already written must serialise to the same
+        bytes and none needs editing. Asserted on the exact dict rather than
+        by membership, so a gate that had smuggled in a keyword with a
+        default would fail here.
+        """
+        for name, op_class in self.OPERATIONS:
+            qualname, args, kwargs = op_class("Booking").deconstruct()
+            assert qualname == name
+            assert args == []
+            assert kwargs == {"model_name": "Booking"}, f"{name}.deconstruct() gained a keyword; got {kwargs!r}"

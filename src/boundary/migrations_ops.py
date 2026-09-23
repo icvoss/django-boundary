@@ -185,6 +185,74 @@ def detect_tenant_pg_type(pk_field) -> str:
     return _PG_TYPE_MAP.get(pk_field.db_type(connection), "bigint")
 
 
+def _router_allows(schema_editor, model) -> bool:
+    """Return whether the router admits *model* on this alias (BR-RLS-021 gate 1).
+
+    Asked through ``router.allow_migrate_model()``, which is the call
+    Django's own ``CreateModel`` and ``AddField`` make for model-level DDL.
+    It reaches a consumer's routers as ``allow_migrate(db, app_label,
+    model_name=<model name>, model=<model>)`` carrying the RESOLVED model's
+    own app label, which under BR-RLS-019's ``app_label`` override is the
+    overridden app rather than the app whose migration carries the
+    operation: the table under consideration is that app's table, and a
+    router keying on either argument expects to be told about the table it
+    will actually route.
+
+    Not covered by Django's own machinery. A ``reduces_to_sql`` operation is
+    never passed through ``allow_migrate_model`` by the migration executor,
+    so without this gate a project whose router keeps a second alias off the
+    RLS graph still has ``ALTER TABLE ... ENABLE ROW LEVEL SECURITY`` pushed
+    at it, and the whole graph for that alias fails on the backend's parser
+    (icvoss/django-boundary#75).
+
+    Asked once, not per model: these three operations act on exactly one
+    model, where ``AdoptTenantApp`` derives a set and must therefore ask per
+    member of it.
+
+    A denial is a legitimate per-alias skip, so the caller returns without
+    DDL and without raising. Only once the router has admitted the model is
+    the vendor read, because that router is the documented way to keep a
+    non-PostgreSQL alias off this graph and must not itself become a hard
+    failure.
+    """
+    from django.db import router
+
+    return router.allow_migrate_model(schema_editor.connection.alias, model)
+
+
+def _require_postgresql(schema_editor, operation: str, model) -> None:
+    """Refuse a non-PostgreSQL connection the router did admit (BR-RLS-021 gate 2).
+
+    Raises :class:`~boundary.exceptions.RLSOperationRefusedError` naming
+    *operation*, the alias and the observed vendor, before any statement
+    runs. *operation* is the class name of the operation raising, so a
+    consumer reading the traceback is told which of the three refused rather
+    than being told about adoption, which is a different operation raising a
+    different exception.
+
+    Only PostgreSQL has Row Level Security. On SQLite or MySQL the generated
+    ``ENABLE ROW LEVEL SECURITY`` and ``CREATE POLICY`` statements are a
+    syntax error, so the migration fails either way and what differs is the
+    message: the backend's own parser error names a fragment of generated SQL
+    and leaves the consumer to infer that this layer is PostgreSQL-only.
+
+    Reached only after :func:`_router_allows` has admitted the model, so an
+    alias the router denies is never asked about its vendor at all.
+    """
+    from boundary.exceptions import RLSOperationRefusedError
+
+    vendor = schema_editor.connection.vendor
+    if vendor == "postgresql":
+        return
+    raise RLSOperationRefusedError(
+        f"{operation} cannot run against model '{model._meta.label}' on database alias "
+        f"'{schema_editor.connection.alias}': its backend vendor is '{vendor}', and this "
+        f"operation emits PostgreSQL Row Level Security, which no other backend has. Keep "
+        f"this alias off the operation's graph with a router's allow_migrate(), or run the "
+        f"migration against PostgreSQL."
+    )
+
+
 class EnableRLS(migrations.operations.base.Operation):
     """Enable Row Level Security on a table.
 
@@ -210,12 +278,27 @@ class EnableRLS(migrations.operations.base.Operation):
 
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         model = to_state.apps.get_model(self.app_label or app_label, self.model_name)
+        # The two gates, in BR-RLS-021's order: the router first, whose denial
+        # is a silent per-alias skip, then the vendor, whose mismatch on an
+        # alias the router admitted is named rather than left to the backend's
+        # parser. Both run before any statement is issued.
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "EnableRLS", model)
+
         table = model._meta.db_table
         schema_editor.execute(f'ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY')
         schema_editor.execute(f'ALTER TABLE "{table}" FORCE ROW LEVEL SECURITY')
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
+        # Both gates apply on reverse too. A guard on the forward alone would
+        # let the reverse disable RLS on an alias the router keeps off this
+        # graph, which never had it enabled there in the first place.
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "EnableRLS", model)
+
         table = model._meta.db_table
         # Drop all boundary policies first
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_tenant_isolation ON "{table}"')
@@ -271,6 +354,13 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
 
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         model = to_state.apps.get_model(self.app_label or app_label, self.model_name)
+        # The two gates, in BR-RLS-021's order. Checked ahead of the tenant
+        # column type detection as well as the DDL, so a denied alias reads
+        # nothing from the model either.
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "CreateTenantPolicy", model)
+
         table = model._meta.db_table
 
         # Detect tenant column's database type for the helper function
@@ -290,6 +380,10 @@ class CreateTenantPolicy(migrations.operations.base.Operation):
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "CreateTenantPolicy", model)
+
         table = model._meta.db_table
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_tenant_isolation ON "{table}"')
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_admin_bypass ON "{table}"')
@@ -339,6 +433,10 @@ class DropTenantPolicy(migrations.operations.base.Operation):
 
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
         model = to_state.apps.get_model(self.app_label or app_label, self.model_name)
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "DropTenantPolicy", model)
+
         table = model._meta.db_table
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_tenant_isolation ON "{table}"')
         schema_editor.execute(f'DROP POLICY IF EXISTS boundary_admin_bypass ON "{table}"')
@@ -346,6 +444,26 @@ class DropTenantPolicy(migrations.operations.base.Operation):
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         # Re-create policies on reverse. The override is passed through so the
         # reverse targets the same table the forward dropped from.
+        #
+        # Gated here as well as inside the delegate, and deliberately so. The
+        # delegate carries its own copy of both gates, but it reports them as
+        # CreateTenantPolicy, and a consumer reversing DropTenantPolicy on a
+        # non-PostgreSQL alias must be told which operation in their migration
+        # refused. Gating first means the refusal names DropTenantPolicy and
+        # the delegate is never reached; the router half is idempotent, so
+        # asking twice on an admitted alias changes nothing.
+        #
+        # Resolved from ``from_state`` here, which is the state a reverse
+        # reads (BR-RLS-019) and what the other five gated methods use in
+        # this direction. The delegate re-resolves from ``to_state``, as it
+        # has always done; the two agree for any model whose recorded fields
+        # match, and the gate's question is which TABLE the router routes,
+        # which does not differ between the two states.
+        model = from_state.apps.get_model(self.app_label or app_label, self.model_name)
+        if not _router_allows(schema_editor, model):
+            return
+        _require_postgresql(schema_editor, "DropTenantPolicy", model)
+
         create_op = CreateTenantPolicy(self.model_name, self.tenant_column, app_label=self.app_label)
         create_op.database_forwards(app_label, schema_editor, from_state, to_state)
 
