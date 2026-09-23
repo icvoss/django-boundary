@@ -2218,7 +2218,28 @@ class TestCompositeConstraintNameTruncation:
             )
         assert name == "thirdparty_widget_code_key_tenant"
 
-    def test_a_name_over_the_limit_goes_through_create_index_name(self):
+    def test_a_name_over_the_limit_is_the_documented_truncate_and_hash_form(self):
+        """And a ``_tenant``-suffixed name over the limit is the documented
+        truncate-and-hash form, computed here from BR-RLS-012's own rule rather
+        than by calling the code under test.
+
+        The previous version of this test built its expected value by calling
+        the same private schema-editor method ``composite_constraint_name()``
+        calls, so the assertion held by construction whatever that method did,
+        and a Django rename surfaced as an ``AttributeError`` from the
+        expectation line rather than as a contract failure
+        (icvoss/django-boundary#83). The expectation is now derived
+        independently: Django's own documented scheme is
+        ``<table>_<columns>_<digest><suffix>``, truncated to the connection's
+        max name length, with the digest coming from the PUBLIC
+        ``django.db.backends.utils.names_digest``. Nothing private is named
+        here, so a rename of the private method fails in
+        ``tests/test_schema_adapter.py`` by name, where it belongs, and this
+        test keeps asserting the shape of the name a consumer's database ends
+        up with.
+        """
+        from django.db.backends.utils import names_digest, split_identifier
+
         from boundary.migrations_ops import composite_constraint_name
 
         table = "a" * 40
@@ -2228,14 +2249,24 @@ class TestCompositeConstraintNameTruncation:
 
         with connection.schema_editor() as editor:
             name = composite_constraint_name(editor, table, original, columns)
-            expected = editor._create_index_name(table, columns, suffix="_tenant")
+            max_length = editor.connection.ops.max_name_length() or 200
 
-        assert name == expected
+        # BR-RLS-012's documented scheme, rebuilt from public API only.
+        _, bare_table = split_identifier(table)
+        hash_part = f"{names_digest(bare_table, *columns, length=8)}_tenant"
+        other_length = (max_length - len(hash_part)) // 2 - 1
+        expected = f"{bare_table[:other_length]}_{'_'.join(columns)[:other_length]}_{hash_part}"
+
+        assert name == expected, f"expected the documented truncate-and-hash form {expected!r}, got {name!r}"
         assert len(name) <= 63
         assert name.endswith("_tenant")
-        # Not a truncation of the original: the derived name is the schema
-        # editor's hashed form, which is what makes it collision-resistant
-        # against a sibling constraint sharing the surviving prefix.
+        # Derived from the TABLE and COLUMNS, not from the original name: that
+        # is what makes it reproducible on the reverse path, where the original
+        # name may be PostgreSQL's own and is not recomputable (BR-RLS-020).
+        assert name.startswith("a" * 10), f"the derived name must lead with the table name; got {name!r}"
+        # Not a truncation of the original: the derived name is the hashed
+        # form, which is what makes it collision-resistant against a sibling
+        # constraint sharing the surviving prefix.
         assert not name.startswith(original[:50])
 
     def test_two_long_originals_on_the_same_columns_do_not_collide(self):

@@ -110,15 +110,21 @@ def composite_constraint_name(schema_editor, table: str, original_name: str, col
     The original name with ``_tenant`` appended, so the name is reproducible
     from the original alone (BR-RLS-012). When that exceeds PostgreSQL's
     63-character identifier limit, the name is regenerated through the schema
-    editor's own truncate-and-hash scheme
-    (``BaseDatabaseSchemaEditor._create_index_name``) rather than being cut
-    off, which would risk colliding with a sibling constraint whose name
-    shares the surviving prefix.
+    editor's own truncate-and-hash scheme rather than being cut off, which
+    would risk colliding with a sibling constraint whose name shares the
+    surviving prefix.
+
+    That scheme is private Django API, so it is reached through
+    ``schema_compat.index_name()`` rather than named here (BR-RLS-022): the
+    adapter is the one module allowed to touch it, and the one place a Django
+    rename has to be fixed.
     """
+    from boundary import schema_compat
+
     suffixed = f"{original_name}_tenant"
     if len(suffixed) <= _MAX_IDENTIFIER_LENGTH:
         return suffixed
-    return schema_editor._create_index_name(table, list(columns), suffix="_tenant")
+    return schema_compat.index_name(schema_editor, table, columns, "_tenant")
 
 
 def _pg_types_match(found: str, expected: str) -> bool:
@@ -1072,8 +1078,9 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         The composite is found by the same deterministic ``_tenant`` name the
         forward derived, so no state needs carrying between the two
         directions; the originals are rebuilt from the historical ``_meta``
-        through ``schema_editor._create_unique_sql(..., name=None)``, which
-        is the schema editor's own naming.
+        through ``schema_compat.unique_sql(..., name=None)``, which reaches
+        the schema editor's own naming through BR-RLS-022's private-API
+        adapter.
 
         One consequence is visible and intended. A field declared
         ``unique=True`` was originally an inline UNIQUE that PostgreSQL named
@@ -1110,7 +1117,7 @@ class AdoptTenantApp(migrations.operations.base.Operation):
         which is what makes a second reverse a genuine no-op rather than a
         pass that quietly adds constraints (BR-RLS-020).
         """
-        from boundary import adoption
+        from boundary import adoption, schema_compat
 
         with schema_editor.connection.cursor() as cursor:
             live = adoption.unique_constraints(cursor, table)
@@ -1125,7 +1132,7 @@ class AdoptTenantApp(migrations.operations.base.Operation):
                     break
             if not dropped:
                 continue
-            statement = schema_editor._create_unique_sql(model, columns)
+            statement = schema_compat.unique_sql(schema_editor, model, columns)
             if statement is not None:
                 schema_editor.execute(statement)
 
