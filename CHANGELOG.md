@@ -4,6 +4,19 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-24
+
+### Added
+
+- `boundary.E004` and `boundary.W002` now recognise
+  `icv_tenants.middleware.TenantContextMiddleware` as the canonical external
+  resolver. An ICV consumer can install `icv-tenants` to authorise tenant
+  selection and bridge it into boundary without also mounting
+  `boundary.middleware.TenantMiddleware`. The legacy
+  `icv_identity.tenants.middleware.TenantContextMiddleware` remains supported
+  during the migration window. Do not mount boundary's middleware with either
+  external resolver: `boundary.W002` reports the resulting double resolution.
+
 ## [1.0.0] - 2026-09-23
 
 ### Added

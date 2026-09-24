@@ -21,6 +21,25 @@ from django.db.utils import InterfaceError, OperationalError
 _CONNECTION_UNAVAILABLE_ERRORS = (OperationalError, InterfaceError)
 
 
+# These external middleware paths are configuration contracts, not imports.
+# Both set request.tenant only after their own authorisation checks and bridge
+# it into TenantContext. Keeping the legacy identity path during the migration
+# window lets consumers upgrade their packages independently.
+_EXTERNAL_TENANT_CONTEXT_MIDDLEWARE = (
+    "icv_tenants.middleware.TenantContextMiddleware",
+    "icv_identity.tenants.middleware.TenantContextMiddleware",
+)
+
+
+def _has_external_tenant_context_middleware(middleware):
+    """Return whether a supported external resolver is configured.
+
+    A suffix match recognises configuration aliases ending in a known path
+    without importing either optional domain package.
+    """
+    return any(entry.endswith(path) for entry in middleware for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE)
+
+
 @register(Tags.models)
 def check_boundary_configuration(app_configs, **kwargs):
     """Validate boundary settings at startup."""
@@ -32,7 +51,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_strict_mode())
     errors.extend(_check_production_posture())
     errors.extend(_check_rls_enabled())
-    errors.extend(_check_identity_double_resolve())
+    errors.extend(_check_external_double_resolve())
     errors.extend(_check_rls_bypassable())
     errors.extend(_check_client_controlled_resolver_without_membership_check())
     errors.extend(_check_regional_router_configured())
@@ -126,16 +145,15 @@ def _check_middleware():
        treated as not satisfying the check rather than raising: Django's own
        middleware loading reports an unimportable entry separately, and this
        check has nothing useful to add for a broken path.
-    3. A MIDDLEWARE entry ends with icv-identity's
+    3. A MIDDLEWARE entry ends with a supported external
+       ``TenantContextMiddleware``: the canonical
+       ``icv_tenants.middleware.TenantContextMiddleware`` or the legacy
        ``icv_identity.tenants.middleware.TenantContextMiddleware`` (issue
-       #54). Per ADR-025 T1, when icv-identity is installed it owns
-       request-to-tenant resolution and bridges into boundary's
-       TenantContext; boundary's own TenantMiddleware is for boundary-only
-       deployments. A deployment where icv-identity resolves the tenant and
-       boundary mounts no middleware of its own is the documented, intended
-       shape, not a misconfiguration, so it must not fire E004. Detected by
-       the same string suffix match ``boundary.W002`` already uses; boundary
-       must never import icv_identity (ADR-002, ADR-025 T1).
+       #90). Each authorises its own tenant selection before bridging it into
+       boundary's TenantContext. A deployment using either external resolver
+       and no boundary middleware is a documented, intended shape, not a
+       misconfiguration. Detection is a string suffix match because boundary
+       must never import optional domain packages (ADR-025 T1, ADR-118).
 
     Otherwise E004 fires: no MIDDLEWARE entry resolves tenant context, which
     is a genuine boundary-only misconfiguration.
@@ -147,7 +165,7 @@ def _check_middleware():
 
     middleware = getattr(settings, "MIDDLEWARE", [])
 
-    if any(entry.endswith("icv_identity.tenants.middleware.TenantContextMiddleware") for entry in middleware):
+    if _has_external_tenant_context_middleware(middleware):
         return []
 
     for entry in middleware:
@@ -165,9 +183,10 @@ def _check_middleware():
             "boundary.middleware.TenantMiddleware is not in MIDDLEWARE.",
             hint=(
                 "Add 'boundary.middleware.TenantMiddleware' (or a subclass of it) to "
-                "MIDDLEWARE before SessionMiddleware. If icv-identity is installed and "
-                "its TenantContextMiddleware is mounted, it already owns tenant "
-                "resolution (ADR-025 T1) and boundary needs no middleware of its own."
+                "MIDDLEWARE before SessionMiddleware. If icv-tenants is installed and "
+                "its TenantContextMiddleware is mounted, it already owns authorised tenant "
+                "resolution (ADR-118) and boundary needs no middleware of its own. The legacy "
+                "icv-identity TenantContextMiddleware remains supported during migration."
             ),
             id="boundary.E004",
         )
@@ -272,39 +291,39 @@ def _check_production_posture():
     return errors
 
 
-def _check_identity_double_resolve():
-    """W002: warn when boundary and icv-identity both resolve the tenant.
+def _check_external_double_resolve():
+    """W002: warn when boundary and an external package both resolve a tenant.
 
-    Per ADR-025 T1, when icv-identity is installed it owns request-to-tenant
-    resolution: its TenantContextMiddleware resolves the tenant, sets
-    request.tenant, and bridges into boundary's TenantContext. Boundary's own
-    TenantMiddleware and resolver chain are for boundary-only deployments (no
-    identity). Running both middlewares double-resolves the tenant per
-    request. Detected by string suffix match on MIDDLEWARE entries; boundary
-    must never import icv_identity (ADR-002, ADR-025 T1).
+    The canonical icv-tenants middleware, and the legacy icv-identity
+    middleware during migration, authorise tenant selection before setting
+    request.tenant and bridging into boundary's TenantContext. Boundary's own
+    TenantMiddleware and resolver chain are for boundary-only deployments.
+    Running either external middleware with boundary's middleware
+    double-resolves a tenant per request. Detection is string-only, so
+    boundary never imports optional domain packages (ADR-025 T1, ADR-118).
     """
     from django.conf import settings
 
     middleware = getattr(settings, "MIDDLEWARE", [])
 
-    has_boundary_middleware = any(entry.endswith("boundary.middleware.TenantMiddleware") for entry in middleware)
-    has_identity_middleware = any(
-        entry.endswith("icv_identity.tenants.middleware.TenantContextMiddleware") for entry in middleware
+    resolver_count = int(any(entry.endswith("boundary.middleware.TenantMiddleware") for entry in middleware))
+    resolver_count += sum(
+        any(entry.endswith(path) for entry in middleware) for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE
     )
 
-    if not (has_boundary_middleware and has_identity_middleware):
+    if resolver_count < 2:
         return []
 
     return [
         Warning(
-            "Both boundary.middleware.TenantMiddleware and icv-identity's "
-            "TenantContextMiddleware are in MIDDLEWARE. This double-resolves the "
-            "tenant on every request.",
+            "Multiple known tenant-resolution middlewares are in MIDDLEWARE. "
+            "This double-resolves the tenant on every request.",
             hint=(
-                "Per ADR-025 T1, when icv-identity is present it owns tenant "
-                "resolution and bridges into boundary. Remove "
-                "boundary.middleware.TenantMiddleware and let icv-identity resolve "
-                "and bridge, or run boundary-only without icv-identity's middleware."
+                "When icv-tenants is present it owns authorised tenant resolution and "
+                "bridges into boundary. Remove boundary.middleware.TenantMiddleware and "
+                "let the external middleware resolve and bridge, or run boundary-only "
+                "without external tenant middleware. The legacy icv-identity middleware "
+                "remains supported during migration (ADR-118)."
             ),
             id="boundary.W002",
         )
