@@ -128,6 +128,22 @@ class TestSystemChecks:
         assert not any(e.id == "boundary.E004" for e in errors)
         assert any(e.id == "boundary.W002" for e in errors)
 
+    def test_w002_fires_when_legacy_and_canonical_external_resolvers_are_mounted(self, settings):
+        """A migration must not run the old and new resolvers together.
+
+        This configuration has no boundary middleware, so detecting only a
+        boundary-plus-external pair would leave the double resolution live.
+        """
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = [
+            "icv_identity.tenants.middleware.TenantContextMiddleware",
+            "icv_tenants.middleware.TenantContextMiddleware",
+        ]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+        assert any(e.id == "boundary.W002" for e in errors)
+
     def test_w001_strict_mode_disabled(self, settings):
         settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
         settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]

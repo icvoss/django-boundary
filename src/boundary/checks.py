@@ -34,8 +34,8 @@ _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE = (
 def _has_external_tenant_context_middleware(middleware):
     """Return whether a supported external resolver is configured.
 
-    A suffix match intentionally permits a consumer's wrapper module while
-    avoiding an import of either optional domain package.
+    A suffix match recognises configuration aliases ending in a known path
+    without importing either optional domain package.
     """
     return any(entry.endswith(path) for entry in middleware for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE)
 
@@ -306,17 +306,18 @@ def _check_external_double_resolve():
 
     middleware = getattr(settings, "MIDDLEWARE", [])
 
-    has_boundary_middleware = any(entry.endswith("boundary.middleware.TenantMiddleware") for entry in middleware)
-    has_external_middleware = _has_external_tenant_context_middleware(middleware)
+    resolver_count = int(any(entry.endswith("boundary.middleware.TenantMiddleware") for entry in middleware))
+    resolver_count += sum(
+        any(entry.endswith(path) for entry in middleware) for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE
+    )
 
-    if not (has_boundary_middleware and has_external_middleware):
+    if resolver_count < 2:
         return []
 
     return [
         Warning(
-            "Both boundary.middleware.TenantMiddleware and an external "
-            "TenantContextMiddleware are in MIDDLEWARE. This double-resolves the "
-            "tenant on every request.",
+            "Multiple known tenant-resolution middlewares are in MIDDLEWARE. "
+            "This double-resolves the tenant on every request.",
             hint=(
                 "When icv-tenants is present it owns authorised tenant resolution and "
                 "bridges into boundary. Remove boundary.middleware.TenantMiddleware and "
