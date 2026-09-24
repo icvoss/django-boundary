@@ -126,9 +126,11 @@ Confirm the app is in `INSTALLED_APPS` and the `app_label.ModelName` format is e
 
 ### `boundary.E004`: middleware missing
 
-**Triggers when:** `boundary.middleware.TenantMiddleware` is not in `MIDDLEWARE`.
+**Triggers when:** neither `boundary.middleware.TenantMiddleware` nor a
+supported external tenant-context middleware is in `MIDDLEWARE`.
 
-**Fix:** add it, before `SessionMiddleware` if you use the session resolver:
+**Fix:** add boundary's middleware before `SessionMiddleware` if you use its
+session resolver:
 
 ```python
 MIDDLEWARE = [
@@ -137,6 +139,13 @@ MIDDLEWARE = [
     # ...
 ]
 ```
+
+An ICV consumer using `icv-tenants` instead configures only
+`icv_tenants.middleware.TenantContextMiddleware`. It authorises the tenant
+selection and bridges it into boundary. Do not configure both middleware
+classes. The legacy
+`icv_identity.tenants.middleware.TenantContextMiddleware` remains recognised
+during the migration window.
 
 ### `boundary.E006`: Row Level Security not enabled
 

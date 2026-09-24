@@ -48,8 +48,8 @@ exposure during development.
   stack. boundary's resolvers read an already-authenticated request; they
   never authenticate one.
 - **Membership, RBAC or authorisation.** Resolving a tenant is not
-  authorising a caller against it. Your project (or icv-identity, for ICV
-  ecosystem consumers) owns that check.
+  authorising a caller against it. Your project, or `icv-tenants` for ICV
+  ecosystem consumers, owns that check.
 - **Providing the tenant domain model itself.** You define your own tenant
   model and point `BOUNDARY_TENANT_MODEL` at it, or use the bundled
   `AbstractTenant` convenience base.
@@ -922,13 +922,13 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 |----|----------|-----------|
 | `boundary.E001` | Error | Neither `BOUNDARY_TENANT_MODEL` nor its `ICV_TENANT_MODEL` fallback is set, or whichever one is set is invalid |
 | `boundary.E003` | Error | Resolver class cannot be imported |
-| `boundary.E004` | Error | TenantMiddleware not in MIDDLEWARE |
+| `boundary.E004` | Error | No boundary or supported external tenant-resolution middleware is in `MIDDLEWARE`. `icv_tenants.middleware.TenantContextMiddleware` is the canonical external path; the legacy `icv_identity.tenants.middleware.TenantContextMiddleware` remains recognised during migration |
 | `boundary.E005` | Error | BOUNDARY_REGIONS set but RegionalRouter not in DATABASE_ROUTERS |
 | `boundary.E006` | Error | Tenant-scoped table missing RLS; recognises TenantMixin and make_tenant_mixin models, and adopted tables |
 | `boundary.E007` | Error | An expected-adopted table (a concrete model of an app in `BOUNDARY_TENANT_APPS`, not excluded, not already mixin- or path-scoped, and not the tenant model) is missing its `tenant_id` column, carries one of an unexpected type, lacks enabled-and-forced RLS, is missing either policy, or carries a unique constraint that is not composite leading with `tenant_id`. Also reports a deny-listed or uninstalled app label in the setting, the one condition needing no database connection. The expected set is derived from the live app registry, so a model added by an upstream upgrade is reported; the remedy is a second `AdoptTenantApp` migration (issues #69, #71) |
 | `boundary.E008` | Error | `settings.DEBUG` is `False` and `BOUNDARY_STRICT_MODE` or `BOUNDARY_SET_DB_SESSION_VAR` is `False`, one Error per offending setting. Each removes a category of isolation the deployment believes it has, and both default to the safe value, so reaching this state takes an explicit opt-out. Settings-only: no query, no connection, no vendor gate, so it is the one check that cannot be silently skipped. **It fires under the test runner too**, which sets `DEBUG = False`; record a deliberate choice with `"boundary.E008"` in `SILENCED_SYSTEM_CHECKS` (issue #82) |
 | `boundary.W001` | Warning | STRICT_MODE is False |
-| `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and icv-identity's `TenantContextMiddleware` are in `MIDDLEWARE` (double-resolves the tenant; ADR-025 T1) |
+| `boundary.W002` | Warning | Both `boundary.middleware.TenantMiddleware` and an external `TenantContextMiddleware` are in `MIDDLEWARE`, which double-resolves the tenant. The canonical external middleware is `icv_tenants.middleware.TenantContextMiddleware`; the legacy identity path remains recognised during migration |
 | `boundary.W003` | Warning | The connecting database role is a superuser or has BYPASSRLS: RLS policies are not enforced for this connection, so `boundary.E006` passing gives no guarantee tenant isolation actually works (issue #21) |
 | `boundary.W006` | Warning | A client-controlled resolver (`HeaderResolver`, `JWTClaimResolver`, or a subclass) is in `BOUNDARY_RESOLVERS` alongside `django.contrib.auth`: resolution names a tenant from client input with no membership check downstream (issue #38) |
 | `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |

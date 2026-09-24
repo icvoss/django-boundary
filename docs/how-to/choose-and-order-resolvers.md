@@ -209,9 +209,17 @@ A request with no resolved tenant (`BOUNDARY_REQUIRED = False`, public routes) o
 
 `TenantMiddleware` already returns two responses of its own before your membership check ever runs: a 404 when `BOUNDARY_REQUIRED = True` and no resolver matched, and a 403 when the resolved tenant has `is_active = False`. Your membership check is a third, independent gate, checking a different fact (is *this user* allowed in *this* tenant, as opposed to does the tenant exist and is it active) and should return its own 403 rather than trying to reuse boundary's.
 
-### If you use icv-identity
+### If you use icv-tenants
 
-If `icv-identity` is installed, it owns the tenant domain model and provides its own middleware for this per ADR-025 T1; you should not hand-roll `TenantMembershipMiddleware` on top of it. See icv-identity's own documentation for the specifics: boundary does not import `icv_identity` and this guide does not describe its internals.
+If `icv-tenants` is installed, its
+`icv_tenants.middleware.TenantContextMiddleware` authorises the tenant
+selection, sets `request.tenant`, and bridges into boundary's context. Do not
+mount `boundary.middleware.TenantMiddleware` or hand-roll
+`TenantMembershipMiddleware` alongside it. Boundary does not import
+`icv_tenants` and this guide does not describe its internals. The legacy
+`icv_identity.tenants.middleware.TenantContextMiddleware` remains compatible
+during the migration window, but new integrations should use `icv-tenants`
+(ADR-118).
 
 ## Common pitfalls
 

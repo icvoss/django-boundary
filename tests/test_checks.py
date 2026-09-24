@@ -64,6 +64,18 @@ class TestSystemChecks:
         errors = check_boundary_configuration(None)
         assert not any(e.id == "boundary.E004" for e in errors)
 
+    def test_e004_absent_when_tenants_middleware_present_and_boundary_absent(self, settings):
+        """Issue #90: icv-tenants is the canonical owner of authorised
+        request-to-tenant resolution. Its middleware bridges into boundary's
+        context, so a deployment that mounts it without boundary middleware
+        is valid and needs no installed icv-tenants package for this check to
+        recognise the configuration path."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = ["icv_tenants.middleware.TenantContextMiddleware"]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+
     def test_e004_absent_for_a_subclass_of_tenant_middleware(self, settings):
         """Issue #52: a consumer subclass of TenantMiddleware (Magmify's
         host-scoped SiteTenantBoundaryMiddleware is the documented-in-the-wild
@@ -97,6 +109,20 @@ class TestSystemChecks:
         settings.MIDDLEWARE = [
             "boundary.middleware.TenantMiddleware",
             "icv_identity.tenants.middleware.TenantContextMiddleware",
+        ]
+        errors = check_boundary_configuration(None)
+        assert not any(e.id == "boundary.E004" for e in errors)
+        assert any(e.id == "boundary.W002" for e in errors)
+
+    def test_e004_absent_and_w002_fires_when_both_boundary_and_tenants_mounted(self, settings):
+        """The canonical external resolver and boundary's resolver must not
+        run together, even when icv-tenants is not importable in this test
+        environment. Recognition remains a no-import configuration check."""
+        settings.BOUNDARY_TENANT_MODEL = "boundary_testapp.Tenant"
+        settings.BOUNDARY_RESOLVERS = ["boundary.resolvers.SubdomainResolver"]
+        settings.MIDDLEWARE = [
+            "boundary.middleware.TenantMiddleware",
+            "icv_tenants.middleware.TenantContextMiddleware",
         ]
         errors = check_boundary_configuration(None)
         assert not any(e.id == "boundary.E004" for e in errors)
