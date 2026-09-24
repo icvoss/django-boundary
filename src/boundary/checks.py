@@ -37,9 +37,7 @@ def _has_external_tenant_context_middleware(middleware):
     A suffix match intentionally permits a consumer's wrapper module while
     avoiding an import of either optional domain package.
     """
-    return any(
-        entry.endswith(path) for entry in middleware for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE
-    )
+    return any(entry.endswith(path) for entry in middleware for path in _EXTERNAL_TENANT_CONTEXT_MIDDLEWARE)
 
 
 @register(Tags.models)
