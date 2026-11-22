@@ -190,3 +190,86 @@ class UniqueProduct(MerchantMixin):
     class Meta:
         app_label = "boundary_testapp"
         constraints = [tenant_unique("slug")]
+
+
+# -- boundary.W010 fixtures (BR-ORM-015, AC-ORM-017) --
+
+
+class GlobalUniqueDoc(TenantModel):
+    """TenantMixin model with field-level unique=True: W010 must warn."""
+
+    slug = models.CharField(max_length=50, unique=True)
+
+    class Meta:
+        app_label = "boundary_testapp"
+
+
+class OptedOutUniqueDoc(TenantModel):
+    """Genuinely global uniqueness, opted out of W010 via class attribute."""
+
+    boundary_global_unique = ["token"]
+
+    token = models.CharField(max_length=64, unique=True)
+
+    class Meta:
+        app_label = "boundary_testapp"
+
+
+class GlobalUniqueProduct(MerchantMixin):
+    """make_tenant_mixin("merchant") model with unique=True: W010 must warn
+    and the hint must name merchant, not tenant.
+    """
+
+    sku = models.CharField(max_length=50, unique=True)
+
+    class Meta:
+        app_label = "boundary_testapp"
+
+
+class GlobalTogetherDoc(TenantModel):
+    """unique_together without the tenant FK: W010 must warn."""
+
+    code = models.CharField(max_length=20)
+    year = models.IntegerField()
+
+    class Meta:
+        app_label = "boundary_testapp"
+        unique_together = [("code", "year")]
+
+
+class TenantTogetherDoc(TenantModel):
+    """unique_together that already includes the tenant FK: no W010."""
+
+    code = models.CharField(max_length=20)
+
+    class Meta:
+        app_label = "boundary_testapp"
+        unique_together = [("tenant", "code")]
+
+
+class GlobalConstraintDoc(TenantModel):
+    """Hand-written UniqueConstraint omitting the tenant FK: W010 must warn."""
+
+    reference = models.CharField(max_length=32)
+
+    class Meta:
+        app_label = "boundary_testapp"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["reference"],
+                name="boundary_testapp_globalconstraintdoc_reference",
+            )
+        ]
+
+
+class OptedOutTogetherDoc(TenantModel):
+    """unique_together opted out field-by-field via boundary_global_unique."""
+
+    boundary_global_unique = ["code", "year"]
+
+    code = models.CharField(max_length=20)
+    year = models.IntegerField()
+
+    class Meta:
+        app_label = "boundary_testapp"
+        unique_together = [("code", "year")]

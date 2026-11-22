@@ -240,6 +240,31 @@ own to lead a constraint with, so `tenant_unique()` raises when the model class
 is prepared, naming the model. Express the uniqueness on the model that owns
 the tenant column, or use a plain `UniqueConstraint` if it is genuinely global.
 
+### When uniqueness really is global
+
+Some values must stay unique across every tenant (an opaque API token hash, a
+platform-wide order number). Keep `unique=True` (or a plain
+`UniqueConstraint`), and declare the field on the model class so
+`boundary.W010` does not warn:
+
+```python
+class APIToken(TenantModel):
+    boundary_global_unique = ["token_hash"]
+
+    token_hash = models.CharField(max_length=64, unique=True)
+```
+
+`boundary_global_unique` is a **model class attribute**, the same shape as
+`boundary_tenant_path`. Django rejects unknown `Meta` options, so this cannot
+live under `class Meta`. List every field that is intentionally global; for a
+`unique_together` or multi-field `UniqueConstraint`, list every field in that
+constraint.
+
+`boundary.W010` reports each `unique=True` field, each `unique_together`
+tuple, and each `UniqueConstraint` on a model with a local tenant column
+whose fields do not include that column. Constraints built with
+`tenant_unique()` already lead with the tenant field, so they are silent.
+
 ### Changing an existing global constraint to a per-tenant one
 
 `makemigrations` generates a `RemoveConstraint` (or a field alteration dropping
