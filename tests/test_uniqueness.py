@@ -4,12 +4,7 @@ AC-ORM-016 (BR-ORM-015, issue #72). A field declared ``unique=True`` on a
 tenant-scoped model is unique across every tenant, not within one;
 ``tenant_unique()`` is the affordance for saying what the author meant.
 
-AC-ORM-017 (boundary.W010) is void: BR-ORM-015 makes the check conditional on
-a prototype showing more genuine hits than spurious ones, and the prototype
-recorded on icvoss/django-boundary#72 on 2026-09-23 found one genuine hit
-against twenty spurious ones. W010 is RESERVED, NOT IMPLEMENTED; the helper
-and the documented pattern ship regardless, and this module is BR-ORM-015's
-whole verification.
+AC-ORM-017 (boundary.W010) lives in ``tests/test_w010_uniqueness_check.py``.
 """
 
 import pytest

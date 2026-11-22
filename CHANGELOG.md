@@ -4,6 +4,26 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
+### Added
+
+- **`boundary.W010` system check** (issue #72, BR-ORM-015, AC-ORM-017).
+  `unique=True`, `Meta.unique_together`, and a `UniqueConstraint` whose
+  fields do not include the model's tenant foreign key are enforced across
+  every tenant, not within one. On a model where `has_tenant_column()` is
+  true, `boundary.W010` reports each such declaration. The hint names
+  `tenant_unique(...)` (and the equivalent hand-written
+  `UniqueConstraint`) so the author can switch to per-tenant uniqueness.
+  Genuinely global uniqueness opts out per field with the model class
+  attribute `boundary_global_unique = ["field"]` (same shape as
+  `boundary_tenant_path`; Django rejects unknown `Meta` options, so this is
+  not a `Meta` attribute). Listing every field of a multi-field constraint
+  silences that constraint. `tenant_unique()` constraints already lead with
+  the tenant column and are silent. Path-scoped and non-mixin models are
+  out of scope (`has_tenant_column()` is false). Documented under
+  [Uniqueness within a tenant](docs/how-to/set-up-a-tenant-model.md#uniqueness-within-a-tenant).
+
 ## [1.1.0] - 2026-09-24
 
 ### Added

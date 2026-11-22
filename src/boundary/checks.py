@@ -58,6 +58,7 @@ def check_boundary_configuration(app_configs, **kwargs):
     errors.extend(_check_subdomain_resolver_without_parent_domain())
     errors.extend(_check_db_session_var_disabled_with_rls_enabled())
     errors.extend(_check_adopted_tables())
+    errors.extend(_check_tenant_scoped_uniqueness())
 
     return errors
 
@@ -1312,3 +1313,128 @@ def _check_rls_bypassable():
             id="boundary.W003",
         )
     ]
+
+
+def _check_tenant_scoped_uniqueness():
+    """W010: uniqueness on a tenant-scoped model that omits the tenant FK.
+
+    ``unique=True``, ``unique_together``, and ``UniqueConstraint`` are enforced
+    globally across every tenant unless the tenant column leads the constraint.
+    The model author almost always meant per-tenant uniqueness (BR-ORM-015).
+    Path-scoped models have no local column and are skipped; adopted tables
+    without a mixin are out of scope for this check (``has_tenant_column`` is
+    false for them; ``boundary.E007`` covers their constraint shape).
+
+    Opt out per field with the class attribute ``boundary_global_unique``
+    (same shape as ``boundary_tenant_path``): a list of field names that are
+    intentionally unique across every tenant. Django rejects unknown ``Meta``
+    attributes, so this is a model class attribute, not a ``Meta`` option.
+    """
+    from django.apps import apps
+    from django.db import models as dj_models
+
+    from boundary.models import get_tenant_fk_field, has_tenant_column
+
+    warnings = []
+    for model in apps.get_models():
+        if model._meta.abstract or model._meta.proxy:
+            continue
+        if not has_tenant_column(model):
+            continue
+        fk_field = get_tenant_fk_field(model)
+        if not fk_field:
+            continue
+        opted_out = frozenset(getattr(model, "boundary_global_unique", None) or ())
+        warnings.extend(_w010_for_unique_fields(model, fk_field, opted_out))
+        warnings.extend(_w010_for_unique_together(model, fk_field, opted_out))
+        warnings.extend(_w010_for_unique_constraints(model, fk_field, opted_out, dj_models))
+    return warnings
+
+
+def _w010_hint(fk_field: str, fields: tuple[str, ...]) -> str:
+    """Hint naming the composite constraint pattern for *fields*."""
+    quoted = ", ".join(repr(f) for f in fields)
+    composite = ", ".join([fk_field, *fields])
+    return (
+        f"Use tenant_unique({quoted}) in Meta.constraints (or "
+        f"UniqueConstraint(fields=[{', '.join(repr(f) for f in (fk_field, *fields))}])) "
+        f"so uniqueness is per-tenant on ({composite}). "
+        f"If the uniqueness is genuinely global across every tenant, declare "
+        f"boundary_global_unique = [{quoted}] on the model class."
+    )
+
+
+def _w010_for_unique_fields(model, fk_field: str, opted_out: frozenset[str]):
+    """Warn for each local field with ``unique=True`` that omits the tenant."""
+    warnings = []
+    for field in model._meta.local_fields:
+        if not getattr(field, "unique", False):
+            continue
+        if field.primary_key or field.name == fk_field:
+            continue
+        if field.name in opted_out:
+            continue
+        warnings.append(
+            Warning(
+                f"{model._meta.label}.{field.name} is unique=True on a "
+                f"tenant-scoped model, so the value is unique across every "
+                f"tenant rather than within one.",
+                hint=_w010_hint(fk_field, (field.name,)),
+                id="boundary.W010",
+                obj=model,
+            )
+        )
+    return warnings
+
+
+def _w010_for_unique_together(model, fk_field: str, opted_out: frozenset[str]):
+    """Warn for each ``unique_together`` tuple that omits the tenant FK."""
+    warnings = []
+    for fields in model._meta.unique_together:
+        field_tuple = tuple(fields)
+        if fk_field in field_tuple:
+            continue
+        if field_tuple and set(field_tuple) <= opted_out:
+            continue
+        warnings.append(
+            Warning(
+                f"{model._meta.label} Meta.unique_together {field_tuple!r} "
+                f"does not include the tenant foreign key {fk_field!r}, so "
+                f"the combination is unique across every tenant rather than "
+                f"within one.",
+                hint=_w010_hint(fk_field, field_tuple),
+                id="boundary.W010",
+                obj=model,
+            )
+        )
+    return warnings
+
+
+def _w010_for_unique_constraints(model, fk_field: str, opted_out: frozenset[str], dj_models):
+    """Warn for each ``UniqueConstraint`` whose fields omit the tenant FK."""
+    warnings = []
+    for constraint in model._meta.constraints:
+        if not isinstance(constraint, dj_models.UniqueConstraint):
+            continue
+        field_tuple = tuple(constraint.fields or ())
+        if not field_tuple:
+            # Expression-only unique constraints have no field list to lead
+            # with the tenant column; leave them alone.
+            continue
+        if fk_field in field_tuple:
+            continue
+        if set(field_tuple) <= opted_out:
+            continue
+        name = constraint.name or "(unnamed)"
+        warnings.append(
+            Warning(
+                f"{model._meta.label} UniqueConstraint {name!r} on "
+                f"{field_tuple!r} does not include the tenant foreign key "
+                f"{fk_field!r}, so the combination is unique across every "
+                f"tenant rather than within one.",
+                hint=_w010_hint(fk_field, field_tuple),
+                id="boundary.W010",
+                obj=model,
+            )
+        )
+    return warnings

@@ -479,7 +479,7 @@ class Product(MerchantMixin):  # type: ignore[valid-type,misc]
 ```
 
 `Product.objects` / `Product.unscoped` then type as `Any` rather than
-`TenantManager[Product]` / `UnscopedManager[Product]` — no false positives,
+`TenantManager[Product]` / `UnscopedManager[Product]`, with no false positives,
 but no manager-level type safety either. Separately, the tenant model on the
 other end of the relationship needs its own narrow suppression for the
 reverse accessor `django-stubs` cannot synthesise for a runtime-attached FK:
@@ -554,6 +554,12 @@ class Invoice(TenantModel):
 
     class Meta:
         constraints = [tenant_unique("reference")]
+
+
+# Genuinely global uniqueness: keep unique=True and opt out of boundary.W010
+class APIToken(TenantModel):
+    boundary_global_unique = ["token_hash"]
+    token_hash = models.CharField(max_length=64, unique=True)
 ```
 
 The tenant field is read off the model when Django prepares it, not when the
@@ -934,6 +940,7 @@ python manage.py boundary_run_all send_reminders --parallel 4 --region eu-west -
 | `boundary.W007` | Warning | `boundary.E006` or `boundary.W003` could not determine the database state it checks. The connection was available but the query against `pg_class`/`pg_roles` failed, so the absence of E006 or W003 must not be read as a pass (issue #34) |
 | `boundary.W008` | Warning | `SubdomainResolver` (or a subclass) is in `BOUNDARY_RESOLVERS` without `BOUNDARY_SUBDOMAIN_PARENT_DOMAIN` set: it resolves the first label of any three-plus-label host, including a foreign host outside the deployment's own domain (issue #22) |
 | `boundary.W009` | Warning | `BOUNDARY_SET_DB_SESSION_VAR` is `False` but Row Level Security is enabled and forced on a tenant-scoped table, or on an adopted table: RLS depends on the session variable the opt-out stops writing, so isolation on that table is not enforced. An adopted table has no ORM layer to fall back on, so the combination leaves it with no isolation at all (issue #53) |
+| `boundary.W010` | Warning | A tenant-scoped model (one with a local tenant FK) declares `unique=True`, `unique_together`, or a `UniqueConstraint` whose fields do not include the tenant FK, so the value is unique across every tenant rather than within one. Hint names `tenant_unique(...)`. Opt out per field with the class attribute `boundary_global_unique = ["field"]` when uniqueness is genuinely global (issue #72) |
 
 ---
 

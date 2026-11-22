@@ -14,7 +14,7 @@ class BoundaryConfig(AppConfig):
         # @register decorator at import time. Nothing else in the package
         # imports that module, so without this import the whole check suite
         # (E001, E003, E004, E005, E006, E007, E008, W001, W002, W003, W006,
-        # W007, W009) never
+        # W007, W009, W010) never
         # registers and `manage.py check`/`migrate`/runserver silently run
         # none of them; they had only ever appeared to work because
         # tests/test_checks.py imports the module directly.
@@ -57,6 +57,6 @@ class BoundaryConfig(AppConfig):
 
             _cache_invalidate(instance)
 
-        # String sender — Django resolves lazily
+        # String sender: Django resolves lazily
         post_save.connect(_invalidate_on_save, sender=model_string, weak=False)
         post_delete.connect(_invalidate_on_delete, sender=model_string, weak=False)
