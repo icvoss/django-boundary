@@ -2,14 +2,16 @@
 
 Registered in AppConfig.ready() and run at startup and during test collection.
 
-boundary.W011: no logging handler reaches the package's own logger hierarchy
+boundary.E009: no logging handler reaches the package's own logger hierarchy
 (ADR-101 decision 3). boundary logs through the ``boundary.*`` loggers
 (``boundary.context``, ``boundary.middleware``, ``boundary.routing`` and
 others); if a consuming project's LOGGING configuration attaches no handler
 anywhere in that chain, the records it logs (a tenant session variable that
 could not be set or restored, an inactive tenant rejected, a tenant region
-missing from BOUNDARY_REGIONS) are effectively invisible. boundary.W004 and
-boundary.W005 are reserved in the spec, so this check takes the next free id.
+missing from BOUNDARY_REGIONS) are effectively invisible. It is an Error per
+ADR-101 decision 3 and docs/STANDARDS.md section 15. It shipped as the Warning
+boundary.W011 in 1.2.1, an id now retired and not reused; boundary.E002 is
+reserved in the spec, so this check takes the next free Error id.
 """
 
 import logging
@@ -17,7 +19,7 @@ import logging
 from django.core.checks import Error, Tags, Warning, register
 from django.db.utils import InterfaceError, OperationalError
 
-W011_ID = "boundary.W011"
+E009_ID = "boundary.E009"
 _PACKAGE_LOGGER_NAME = "boundary"
 
 # Exceptions that mean "the database connection itself is unavailable",
@@ -1478,7 +1480,7 @@ def _has_reachable_handler(logger_name):
 
 @register()
 def check_logging_handler_configured(app_configs, **kwargs):
-    """Warn when no handler reaches the boundary logger hierarchy (boundary.W011).
+    """Fail with an Error when no handler reaches the boundary logger hierarchy (boundary.E009).
 
     ADR-101 decision 3: a package that emits through logging ships a
     boot-time check confirming the consumer's LOGGING configuration
@@ -1492,7 +1494,7 @@ def check_logging_handler_configured(app_configs, **kwargs):
         return []
 
     return [
-        Warning(
+        Error(
             "No logging handler is configured to receive records from the "
             f"'{_PACKAGE_LOGGER_NAME}' logger (or any of its ancestors while "
             "propagate=True), so failures django-boundary logs (e.g. 'Failed to "
@@ -1503,6 +1505,6 @@ def check_logging_handler_configured(app_configs, **kwargs):
                 "LOGGING['loggers']['boundary'] = {'handlers': [...], "
                 "'level': 'WARNING', 'propagate': True}."
             ),
-            id=W011_ID,
+            id=E009_ID,
         )
     ]
