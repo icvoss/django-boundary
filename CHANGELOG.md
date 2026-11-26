@@ -4,6 +4,29 @@ All notable changes to django-boundary are documented here.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-26
+
+### Added
+
+- **`boundary.W011` system check** (ADR-101 decision 3, umbrella
+  icvoss/icv-oss-umbrella#678). Warns at `manage.py check`, `runserver` and
+  deploy when no logging handler is reachable from the `boundary` logger
+  (a handler on the logger itself, or on an ancestor while `propagate` stays
+  true; `logging.lastResort` does not count). Without one, the records this
+  package logs (a tenant session variable that could not be set or restored,
+  an inactive tenant rejected, a region missing from `BOUNDARY_REGIONS`) are
+  invisible. `W004` and `W005` stay reserved in the spec, so the check takes
+  the next free id.
+
+### Upgrade note
+
+- **New warning on upgrade.** A project whose `LOGGING` configures no handler
+  for `boundary` or the root logger will now see `boundary.W011` from
+  `manage.py check`. It is a Warning, not an Error, so boot is unaffected;
+  add a handler for `boundary` (or the root logger) to clear it, or list it
+  in `SILENCED_SYSTEM_CHECKS`. A project that runs
+  `check --fail-level WARNING` will fail until one of those is done.
+
 ## [1.2.0] - 2026-11-22
 
 ### Added
