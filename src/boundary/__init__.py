@@ -1,4 +1,4 @@
 """django-boundary: scalable row-level multi-tenancy for Django."""
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 default_app_config = "boundary.apps.BoundaryConfig"

@@ -135,3 +135,19 @@ if _SQLITE_LEG:
     # fails the leg loudly rather than quietly, and is the acceptable
     # failure mode.
     DATABASE_ROUTERS = ["sqlite_leg.DenyRlsMigrationsRouter"]
+
+
+# ADR-101 decision 3: the logging-handler boot check (boundary.E009) is an
+# Error, so every settings module that runs system checks (makemigrations,
+# migrate, check) must route the package logger to a handler. Propagation
+# stays on so caplog and the root logger still see the records, and the root
+# handler covers any sibling ICV package installed alongside this one.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"null": {"class": "logging.NullHandler"}},
+    "loggers": {
+        "boundary": {"handlers": ["null"], "level": "WARNING", "propagate": True},
+    },
+    "root": {"handlers": ["null"]},
+}
