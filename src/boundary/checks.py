@@ -1,10 +1,24 @@
 """Django system checks for boundary configuration.
 
 Registered in AppConfig.ready() and run at startup and during test collection.
+
+boundary.W011: no logging handler reaches the package's own logger hierarchy
+(ADR-101 decision 3). boundary logs through the ``boundary.*`` loggers
+(``boundary.context``, ``boundary.middleware``, ``boundary.routing`` and
+others); if a consuming project's LOGGING configuration attaches no handler
+anywhere in that chain, the records it logs (a tenant session variable that
+could not be set or restored, an inactive tenant rejected, a tenant region
+missing from BOUNDARY_REGIONS) are effectively invisible. boundary.W004 and
+boundary.W005 are reserved in the spec, so this check takes the next free id.
 """
+
+import logging
 
 from django.core.checks import Error, Tags, Warning, register
 from django.db.utils import InterfaceError, OperationalError
+
+W011_ID = "boundary.W011"
+_PACKAGE_LOGGER_NAME = "boundary"
 
 # Exceptions that mean "the database connection itself is unavailable",
 # distinct from a query against a reachable database failing for some
@@ -1438,3 +1452,57 @@ def _w010_for_unique_constraints(model, fk_field: str, opted_out: frozenset[str]
             )
         )
     return warnings
+
+
+def _has_reachable_handler(logger_name):
+    """Return whether a handler is attached anywhere in ``logger_name``'s
+    hierarchy that a record from it would actually reach, walking ancestors
+    while ``propagate`` is true. ``logging.lastResort`` (the module-level
+    fallback that stderr-prints WARNING+ when nothing else is configured) is
+    not a configured handler and is ignored, per ADR-101 decision 3: it
+    exists precisely to be invisible/unmanaged, not a substitute for a real
+    handler the consumer chose.
+    """
+    logger = logging.getLogger(logger_name)
+
+    current = logger
+    while current is not None:
+        if any(handler is not logging.lastResort for handler in current.handlers):
+            return True
+        if not current.propagate:
+            return False
+        current = current.parent
+
+    return False
+
+
+@register()
+def check_logging_handler_configured(app_configs, **kwargs):
+    """Warn when no handler reaches the boundary logger hierarchy (boundary.W011).
+
+    ADR-101 decision 3: a package that emits through logging ships a
+    boot-time check confirming the consumer's LOGGING configuration
+    actually routes it somewhere. boundary's failure-logging call sites
+    (``boundary.context``: a tenant DB session variable that could not be
+    set, cleared or restored; ``boundary.middleware``: an inactive tenant
+    rejected; ``boundary.routing``: a tenant region missing from
+    BOUNDARY_REGIONS) rely on this.
+    """
+    if _has_reachable_handler(_PACKAGE_LOGGER_NAME):
+        return []
+
+    return [
+        Warning(
+            "No logging handler is configured to receive records from the "
+            f"'{_PACKAGE_LOGGER_NAME}' logger (or any of its ancestors while "
+            "propagate=True), so failures django-boundary logs (e.g. 'Failed to "
+            "clear DB session variable', 'Inactive tenant rejected') will be invisible.",
+            hint=(
+                "Add a handler for the 'boundary' logger (or the root logger, "
+                "if it propagates) in your LOGGING setting, e.g. "
+                "LOGGING['loggers']['boundary'] = {'handlers': [...], "
+                "'level': 'WARNING', 'propagate': True}."
+            ),
+            id=W011_ID,
+        )
+    ]
